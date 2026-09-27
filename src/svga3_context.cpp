@@ -133,6 +133,8 @@ VlknContext::VlknContext(VlknBackend *backend, VlknSurfaceManager *surfaceMgr, u
     , m_descriptorSetInitialized(false)
     , m_descriptorSetDirty(true)
     , m_constantsDirty(true)
+    , m_vsConstsUploadedForFf(false)
+    , m_lastFfMvp{}
     , m_dummyImage(VK_NULL_HANDLE)
     , m_dummyMemory(VK_NULL_HANDLE)
     , m_dummyView(VK_NULL_HANDLE)
@@ -796,6 +798,9 @@ Svga3VlknStatus VlknContext::setTransform(SVGA3dTransformType type, const float 
     std::array<float, 16> mat;
     std::copy(matrix, matrix + 16, mat.begin());
     m_transforms[(uint32_t)type] = mat;
+    if (m_boundVS == SVGA3D_INVALID_ID) {
+        m_constantsDirty = true;
+    }
     return SVGA3_VLKN_SUCCESS;
 }
 
@@ -950,23 +955,34 @@ Svga3VlknStatus VlknContext::destroyShader(uint32_t shid, SVGA3dShaderType type)
         m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), it->second.module, nullptr);
     }
     table.erase(it);
-    if (type == SVGA3D_SHADERTYPE_VS && m_boundVS == shid) m_boundVS = SVGA3D_INVALID_ID;
+    if (type == SVGA3D_SHADERTYPE_VS && m_boundVS == shid) {
+        m_boundVS = SVGA3D_INVALID_ID;
+        m_constantsDirty = true;
+    }
     if (type == SVGA3D_SHADERTYPE_PS && m_boundPS == shid) m_boundPS = SVGA3D_INVALID_ID;
     return SVGA3_VLKN_SUCCESS;
 }
 
 Svga3VlknStatus VlknContext::setShader(SVGA3dShaderType type, uint32_t shid) {
     if (shid == SVGA3D_INVALID_ID) {
-        if (type == SVGA3D_SHADERTYPE_VS) m_boundVS = SVGA3D_INVALID_ID;
-        else m_boundPS = SVGA3D_INVALID_ID;
+        if (type == SVGA3D_SHADERTYPE_VS) {
+            if (m_boundVS != SVGA3D_INVALID_ID) m_constantsDirty = true;
+            m_boundVS = SVGA3D_INVALID_ID;
+        } else {
+            m_boundPS = SVGA3D_INVALID_ID;
+        }
         return SVGA3_VLKN_SUCCESS;
     }
     const auto &table = (type == SVGA3D_SHADERTYPE_VS) ? m_vertexShaders : m_pixelShaders;
     if (table.find(shid) == table.end()) {
         return SVGA3_VLKN_ERROR_NOT_FOUND;
     }
-    if (type == SVGA3D_SHADERTYPE_VS) m_boundVS = shid;
-    else m_boundPS = shid;
+    if (type == SVGA3D_SHADERTYPE_VS) {
+        if (m_boundVS != shid) m_constantsDirty = true;
+        m_boundVS = shid;
+    } else {
+        m_boundPS = shid;
+    }
     return SVGA3_VLKN_SUCCESS;
 }
 
@@ -1642,23 +1658,18 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
                                  uint32_t numRanges)
 {
     /* Compute MVP = World * View * Projection when using fixed-function vertex shader */
+    std::array<float, 16> ffMvp{};
     if (m_boundVS == SVGA3D_INVALID_ID) {
         std::array<float, 16> world = getTransformOrDefault(SVGA3D_TRANSFORM_WORLD);
         std::array<float, 16> view = getTransformOrDefault(SVGA3D_TRANSFORM_VIEW);
         std::array<float, 16> proj = getTransformOrDefault(SVGA3D_TRANSFORM_PROJECTION);
         std::array<float, 16> wv = multiplyMatrix4x4(world, view);
-        std::array<float, 16> mvp = multiplyMatrix4x4(wv, proj);
-        bool changed = false;
-        for (int col = 0; col < 4; ++col) {
-            for (int row = 0; row < 4; ++row) {
-                float val = mvp[row * 4 + col];
-                if (m_vsConsts.floatConsts[col][row] != val) {
-                    m_vsConsts.floatConsts[col][row] = val;
-                    changed = true;
-                }
-            }
+        ffMvp = multiplyMatrix4x4(wv, proj);
+        if (!m_vsConstsUploadedForFf || ffMvp != m_lastFfMvp) {
+            m_constantsDirty = true;
         }
-        if (changed) {
+    } else {
+        if (m_vsConstsUploadedForFf) {
             m_constantsDirty = true;
         }
     }
@@ -1670,7 +1681,21 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         if (m_vsConstBuffer && m_vsConstMemory) {
             void *mapped = nullptr;
             if (m_backend->dispatch().vkMapMemory(m_backend->device(), m_vsConstMemory, 0, sizeof(m_vsConsts.floatConsts), 0, &mapped) == VK_SUCCESS) {
-                memcpy(mapped, m_vsConsts.floatConsts, sizeof(m_vsConsts.floatConsts));
+                if (m_boundVS == SVGA3D_INVALID_ID) {
+                    float tempConsts[256][4];
+                    memcpy(tempConsts, m_vsConsts.floatConsts, sizeof(tempConsts));
+                    for (int col = 0; col < 4; ++col) {
+                        for (int row = 0; row < 4; ++row) {
+                            tempConsts[col][row] = ffMvp[row * 4 + col];
+                        }
+                    }
+                    memcpy(mapped, tempConsts, sizeof(tempConsts));
+                    m_lastFfMvp = ffMvp;
+                    m_vsConstsUploadedForFf = true;
+                } else {
+                    memcpy(mapped, m_vsConsts.floatConsts, sizeof(m_vsConsts.floatConsts));
+                    m_vsConstsUploadedForFf = false;
+                }
                 m_backend->dispatch().vkUnmapMemory(m_backend->device(), m_vsConstMemory);
             }
         }
@@ -1846,11 +1871,25 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         log_msg("[libqemu_svga3d] ctx::draw #%u (cid=%u, isHand=%d): boundVS=%u, boundPS=%u, useFfTex=%d, stage0.sid=%u, rtSid=%u, cull=%u, vp=(%.1f,%.1f %.1fx%.1f)\n",
                 m_drawCount + 1, m_cid, (int)isHand, m_boundVS, m_boundPS, (int)useFfTex, m_stages[0].sid, m_renderTargets[0].sid, m_renderStates[SVGA3D_RS_CULLMODE],
                 m_viewport.x, m_viewport.y, m_viewport.width, m_viewport.height);
+        float activeMvp[4][4];
+        if (m_boundVS == SVGA3D_INVALID_ID) {
+            for (int col = 0; col < 4; ++col) {
+                for (int row = 0; row < 4; ++row) {
+                    activeMvp[col][row] = ffMvp[row * 4 + col];
+                }
+            }
+        } else {
+            for (int col = 0; col < 4; ++col) {
+                for (int row = 0; row < 4; ++row) {
+                    activeMvp[col][row] = m_vsConsts.floatConsts[col][row];
+                }
+            }
+        }
         log_msg("[libqemu_svga3d]   mvp: [%g, %g, %g, %g] [%g, %g, %g, %g] [%g, %g, %g, %g] [%g, %g, %g, %g]\n",
-                m_vsConsts.floatConsts[0][0], m_vsConsts.floatConsts[0][1], m_vsConsts.floatConsts[0][2], m_vsConsts.floatConsts[0][3],
-                m_vsConsts.floatConsts[1][0], m_vsConsts.floatConsts[1][1], m_vsConsts.floatConsts[1][2], m_vsConsts.floatConsts[1][3],
-                m_vsConsts.floatConsts[2][0], m_vsConsts.floatConsts[2][1], m_vsConsts.floatConsts[2][2], m_vsConsts.floatConsts[2][3],
-                m_vsConsts.floatConsts[3][0], m_vsConsts.floatConsts[3][1], m_vsConsts.floatConsts[3][2], m_vsConsts.floatConsts[3][3]);
+                activeMvp[0][0], activeMvp[0][1], activeMvp[0][2], activeMvp[0][3],
+                activeMvp[1][0], activeMvp[1][1], activeMvp[1][2], activeMvp[1][3],
+                activeMvp[2][0], activeMvp[2][1], activeMvp[2][2], activeMvp[2][3],
+                activeMvp[3][0], activeMvp[3][1], activeMvp[3][2], activeMvp[3][3]);
         for (uint32_t s = 0; s < 4; ++s) {
             uint32_t sid = m_stages[s].sid;
             VlknSurface *surf = (sid != SVGA3D_INVALID_ID && sid != 0) ? m_surfaceMgr->getSurface(sid) : nullptr;

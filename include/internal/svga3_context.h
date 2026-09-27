@@ -259,6 +259,8 @@ private:
     bool m_descriptorSetInitialized;
     bool m_descriptorSetDirty;
     bool m_constantsDirty;
+    bool m_vsConstsUploadedForFf;
+    std::array<float, 16> m_lastFfMvp;
     VkBuffer m_vsConstBuffer;
     VkDeviceMemory m_vsConstMemory;
     VkBuffer m_psConstBuffer;
