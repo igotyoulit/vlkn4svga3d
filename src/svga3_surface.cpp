@@ -5,7 +5,7 @@
 #include "svga3_surface.h"
 #include "svga3_context.h"
 #include "svga3_guest_mem.h"
-#include "svga3d_reference.h"
+#include "../data/svga3d_reference.h"
 #include <cstring>
 #include <algorithm>
 
@@ -75,6 +75,17 @@ size_t svga3_format_bytes_per_pixel(SVGA3dSurfaceFormat format) {
 
         default:
             return 4;
+    }
+}
+
+bool svga3_format_has_stencil(SVGA3dSurfaceFormat format) {
+    switch (format) {
+        case SVGA3D_Z_D24S8:
+        case SVGA3D_Z_D15S1:
+        case SVGA3D_Z_D24S8_INT:
+            return true;
+        default:
+            return false;
     }
 }
 
@@ -230,7 +241,7 @@ Svga3VlknStatus VlknSurface::allocate() {
 
     VkImageCreateInfo imgInfo = {};
     imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    imgInfo.imageType = (m_depth > 1) ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+    imgInfo.imageType = (m_depth > 1 && !m_isCubeMap) ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     imgInfo.format = m_vkFormat;
     imgInfo.extent.width = m_width;
     imgInfo.extent.height = m_height;
@@ -298,7 +309,9 @@ Svga3VlknStatus VlknSurface::allocate() {
                             VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_IDENTITY;
 
     viewInfo.subresourceRange.aspectMask = m_isDepthStencil ?
-        (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
+        (svga3_format_has_stencil(m_svgaFormat) ?
+            (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) :
+            VK_IMAGE_ASPECT_DEPTH_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
     viewInfo.subresourceRange.baseMipLevel = 0;
     m_viewMipLevels = (m_autogenFilter != SVGA3D_TEX_FILTER_NONE) ? m_mipLevels : 1;
     viewInfo.subresourceRange.levelCount = m_viewMipLevels;
@@ -421,7 +434,9 @@ void VlknSurface::ensureViewMipLevels(uint32_t levels) {
                             VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_IDENTITY;
 
     viewInfo.subresourceRange.aspectMask = m_isDepthStencil ?
-        (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
+        (svga3_format_has_stencil(m_svgaFormat) ?
+            (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) :
+            VK_IMAGE_ASPECT_DEPTH_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
     viewInfo.subresourceRange.baseMipLevel = 0;
     viewInfo.subresourceRange.levelCount = m_viewMipLevels;
     viewInfo.subresourceRange.baseArrayLayer = 0;
@@ -482,7 +497,9 @@ VkImageView VlknSurface::getRenderTargetView(uint32_t mip, uint32_t face) {
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = m_vkFormat;
     viewInfo.subresourceRange.aspectMask = m_isDepthStencil ?
-        (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
+        (svga3_format_has_stencil(m_svgaFormat) ?
+            (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) :
+            VK_IMAGE_ASPECT_DEPTH_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
     viewInfo.subresourceRange.baseMipLevel = mip;
     viewInfo.subresourceRange.levelCount = 1;
     viewInfo.subresourceRange.baseArrayLayer = face;

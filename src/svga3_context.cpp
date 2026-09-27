@@ -4,7 +4,7 @@
 
 #include "svga3_context.h"
 #include "svga3_shader_translator.h"
-#include "svga3d_reference.h"
+#include "../data/svga3d_reference.h"
 #include <cstring>
 #include <algorithm>
 #include <iostream>
@@ -521,6 +521,11 @@ VlknContext::~VlknContext() {
         if (pair.second.module && pair.second.module != m_defaultFS && pair.second.module != m_defaultFSTex && pair.second.module != m_defaultFSTexPure) {
             m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), pair.second.module, nullptr);
         }
+        for (auto &variant : pair.second.depthVariants) {
+            if (variant.second && variant.second != pair.second.module) {
+                m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), variant.second, nullptr);
+            }
+        }
     }
     m_pixelShaders.clear();
 
@@ -691,10 +696,21 @@ Svga3VlknStatus VlknContext::setRenderTarget(SVGA3dRenderTargetType type, uint32
                 }
             }
         }
-    } else if (type == SVGA3D_RT_DEPTH || type == SVGA3D_RT_STENCIL) {
+    } else if (type == SVGA3D_RT_DEPTH) {
         m_depthStencilTarget.sid = sid;
         m_depthStencilTarget.face = face;
         m_depthStencilTarget.mipmap = mipmap;
+    } else if (type == SVGA3D_RT_STENCIL) {
+        /* Depth and stencil share one attachment. Mesa binds a depth-only
+         * shadow map and then sets the stencil target to INVALID, which must
+         * not drop the depth surface. */
+        bool unbound = (sid == SVGA3D_INVALID_ID || sid == 0);
+        bool depthBound = m_depthStencilTarget.sid != SVGA3D_INVALID_ID && m_depthStencilTarget.sid != 0;
+        if (!unbound && !depthBound) {
+            m_depthStencilTarget.sid = sid;
+            m_depthStencilTarget.face = face;
+            m_depthStencilTarget.mipmap = mipmap;
+        }
     } else {
         return SVGA3_VLKN_ERROR_INVALID_PARAM;
     }
@@ -903,6 +919,12 @@ Svga3VlknStatus VlknContext::defineShader(uint32_t shid, SVGA3dShaderType type, 
         if (it->second.module && it->second.module != m_defaultVS && it->second.module != m_defaultFS) {
             m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), it->second.module, nullptr);
         }
+        for (auto &variant : it->second.depthVariants) {
+            /* Failed variants borrow the base module; they do not own it. */
+            if (variant.second && variant.second != it->second.module) {
+                m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), variant.second, nullptr);
+            }
+        }
         table.erase(it);
     }
 
@@ -953,6 +975,12 @@ Svga3VlknStatus VlknContext::destroyShader(uint32_t shid, SVGA3dShaderType type)
     }
     if (it->second.module && it->second.module != m_defaultVS && it->second.module != m_defaultFS) {
         m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), it->second.module, nullptr);
+    }
+    for (auto &variant : it->second.depthVariants) {
+        /* Failed variants borrow the base module; they do not own it. */
+        if (variant.second && variant.second != it->second.module) {
+            m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), variant.second, nullptr);
+        }
     }
     table.erase(it);
     if (type == SVGA3D_SHADERTYPE_VS && m_boundVS == shid) {
@@ -1210,7 +1238,8 @@ Svga3VlknStatus VlknContext::ensureRenderPassActive() {
         barrier.srcAccessMask = 0;
         barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
         barrier.image = depthSurf->image();
-        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        barrier.subresourceRange.aspectMask = svga3_format_has_stencil(depthSurf->svgaFormat()) ?
+            (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_DEPTH_BIT;
         barrier.subresourceRange.baseMipLevel = 0;
         barrier.subresourceRange.levelCount = depthSurf->mipLevels();
         barrier.subresourceRange.baseArrayLayer = 0;
@@ -1292,6 +1321,14 @@ Svga3VlknStatus VlknContext::clear(SVGA3dClearFlag flags,
                                   const SVGA3dRect *rects,
                                   uint32_t numRects)
 {
+    bool wantColor = (flags & SVGA3D_CLEAR_COLOR) != 0;
+    bool wantDepth = (flags & (SVGA3D_CLEAR_DEPTH | SVGA3D_CLEAR_STENCIL)) != 0;
+    bool haveColor = m_renderTargets[0].sid != SVGA3D_INVALID_ID && m_renderTargets[0].sid != 0;
+    bool haveDepth = m_depthStencilTarget.sid != SVGA3D_INVALID_ID && m_depthStencilTarget.sid != 0;
+    if (wantColor && !haveColor) flags = (SVGA3dClearFlag)(flags & ~SVGA3D_CLEAR_COLOR);
+    if (wantDepth && !haveDepth) flags = (SVGA3dClearFlag)(flags & ~(SVGA3D_CLEAR_DEPTH | SVGA3D_CLEAR_STENCIL));
+    if (flags == 0) return SVGA3_VLKN_SUCCESS;
+
     ensureRenderPassActive();
     VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
 
@@ -1356,7 +1393,7 @@ Svga3VlknStatus VlknContext::clear(SVGA3dClearFlag flags,
     uint32_t rtSid = m_renderTargets[0].sid;
     if (rtSid != 0 && rtSid != SVGA3D_INVALID_ID) {
         VlknSurface *rtSurf = m_surfaceMgr->getSurface(rtSid);
-        if (rtSurf && rtSurf->width() >= 320 && rtSurf->height() >= 240 && !rtSurf->isDepthStencil()) {
+        if (rtSurf && rtSurf->width() >= 128 && rtSurf->height() >= 128 && !rtSurf->isDepthStencil()) {
             markWindowDrawn(rtSid);
         }
     }
@@ -1408,6 +1445,16 @@ VkPipeline VlknContext::getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
 
     key.boundVS = m_boundVS;
     key.boundPS = m_boundPS;
+    key.depthSamplerMask = 0;
+    if (m_boundPS != SVGA3D_INVALID_ID && m_surfaceMgr) {
+        for (uint32_t i = 0; i < SVGA3_MAX_TEXTURE_STAGES && i < 8; ++i) {
+            if (m_stages[i].sid == SVGA3D_INVALID_ID || m_stages[i].sid == 0) continue;
+            VlknSurface *stageSurf = m_surfaceMgr->getSurface(m_stages[i].sid);
+            if (stageSurf && stageSurf->isDepthStencil()) {
+                key.depthSamplerMask |= (1u << i);
+            }
+        }
+    }
     bool useFfTex = (m_boundPS == SVGA3D_INVALID_ID && m_stages[0].sid != SVGA3D_INVALID_ID && m_stages[0].sid != 0 && m_surfaceMgr->getSurface(m_stages[0].sid) != nullptr);
     bool hasVertexColor = false;
     if (useFfTex && numDecls > 0 && decls) {
@@ -1419,7 +1466,6 @@ VkPipeline VlknContext::getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
         }
     }
     key.ffTextureStage0 = useFfTex ? (hasVertexColor ? 1 : 2) : 0;
-    key.pad = 0;
 
     auto it = m_pipelineCache.find(key);
     if (it != m_pipelineCache.end()) {
@@ -1457,6 +1503,35 @@ VkPipeline VlknContext::getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
         auto pit = m_pixelShaders.find(m_boundPS);
         if (pit != m_pixelShaders.end() && pit->second.module) {
             stages[1].module = pit->second.module;
+            if (key.depthSamplerMask != 0) {
+                auto variant = pit->second.depthVariants.find(key.depthSamplerMask);
+                if (variant == pit->second.depthVariants.end()) {
+                    std::vector<uint32_t> spirv;
+                    std::string err;
+                    Svga3VlknStatus st = svga3_translate_shader_d3d9(
+                        SVGA3D_SHADERTYPE_PS, pit->second.bytecode.data(),
+                        (uint32_t)pit->second.bytecode.size(), spirv, err, nullptr,
+                        key.depthSamplerMask);
+                    VkShaderModule depthModule = VK_NULL_HANDLE;
+                    if (st == SVGA3_VLKN_SUCCESS) {
+                        VkShaderModuleCreateInfo info = {};
+                        info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+                        info.codeSize = spirv.size() * sizeof(uint32_t);
+                        info.pCode = spirv.data();
+                        m_backend->dispatch().vkCreateShaderModule(m_backend->device(), &info, nullptr, &depthModule);
+                    }
+                    if (depthModule == VK_NULL_HANDLE) {
+                        log_msg("[libqemu_svga3d] depth shader variant failed for ps %u mask 0x%x: %s\n",
+                                m_boundPS, key.depthSamplerMask, err.c_str());
+                        depthModule = pit->second.module;
+                    }
+                    pit->second.depthVariants[key.depthSamplerMask] = depthModule;
+                    variant = pit->second.depthVariants.find(key.depthSamplerMask);
+                }
+                if (variant->second) {
+                    stages[1].module = variant->second;
+                }
+            }
         }
     }
 
@@ -1633,6 +1708,7 @@ VkPipeline VlknContext::getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
     );
     if (pipeRes != VK_SUCCESS) {
         log_msg("[libqemu_svga3d] ERROR: vkCreateGraphicsPipelines failed with VkResult=%d\n", pipeRes);
+        return VK_NULL_HANDLE;
     }
 
     m_pipelineCache[key] = pipeline;
@@ -1798,7 +1874,9 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
                 barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
                 barrier.image = surf->image();
                 barrier.subresourceRange.aspectMask = surf->isDepthStencil() ?
-                    (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
+                    (svga3_format_has_stencil(surf->svgaFormat()) ?
+                        (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) :
+                        VK_IMAGE_ASPECT_DEPTH_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
                 barrier.subresourceRange.baseMipLevel = 0;
                 barrier.subresourceRange.levelCount = surf->mipLevels();
                 barrier.subresourceRange.baseArrayLayer = 0;
@@ -1936,6 +2014,10 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
 
     /* 3. Bind Pipeline and Descriptor Sets */
     VkPipeline pipeline = getOrCreatePipeline(primitiveType, decls, numDecls, m_activeRenderPass);
+    if (pipeline == VK_NULL_HANDLE) {
+        endRenderPassIfActive();
+        return SVGA3_VLKN_SUCCESS;
+    }
     m_backend->dispatch().vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
     if (m_descriptorSet) {
@@ -2007,6 +2089,7 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         SVGA3dPrimitiveType ptype = (r.primType != SVGA3D_PRIMITIVE_INVALID) ? (SVGA3dPrimitiveType)r.primType : primitiveType;
         if (i == 0 || ptype != currentBoundType) {
             VkPipeline pipe = getOrCreatePipeline(ptype, decls, numDecls, m_activeRenderPass);
+            if (pipe == VK_NULL_HANDLE) continue;
             m_backend->dispatch().vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             currentBoundType = ptype;
         }
@@ -2037,7 +2120,7 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
     uint32_t rtSid = m_renderTargets[0].sid;
     if (rtSid != 0 && rtSid != SVGA3D_INVALID_ID) {
         VlknSurface *rtSurf = m_surfaceMgr->getSurface(rtSid);
-        if (rtSurf && rtSurf->width() >= 320 && rtSurf->height() >= 240 && !rtSurf->isDepthStencil()) {
+        if (rtSurf && rtSurf->width() >= 128 && rtSurf->height() >= 128 && !rtSurf->isDepthStencil()) {
             markWindowDrawn(rtSid);
         }
     }
@@ -2187,7 +2270,10 @@ std::vector<std::pair<uint32_t, uint32_t>> VlknContextManager::collectPendingWin
     std::vector<std::pair<uint32_t, uint32_t>> list;
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     for (auto &pair : m_contexts) {
-        if (pair.first != 246 && pair.second && pair.second->hasDrawnToWindow()) {
+        if (pair.first != 246 && pair.second &&
+            (pair.second->hasDrawnToWindow() ||
+             (pair.second->lastDrawnWindowSid() != 0 &&
+              pair.second->lastDrawnWindowSid() != SVGA3D_INVALID_ID))) {
             uint32_t sid = pair.second->lastDrawnWindowSid();
             if (sid != 0 && sid != SVGA3D_INVALID_ID) {
                 list.push_back({pair.first, sid});

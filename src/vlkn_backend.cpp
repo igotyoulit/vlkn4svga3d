@@ -646,8 +646,11 @@ VkRenderPass VlknBackend::getOrCreateRenderPass(VkFormat colorFormat, VkFormat d
         attachments[attachmentCount].samples = VK_SAMPLE_COUNT_1_BIT;
         attachments[attachmentCount].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         attachments[attachmentCount].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        attachments[attachmentCount].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        attachments[attachmentCount].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+        bool hasStencil = (depthFormat == VK_FORMAT_D24_UNORM_S8_UINT ||
+                           depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+                           depthFormat == VK_FORMAT_D16_UNORM_S8_UINT);
+        attachments[attachmentCount].stencilLoadOp = hasStencil ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachments[attachmentCount].stencilStoreOp = hasStencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
         attachments[attachmentCount].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         attachments[attachmentCount].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 

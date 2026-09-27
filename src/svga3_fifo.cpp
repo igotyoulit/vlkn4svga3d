@@ -15,7 +15,8 @@ namespace svga3_vlkn {
 static void blitClientSurfaceToFramebuffer(Svga3VlknDevice *dev, uint32_t cid, uint32_t sid, const char *reason) {
     if (!dev || !dev->guestMem || !dev->surfaceMgr || sid == 0 || sid == SVGA3D_INVALID_ID) return;
     VlknSurface *surf = dev->surfaceMgr->getSurface(sid);
-    if (!surf || surf->width() < 320 || surf->height() < 240 || surf->isDepthStencil()) return;
+    /* Cursors are 64 or smaller. A window can be as small as the OpenGL test. */
+    if (!surf || surf->width() < 128 || surf->height() < 128 || surf->isDepthStencil()) return;
 
     if (dev->contextMgr) dev->contextMgr->endAllRenderPasses();
 
@@ -77,14 +78,15 @@ static void blitClientSurfaceToFramebuffer(Svga3VlknDevice *dev, uint32_t cid, u
 }
 
 void svga3_vlkn_present_client_surfaces(Svga3VlknDevice *dev, const char *reason) {
-    if (!dev || !dev->contextMgr || !dev->surfaceMgr || !dev->guestMem) return;
+    if (!dev) return;
 
-    auto pending = dev->contextMgr->collectPendingWindowPresents();
-    if (pending.empty()) return;
-
+    /* The preload fence handler signals completion after this returns. Finish
+     * queued work even when it only touches offscreen/depth targets. */
     if (dev->contextMgr) dev->contextMgr->endAllRenderPasses();
     if (dev->backend) dev->backend->flushCommandBuffer();
 
+    if (!dev->contextMgr || !dev->surfaceMgr || !dev->guestMem) return;
+    auto pending = dev->contextMgr->collectPendingWindowPresents();
     for (const auto &item : pending) {
         blitClientSurfaceToFramebuffer(dev, item.first, item.second, reason);
     }
@@ -919,7 +921,9 @@ Svga3VlknStatus svga3_vlkn_fifo_execute(Svga3VlknDevice *dev,
         bool hasCmdHeader = false;
         size_t payloadSize = remaining;
 
-        /* Check for standard SVGA3D command header (size following cmdId) */
+        /* Every 3D command carries an SVGA3dCmdHeader size word. The outer
+         * FIFO loop sizes the packet from that word, so it has to be
+         * consumed here too or the body is read one dword off. */
         if (remaining >= sizeof(SVGA3dCmdHeader)) {
             if (cmd >= SVGA_3D_CMD_BASE && cmd < SVGA_3D_CMD_FUTURE_MAX) {
                 const auto *hdr = reinterpret_cast<const SVGA3dCmdHeader*>(ptr);

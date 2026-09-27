@@ -210,6 +210,7 @@ private:
 
 /* Format helpers */
 size_t svga3_format_bytes_per_pixel(SVGA3dSurfaceFormat format);
+bool   svga3_format_has_stencil(SVGA3dSurfaceFormat format);
 bool   svga3_format_is_depth_stencil(SVGA3dSurfaceFormat format);
 bool   svga3_format_is_compressed(SVGA3dSurfaceFormat format);
 
