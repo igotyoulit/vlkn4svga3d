@@ -78,14 +78,15 @@ static void blitClientSurfaceToFramebuffer(Svga3VlknDevice *dev, uint32_t cid, u
 }
 
 void svga3_vlkn_present_client_surfaces(Svga3VlknDevice *dev, const char *reason) {
-    if (!dev || !dev->contextMgr || !dev->surfaceMgr || !dev->guestMem) return;
+    if (!dev) return;
 
-    auto pending = dev->contextMgr->collectPendingWindowPresents();
-    if (pending.empty()) return;
-
+    /* The preload fence handler signals completion after this returns. Finish
+     * queued work even when it only touches offscreen/depth targets. */
     if (dev->contextMgr) dev->contextMgr->endAllRenderPasses();
     if (dev->backend) dev->backend->flushCommandBuffer();
 
+    if (!dev->contextMgr || !dev->surfaceMgr || !dev->guestMem) return;
+    auto pending = dev->contextMgr->collectPendingWindowPresents();
     for (const auto &item : pending) {
         blitClientSurfaceToFramebuffer(dev, item.first, item.second, reason);
     }

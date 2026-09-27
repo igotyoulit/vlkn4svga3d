@@ -920,7 +920,8 @@ Svga3VlknStatus VlknContext::defineShader(uint32_t shid, SVGA3dShaderType type, 
             m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), it->second.module, nullptr);
         }
         for (auto &variant : it->second.depthVariants) {
-            if (variant.second) {
+            /* Failed variants borrow the base module; they do not own it. */
+            if (variant.second && variant.second != it->second.module) {
                 m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), variant.second, nullptr);
             }
         }
@@ -976,7 +977,8 @@ Svga3VlknStatus VlknContext::destroyShader(uint32_t shid, SVGA3dShaderType type)
         m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), it->second.module, nullptr);
     }
     for (auto &variant : it->second.depthVariants) {
-        if (variant.second) {
+        /* Failed variants borrow the base module; they do not own it. */
+        if (variant.second && variant.second != it->second.module) {
             m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), variant.second, nullptr);
         }
     }

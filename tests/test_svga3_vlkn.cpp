@@ -6,6 +6,7 @@
  */
 
 #include "svga3_vlkn.h"
+#include "svga3_device.h"
 #include "svga3d_reference.h"
 #include "svga3d_tables.h"
 #include <iostream>
@@ -1340,6 +1341,132 @@ static void TestStressExecution(Svga3VlknDevice *dev) {
     std::cout << ANSI_GREEN << "  Stress test completed resource cycles in " << ms << " ms." << ANSI_RESET << std::endl;
 }
 
+/* Exercise the fence helper used by the preload hook, including offscreen work. */
+static PFN_vkQueueSubmit savedQueueSubmit;
+static PFN_vkQueueWaitIdle savedQueueWaitIdle;
+static unsigned fenceSubmits, fenceWaits;
+static VkResult VKAPI_CALL countFenceSubmit(VkQueue queue, uint32_t count,
+                                           const VkSubmitInfo *info, VkFence fence) {
+    ++fenceSubmits;
+    return savedQueueSubmit(queue, count, info, fence);
+}
+static VkResult VKAPI_CALL countFenceWait(VkQueue queue) {
+    ++fenceWaits;
+    return savedQueueWaitIdle(queue);
+}
+
+static void TestFenceWithoutWindow() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create fence regression device");
+    if (!dev) return;
+    auto &backend = *dev->backend;
+    auto &dispatch = backend.dispatch();
+    savedQueueSubmit = dispatch.vkQueueSubmit;
+    savedQueueWaitIdle = dispatch.vkQueueWaitIdle;
+    dispatch.vkQueueSubmit = countFenceSubmit;
+    dispatch.vkQueueWaitIdle = countFenceWait;
+
+    for (bool offscreen : {false, true}) {
+        if (offscreen) {
+            SVGA3dSize size = {64, 64, 1};
+            TEST_CHECK(svga3_vlkn_surface_define(dev, 1, 0, SVGA3D_Z_D16, &size, 1) == SVGA3_VLKN_SUCCESS,
+                       "Create offscreen depth target");
+            TEST_CHECK(svga3_vlkn_context_create(dev, 1) == SVGA3_VLKN_SUCCESS, "Create offscreen context");
+            auto *ctx = dev->contextMgr->getContext(1);
+            ctx->setRenderTarget(SVGA3D_RT_DEPTH, 1, 0, 0);
+            TEST_CHECK(ctx->clear(SVGA3D_CLEAR_DEPTH, 0, 1.0f, 0, nullptr, 0) == SVGA3_VLKN_SUCCESS,
+                       "Record depth-only clear");
+        } else {
+            backend.getActiveCommandBuffer();
+        }
+        fenceSubmits = fenceWaits = 0;
+        svga3_vlkn::svga3_vlkn_present_client_surfaces(dev, "fence-regression");
+        TEST_CHECK(fenceSubmits == 1 && fenceWaits == 1,
+                   "Fence submits and waits even with no pending window");
+        backend.flushCommandBuffer();
+        TEST_CHECK(fenceSubmits == 1 && fenceWaits == 1, "Fence leaves no unsubmitted commands");
+    }
+    dispatch.vkQueueSubmit = savedQueueSubmit;
+    dispatch.vkQueueWaitIdle = savedQueueWaitIdle;
+    svga3_vlkn_device_destroy(dev);
+}
+
+static PFN_vkCreateShaderModule savedCreateShaderModule;
+static PFN_vkDestroyShaderModule savedDestroyShaderModule;
+static VkShaderModule trackedShader;
+static unsigned trackedShaderDestroys, variantFailures;
+static VkResult VKAPI_CALL captureShader(VkDevice device, const VkShaderModuleCreateInfo *info,
+                                        const VkAllocationCallbacks *allocator, VkShaderModule *module) {
+    VkResult result = savedCreateShaderModule(device, info, allocator, module);
+    if (result == VK_SUCCESS) trackedShader = *module;
+    return result;
+}
+static VkResult VKAPI_CALL failDepthVariant(VkDevice, const VkShaderModuleCreateInfo *,
+                                          const VkAllocationCallbacks *, VkShaderModule *module) {
+    ++variantFailures;
+    *module = VK_NULL_HANDLE;
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+static void VKAPI_CALL countShaderDestroy(VkDevice device, VkShaderModule module,
+                                         const VkAllocationCallbacks *allocator) {
+    if (module == trackedShader) ++trackedShaderDestroys;
+    savedDestroyShaderModule(device, module, allocator);
+}
+
+static void TestDepthVariantCleanup() {
+    /* Multiple failed masks alias the base module. Test all three cleanup paths. */
+    for (int cleanup = 0; cleanup < 3; ++cleanup) {
+        Svga3VlknConfig cfg{};
+        cfg.forceMockBackend = true;
+        auto *dev = svga3_vlkn_device_create(&cfg);
+        TEST_CHECK(dev != nullptr, "Create depth variant regression device");
+        if (!dev) return;
+        TEST_CHECK(svga3_vlkn_context_create(dev, 1) == SVGA3_VLKN_SUCCESS, "Create variant context");
+        auto *ctx = dev->contextMgr->getContext(1);
+        SVGA3dSize size = {64, 64, 1};
+        TEST_CHECK(svga3_vlkn_surface_define(dev, 1, 0, SVGA3D_A8R8G8B8, &size, 1) == SVGA3_VLKN_SUCCESS,
+                   "Create variant render target");
+        TEST_CHECK(svga3_vlkn_surface_define(dev, 2, 0, SVGA3D_Z_D16, &size, 1) == SVGA3_VLKN_SUCCESS,
+                   "Create sampled depth surface");
+        ctx->setRenderTarget(SVGA3D_RT_COLOR0, 1, 0, 0);
+        auto &dispatch = dev->backend->dispatch();
+        savedCreateShaderModule = dispatch.vkCreateShaderModule;
+        savedDestroyShaderModule = dispatch.vkDestroyShaderModule;
+        dispatch.vkCreateShaderModule = captureShader;
+        const uint32_t tokens[] = {0xFFFF0300, 0x0000FFFF};
+        TEST_CHECK(ctx->defineShader(1, SVGA3D_SHADERTYPE_PS, tokens, 2) == SVGA3_VLKN_SUCCESS,
+                   "Define base pixel shader");
+        ctx->setShader(SVGA3D_SHADERTYPE_PS, 1);
+        trackedShaderDestroys = variantFailures = 0;
+        dispatch.vkDestroyShaderModule = countShaderDestroy;
+        dispatch.vkCreateShaderModule = failDepthVariant;
+        SVGA3dPrimitiveRange range{};
+        range.primType = SVGA3D_PRIMITIVE_TRIANGLELIST;
+        range.primitiveCount = 1;
+        for (uint32_t stage = 0; stage < 2; ++stage) {
+            ctx->setTexture(stage, 2);
+            TEST_CHECK(ctx->draw(range.primType, nullptr, 0, &range, 1) == SVGA3_VLKN_SUCCESS,
+                       "Draw with failed depth variant");
+        }
+        TEST_CHECK(variantFailures == 2, "Two distinct depth variants failed creation");
+        ctx->endRenderPassIfActive();
+        dispatch.vkCreateShaderModule = savedCreateShaderModule;
+        if (cleanup == 0) {
+            ctx->destroyShader(1, SVGA3D_SHADERTYPE_PS);
+        } else if (cleanup == 1) {
+            TEST_CHECK(ctx->defineShader(1, SVGA3D_SHADERTYPE_PS, tokens, 2) == SVGA3_VLKN_SUCCESS,
+                       "Redefine shader after variant failure");
+        } else {
+            svga3_vlkn_context_destroy(dev, 1);
+        }
+        TEST_CHECK(trackedShaderDestroys == 1, "Base shader destroyed exactly once after variant failures");
+        dispatch.vkDestroyShaderModule = savedDestroyShaderModule;
+        svga3_vlkn_device_destroy(dev);
+    }
+}
+
 /* --------------------------------------------------------------------------
  * Main Test Runner
  * -------------------------------------------------------------------------- */
@@ -1348,6 +1475,8 @@ int main() {
     std::cout << ANSI_YELLOW << "       SVGA3=VLKN - SVGA3D to Vulkan Engine Test Harness          " << ANSI_RESET << std::endl;
     std::cout << ANSI_YELLOW << "==================================================================" << ANSI_RESET << std::endl;
 
+    TestFenceWithoutWindow();
+    TestDepthVariantCleanup();
     TestSurfaceFormatMappings();
     TestTopologyMappings();
     TestStateConverters();
