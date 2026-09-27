@@ -48,6 +48,9 @@ struct Svga3Shader {
     std::vector<uint32_t> bytecode;
     VkShaderModule module;
     uint32_t inputLocationMask;
+    /* Pixel shaders are recompiled per depth-sampler mask. Bit N means stage N
+     * was a depth texture when that variant was built. */
+    std::unordered_map<uint32_t, VkShaderModule> depthVariants;
 };
 
 struct ShaderConstantBank {
@@ -79,7 +82,7 @@ struct PipelineKey {
     uint32_t boundVS;
     uint32_t boundPS;
     uint32_t ffTextureStage0;
-    uint32_t pad;
+    uint32_t depthSamplerMask;
 
     bool operator==(const PipelineKey &other) const {
         return memcmp(this, &other, sizeof(PipelineKey)) == 0;
@@ -183,6 +186,8 @@ public:
     /* Window Surface Tracking */
     uint32_t lastDrawnWindowSid() const { return m_lastDrawnWindowSid; }
     bool hasDrawnToWindow() const { return m_hasDrawnToWindow; }
+    /* Keep the surface id. The guest reads the window back before the fence
+     * that should present it, so clearing the id here drops the frame. */
     void resetDrawnToWindow() { m_hasDrawnToWindow = false; }
     void markWindowDrawn(uint32_t sid) {
         m_lastDrawnWindowSid = sid;

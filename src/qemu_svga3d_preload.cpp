@@ -68,26 +68,50 @@
 #define SCREEN_W                      1280
 #define SCREEN_H                      768
 
-/* SVGA Capabilities Advertised to Guest (0x0050c0e3):
+/* SVGA Capabilities Advertised to Guest (0x00d2c0e3):
  * Bit 0: RECT_COPY (0x01)
  * Bit 1: CURSOR (0x02)
- * Bit 5: PITCHLOCK (0x20)
+ * Bit 5: CURSOR (legacy 0x20)
  * Bit 6: SYNCHRONIZATION (0x40)
  * Bit 7: GLYPH (0x80)
  * Bit 14: 3D (0x4000)
  * Bit 15: EXTENDED_FIFO (0x8000)
+ * Bit 17: PITCHLOCK (0x20000)
  * Bit 18: IRQMASK cleared (0x0) -> forces synchronous polling
  * Bit 20: GMR (0x100000)
  * Bit 22: GMR2 (0x400000)
+ * Bit 23: SCREEN_OBJECT_2 (0x800000)
  */
-#define SVGA_CAPABILITIES_VALUE       0x0050c0e3
+#ifndef SVGA_CAP_PITCHLOCK
+#define SVGA_CAP_PITCHLOCK            0x00020000
+#endif
+#ifndef SVGA_CAP_SCREEN_OBJECT_2
+#define SVGA_CAP_SCREEN_OBJECT_2      0x00800000
+#endif
+#ifndef SVGA_FIFO_CAP_SCREEN_OBJECT
+#define SVGA_FIFO_CAP_SCREEN_OBJECT     (1 << 7)
+#endif
+#ifndef SVGA_FIFO_CAP_SCREEN_OBJECT_2
+#define SVGA_FIFO_CAP_SCREEN_OBJECT_2   (1 << 9)
+#endif
+#define SVGA_CAPABILITIES_VALUE       (0x0050c0e3 | SVGA_CAP_PITCHLOCK | SVGA_CAP_SCREEN_OBJECT_2)
 #define EXPANDED_FIFO_SIZE            0x400000
+/* vmwgfx (GMR2 path) sets legacy surface memory to
+ * SVGA_REG_MEMORY_SIZE - SVGA_REG_VRAM_SIZE. Equal values leave a 0 kB
+ * surface pool and every surface validate fails. */
+#define LEGACY_SURFACE_BYTES          (256u * 1024u * 1024u)
 
 #ifndef SVGA_FIFO_CAP_FENCE
-#define SVGA_FIFO_CAP_FENCE           1
+#define SVGA_FIFO_CAP_FENCE           (1 << 0)
+#endif
+#ifndef SVGA_FIFO_CAP_PITCHLOCK
+#define SVGA_FIFO_CAP_PITCHLOCK       (1 << 2)
+#endif
+#ifndef SVGA_FIFO_CAP_GMR2
+#define SVGA_FIFO_CAP_GMR2            (1 << 8)
 #endif
 #ifndef SVGA_FIFO_CAP_3D_HWVERSION_REVISED
-#define SVGA_FIFO_CAP_3D_HWVERSION_REVISED 0x8
+#define SVGA_FIFO_CAP_3D_HWVERSION_REVISED SVGA_FIFO_CAP_GMR2
 #endif
 #ifndef SVGA_CMD_RECT_FILL
 #define SVGA_CMD_RECT_FILL            2
@@ -119,6 +143,7 @@ static int64_t left_down_ns;
 static uint32_t saved_gmr_id = 0;
 static uint32_t saved_gmr_desc = 0;
 static uint32_t saved_irqmask = 0;
+static uint32_t saved_num_guest_displays = 1;
 static FILE *log_file = NULL;
 
 /* Production SVGA3=VLKN Vulkan Device State */
@@ -265,6 +290,34 @@ static void ensure_vlkn_device(void *s) {
     log_msg("[libqemu_svga3d] SVGA3=VLKN Vulkan hardware 3D engine initialized successfully!\n");
 }
 
+static uint32_t advertised_devcap(const DevCapInfo &cap) {
+    switch (cap.id) {
+    case SVGA3D_DEVCAP_SURFACEFMT_X8R8G8B8:
+    case SVGA3D_DEVCAP_SURFACEFMT_R5G6B5:
+    case SVGA3D_DEVCAP_SURFACEFMT_X1R5G5B5:
+        /* Mesa and vmwgfx only treat a format as a scanout when DISPLAYMODE
+         * is set. 3DACCELERATION implies that bit on real SVGA3D devices. */
+        return cap.expectedValue
+            | SVGA3DFORMAT_OP_DISPLAYMODE
+            | SVGA3DFORMAT_OP_3DACCELERATION
+            | SVGA3DFORMAT_OP_MEMBEROFGROUP_ARGB
+            | SVGA3DFORMAT_OP_CONVERT_TO_ARGB;
+    case SVGA3D_DEVCAP_SURFACEFMT_Z_D16:
+    case SVGA3D_DEVCAP_SURFACEFMT_Z_D24S8:
+    case SVGA3D_DEVCAP_SURFACEFMT_Z_D24X8:
+    case SVGA3D_DEVCAP_SURFACEFMT_Z_DF16:
+    case SVGA3D_DEVCAP_SURFACEFMT_Z_DF24:
+    case SVGA3D_DEVCAP_SURFACEFMT_Z_D24S8_INT:
+        /* Mesa requires SVGA3DFORMAT_OP_ZSTENCIL before it exposes a
+         * depth visual. 0x10 (SAME_FORMAT_RENDERTARGET) is not enough. */
+        return SVGA3DFORMAT_OP_ZSTENCIL
+            | SVGA3DFORMAT_OP_ZSTENCIL_WITH_ARBITRARY_COLOR_DEPTH
+            | SVGA3DFORMAT_OP_TEXTURE;
+    default:
+        return cap.expectedValue;
+    }
+}
+
 static void init_devcaps_record(uint32_t *fifo) {
     /* Header at &fifo[32]: length = 172 dwords, type = 0x100 (SVGA3DCAPS_RECORD_DEVCAPS) */
     fifo[32] = 172;
@@ -273,7 +326,7 @@ static void init_devcaps_record(uint32_t *fifo) {
     size_t capCount = sizeof(g_DevCaps) / sizeof(g_DevCaps[0]);
     for (size_t i = 0; i < capCount; ++i) {
         fifo[34 + 2 * i] = g_DevCaps[i].id;
-        fifo[34 + 2 * i + 1] = g_DevCaps[i].expectedValue;
+        fifo[34 + 2 * i + 1] = advertised_devcap(g_DevCaps[i]);
     }
     /* 85th dummy sentinel entry at index 84 (words 202, 203) */
     fifo[34 + 2 * capCount] = 0xFFFFFFFF;
@@ -338,6 +391,21 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
             if (available < 6) goto done;
             if (P(4)>256 || P(5)>256) goto unsupported;
             words = 6 + (uint64_t)P(4)*P(5);
+        } else if (cmd == SVGA_CMD_DEFINE_SCREEN) {
+            if (available < 2) goto done;
+            words = 1 + ((uint64_t)P(1) + 3) / 4;
+        } else if (cmd == SVGA_CMD_DESTROY_SCREEN) {
+            words = (sizeof(uint32_t) + sizeof(SVGAFifoCmdDestroyScreen) + 3) / 4;
+        } else if (cmd == SVGA_CMD_DEFINE_GMRFB) {
+            words = (sizeof(uint32_t) + sizeof(SVGAFifoCmdDefineGMRFB) + 3) / 4;
+        } else if (cmd == SVGA_CMD_BLIT_GMRFB_TO_SCREEN) {
+            words = (sizeof(uint32_t) + sizeof(SVGAFifoCmdBlitGMRFBToScreen) + 3) / 4;
+        } else if (cmd == SVGA_CMD_BLIT_SCREEN_TO_GMRFB) {
+            words = (sizeof(uint32_t) + sizeof(SVGAFifoCmdBlitScreenToGMRFB) + 3) / 4;
+        } else if (cmd == SVGA_CMD_ANNOTATION_FILL) {
+            words = (sizeof(uint32_t) + sizeof(SVGAFifoCmdAnnotationFill) + 3) / 4;
+        } else if (cmd == SVGA_CMD_ANNOTATION_COPY) {
+            words = (sizeof(uint32_t) + sizeof(SVGAFifoCmdAnnotationCopy) + 3) / 4;
         } else if (cmd == SVGA_CMD_DEFINE_GMR2) {
             words = (sizeof(uint32_t) + sizeof(SVGAFifoCmdDefineGMR2)) / 4;
         } else if (cmd == SVGA_CMD_REMAP_GMR2) {
@@ -422,12 +490,53 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
                 log_msg("[libqemu_svga3d] SVGA_CMD_FENCE #%u: fence_id=%u\n", fence_count, P(1));
             }
             if (g_vlknDev) {
-                if (g_vlknDev->contextMgr) g_vlknDev->contextMgr->endAllRenderPasses();
-                if (g_vlknDev->backend) g_vlknDev->backend->flushCommandBuffer();
+                /* Mesa waits on this fence after a window swap. Present the
+                 * surfaces drawn since the previous fence before signalling. */
+                svga3_vlkn::svga3_vlkn_present_client_surfaces(g_vlknDev, "fence");
             }
             if (min >= 28) fifo[SVGA_FIFO_FENCE] = P(1);
         } else if (cmd == SVGA_CMD_ESCAPE) {
             /* Video overlay no-ops */
+        } else if (cmd == SVGA_CMD_DEFINE_SCREEN) {
+            uint32_t structSize = P(1);
+            if (structSize >= sizeof(uint32_t) * 5) {
+                uint32_t screenId = P(2);
+                uint32_t flags = P(3);
+                uint32_t sw = P(4);
+                uint32_t sh = P(5);
+                int32_t sx = (int32_t)P(6);
+                int32_t sy = (int32_t)P(7);
+                log_msg("[libqemu_svga3d] DEFINE_SCREEN: id=%u flags=0x%x size=%ux%u pos=(%d,%d)\n",
+                        screenId, flags, sw, sh, sx, sy);
+                if (sw > 0 && sh > 0 && !(flags & SVGA_SCREEN_DEACTIVATE)) {
+                    redraw(s, (sx < 0) ? 0 : (uint32_t)sx, (sy < 0) ? 0 : (uint32_t)sy, sw, sh);
+                    if (g_vlknDev && screenId == 0) {
+                        uint32_t pitch = (structSize >= sizeof(uint32_t) * 9) ? P(10) : 0;
+                        if (!pitch) pitch = sw * 4;
+                        uint8_t *vram = *(uint8_t **)((char *)s + 8);
+                        uint32_t vram_sz = reg_value(s, SVGA_REG_VRAM_SIZE);
+                        if (!vram_sz) vram_sz = 128 * 1024 * 1024;
+                        svga3_vlkn_device_set_framebuffer(g_vlknDev, vram, 0xE0000000, vram_sz, sw, sh, pitch, 4);
+                    }
+                }
+            }
+        } else if (cmd == SVGA_CMD_DESTROY_SCREEN) {
+            log_msg("[libqemu_svga3d] DESTROY_SCREEN: id=%u\n", P(1));
+        } else if (cmd == SVGA_CMD_DEFINE_GMRFB) {
+            log_msg("[libqemu_svga3d] DEFINE_GMRFB: gmrId=%u offset=0x%x bytesPerLine=%u format=0x%x\n",
+                    P(1), P(2), P(3), P(4));
+        } else if (cmd == SVGA_CMD_BLIT_GMRFB_TO_SCREEN) {
+            int32_t dx = (int32_t)P(3);
+            int32_t dy = (int32_t)P(4);
+            int32_t dw = (int32_t)P(5) - dx;
+            int32_t dh = (int32_t)P(6) - dy;
+            if (dw > 0 && dh > 0 && dx >= 0 && dy >= 0) {
+                redraw(s, (uint32_t)dx, (uint32_t)dy, (uint32_t)dw, (uint32_t)dh);
+            }
+        } else if (cmd == SVGA_CMD_BLIT_SCREEN_TO_GMRFB) {
+            log_msg("[libqemu_svga3d] BLIT_SCREEN_TO_GMRFB\n");
+        } else if (cmd == SVGA_CMD_ANNOTATION_FILL || cmd == SVGA_CMD_ANNOTATION_COPY) {
+            /* Handled / consumed */
         } else if ((cmd >= SVGA_3D_CMD_BASE && cmd < SVGA_3D_CMD_FUTURE_MAX) ||
                    cmd == SVGA_CMD_DEFINE_GMR2 || cmd == SVGA_CMD_REMAP_GMR2) {
             ensure_vlkn_device(s);
@@ -501,6 +610,10 @@ extern "C" uint64_t my_vmsvga_io_read(void *opaque, uint64_t addr, unsigned size
             }
             return 0;
         }
+        case SVGA_REG_NUM_DISPLAYS:
+            return 1;
+        case SVGA_REG_NUM_GUEST_DISPLAYS:
+            return saved_num_guest_displays ? saved_num_guest_displays : 1;
         case SVGA_REG_GMR_ID:
             return saved_gmr_id;
         case SVGA_REG_GMR_DESCRIPTOR:
@@ -509,8 +622,15 @@ extern "C" uint64_t my_vmsvga_io_read(void *opaque, uint64_t addr, unsigned size
             return 256;
         case SVGA_REG_GMR_MAX_DESCRIPTOR_LENGTH:
             return 4096;
-        case 45: /* SVGA_REG_GMRS_MAX_PAGES */
+        case SVGA_REG_TRACES:
+            return 0;
+        case SVGA_REG_GMRS_MAX_PAGES:
             return 65536;
+        case SVGA_REG_MEMORY_SIZE: {
+            uint32_t vram = reg_value(s, SVGA_REG_VRAM_SIZE);
+            if (!vram) vram = 128 * 1024 * 1024;
+            return vram + LEGACY_SURFACE_BYTES;
+        }
         case SVGA_REG_IRQMASK:
             return saved_irqmask;
         default:
@@ -542,7 +662,9 @@ extern "C" void my_vmsvga_io_write(void *opaque, uint64_t addr, uint64_t data, u
                 }
                 if (fifo) {
                     if (fifo[SVGA_FIFO_MIN] < 32 || fifo[SVGA_FIFO_MIN] > EXPANDED_FIFO_SIZE) return;
-                    fifo[SVGA_FIFO_CAPABILITIES] |= SVGA_FIFO_CAP_FENCE | SVGA_FIFO_CAP_3D_HWVERSION_REVISED;
+                    fifo[SVGA_FIFO_CAPABILITIES] |= SVGA_FIFO_CAP_FENCE | SVGA_FIFO_CAP_PITCHLOCK |
+                                                    SVGA_FIFO_CAP_3D_HWVERSION_REVISED |
+                                                    SVGA_FIFO_CAP_SCREEN_OBJECT | SVGA_FIFO_CAP_SCREEN_OBJECT_2;
                     fifo[SVGA_FIFO_FLAGS] = 0;
                     fifo[SVGA_FIFO_FENCE] = 0;
                     fifo[SVGA_FIFO_3D_HWVERSION] = SVGA3D_HWVERSION_WS65_B1;
@@ -594,6 +716,12 @@ extern "C" void my_vmsvga_io_write(void *opaque, uint64_t addr, uint64_t data, u
             }
             return;
         }
+        case SVGA_REG_NUM_DISPLAYS:
+            return;
+        case SVGA_REG_NUM_GUEST_DISPLAYS:
+            saved_num_guest_displays = (uint32_t)data;
+            log_msg("[libqemu_svga3d] SVGA_REG_NUM_GUEST_DISPLAYS write %u\n", saved_num_guest_displays);
+            return;
         case SVGA_REG_GMR_ID:
             saved_gmr_id = (uint32_t)data;
             log_msg("[libqemu_svga3d] SVGA_REG_GMR_ID write 0x%x\n", saved_gmr_id);
@@ -610,7 +738,9 @@ extern "C" void my_vmsvga_io_write(void *opaque, uint64_t addr, uint64_t data, u
             return;
         case SVGA_REG_GMR_MAX_IDS:
         case SVGA_REG_GMR_MAX_DESCRIPTOR_LENGTH:
-        case 45: /* SVGA_REG_GMRS_MAX_PAGES */
+        case SVGA_REG_TRACES:
+        case SVGA_REG_GMRS_MAX_PAGES:
+        case SVGA_REG_MEMORY_SIZE:
             return;
         case SVGA_REG_IRQMASK:
             saved_irqmask = (uint32_t)data;

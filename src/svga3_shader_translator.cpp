@@ -120,7 +120,8 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                                             uint32_t numTokens,
                                             std::vector<uint32_t> &outSpirv,
                                             std::string &outError,
-                                            uint32_t *outInputMask)
+                                            uint32_t *outInputMask,
+                                            uint32_t depthSamplerMask)
 {
     outSpirv.clear();
     outError.clear();
@@ -367,9 +368,10 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     uint32_t psInTexCoords[8] = { 0 };
     uint32_t psOutColor = 0;
 
-    /* Samplers */
+    /* Samplers. depthSamplerMask bit N means stage N is a depth texture. */
     uint32_t samplerVars[8] = { 0 };
     uint32_t typeSampledImage2D = 0;
+    uint32_t typeSampledDepth2D = 0;
 
     /* Uniform Buffer for constants c[256] */
     uint32_t uboBlockVar = b.allocId();
@@ -561,16 +563,26 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
         }
         b.emitInst(b.typesConstantsGlobals, SpvOpVariable, { ptrOutputV4Float, psOutColor, SpvStorageClassOutput });
 
-        /* Sampler Types: OpTypeImage, OpTypeSampledImage */
+        /* Sampler Types: OpTypeImage, OpTypeSampledImage.
+         * Depth images must be declared with Depth=1. Sampling a depth image
+         * through an Unknown/color image type is illegal and faults the driver. */
         uint32_t typeImage2D = b.allocId();
         b.emitInst(b.typesConstantsGlobals, SpvOpTypeImage, { typeImage2D, typeFloat, SpvDim2D, 0, 0, 0, 1, 0 });
         typeSampledImage2D = b.allocId();
         b.emitInst(b.typesConstantsGlobals, SpvOpTypeSampledImage, { typeSampledImage2D, typeImage2D });
-        uint32_t ptrUniformConstantSampledImage = b.allocId();
-        b.emitInst(b.typesConstantsGlobals, SpvOpTypePointer, { ptrUniformConstantSampledImage, SpvStorageClassUniformConstant, typeSampledImage2D });
+        uint32_t ptrColorSampler = b.allocId();
+        b.emitInst(b.typesConstantsGlobals, SpvOpTypePointer, { ptrColorSampler, SpvStorageClassUniformConstant, typeSampledImage2D });
+
+        uint32_t typeDepthImage = b.allocId();
+        b.emitInst(b.typesConstantsGlobals, SpvOpTypeImage, { typeDepthImage, typeFloat, SpvDim2D, 1, 0, 0, 1, 0 });
+        typeSampledDepth2D = b.allocId();
+        b.emitInst(b.typesConstantsGlobals, SpvOpTypeSampledImage, { typeSampledDepth2D, typeDepthImage });
+        uint32_t ptrDepthSampler = b.allocId();
+        b.emitInst(b.typesConstantsGlobals, SpvOpTypePointer, { ptrDepthSampler, SpvStorageClassUniformConstant, typeSampledDepth2D });
 
         for (int i = 0; i < 8; ++i) {
-            b.emitInst(b.typesConstantsGlobals, SpvOpVariable, { ptrUniformConstantSampledImage, samplerVars[i], SpvStorageClassUniformConstant });
+            uint32_t ptrType = (depthSamplerMask & (1u << i)) ? ptrDepthSampler : ptrColorSampler;
+            b.emitInst(b.typesConstantsGlobals, SpvOpVariable, { ptrType, samplerVars[i], SpvStorageClassUniformConstant });
         }
     }
 
@@ -1048,10 +1060,21 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 b.emitInst(b.functionDefinitions, SpvOpVectorShuffle, { typeV2Float, uv, coord, coord, 0, 1 });
 
                 uint32_t sampledImage = b.allocId();
-                b.emitInst(b.functionDefinitions, SpvOpLoad, { typeSampledImage2D, sampledImage, samplerVars[samplerIdx] });
+                bool depthStage = (depthSamplerMask & (1u << samplerIdx)) != 0;
+                b.emitInst(b.functionDefinitions, SpvOpLoad,
+                           { depthStage ? typeSampledDepth2D : typeSampledImage2D, sampledImage, samplerVars[samplerIdx] });
 
                 uint32_t sampled = b.allocId();
-                b.emitInst(b.functionDefinitions, SpvOpImageSampleImplicitLod, { typeV4Float, sampled, sampledImage, uv });
+                if (depthStage) {
+                    /* D3D tex of a depth map returns the fetched depth in every channel. */
+                    uint32_t drefResult = b.allocId();
+                    b.emitInst(b.functionDefinitions, SpvOpImageSampleImplicitLod,
+                               { typeFloat, drefResult, sampledImage, uv });
+                    b.emitInst(b.functionDefinitions, SpvOpCompositeConstruct,
+                               { typeV4Float, sampled, drefResult, drefResult, drefResult, const1_f });
+                } else {
+                    b.emitInst(b.functionDefinitions, SpvOpImageSampleImplicitLod, { typeV4Float, sampled, sampledImage, uv });
+                }
                 emitStoreDest(dst, sampled);
                 break;
             }

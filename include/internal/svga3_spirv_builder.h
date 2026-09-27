@@ -53,6 +53,8 @@ enum SpvOp {
     SpvOpCompositeConstruct = 80,
     SpvOpCompositeExtract = 81,
     SpvOpImageSampleImplicitLod = 87,
+    SpvOpImageSampleDrefImplicitLod = 89,
+    SpvOpCompositeInsert = 82,
     SpvOpFNegate = 127,
     SpvOpFAdd = 129,
     SpvOpFSub = 131,
