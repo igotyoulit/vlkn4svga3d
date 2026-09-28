@@ -11,6 +11,8 @@
 #include <unordered_map>
 #include <vector>
 #include <array>
+#include <map>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -201,6 +203,7 @@ private:
     void initDefaultRenderStates();
     std::array<float, 16> getTransformOrDefault(SVGA3dTransformType type) const;
     VkSampler getOrCreateSampler(uint32_t stage);
+    void clearDescriptorSetCache();
     VkPipeline getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
                                    const SVGA3dVertexDecl *decls,
                                    uint32_t numDecls,
@@ -261,15 +264,21 @@ private:
     /* Descriptors and Constant Buffers */
     VkDescriptorSetLayout m_descriptorSetLayout;
     VkDescriptorSet m_descriptorSet;
+    std::map<std::array<uint64_t, SVGA3_MAX_TEXTURE_STAGES * 2>, VkDescriptorSet> m_descriptorSetCache;
     bool m_descriptorSetInitialized;
     bool m_descriptorSetDirty;
     bool m_constantsDirty;
     bool m_vsConstsUploadedForFf;
     std::array<float, 16> m_lastFfMvp;
-    VkBuffer m_vsConstBuffer;
-    VkDeviceMemory m_vsConstMemory;
-    VkBuffer m_psConstBuffer;
-    VkDeviceMemory m_psConstMemory;
+    VkBuffer m_constantRingBuffer;
+    VkDeviceMemory m_constantRingMemory;
+    void *m_constantRingMapped;
+    size_t m_constantRingSize;
+    size_t m_constantRingCursor;
+    size_t m_constantRingStride;
+    uint32_t m_vsConstDynamicOffset;
+    uint32_t m_psConstDynamicOffset;
+    uint64_t m_constantRingSubmissionSerial;
 
     /* Dummy 1x1 textures. Unbound stages and missing views sample white (1,1,1,1)
        so multitexture modulate operations preserve identity. */

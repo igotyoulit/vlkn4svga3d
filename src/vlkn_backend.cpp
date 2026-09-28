@@ -37,6 +37,7 @@ VlknBackend::VlknBackend()
     , m_cmdPool(VK_NULL_HANDLE)
     , m_cmdBuffer(VK_NULL_HANDLE)
     , m_cmdBufferRecording(false)
+    , m_completedSubmissionSerial(0)
     , m_descriptorPool(VK_NULL_HANDLE)
     , m_debugMessenger(VK_NULL_HANDLE)
     , m_validationErrors(0)
@@ -163,6 +164,9 @@ void VlknBackend::shutdown() {
 Svga3VlknStatus VlknBackend::waitIdle() {
     if (m_device && m_dispatch.vkDeviceWaitIdle) {
         m_dispatch.vkDeviceWaitIdle(m_device);
+        if (!m_cmdBufferRecording) {
+            ++m_completedSubmissionSerial;
+        }
     }
     return SVGA3_VLKN_SUCCESS;
 }
@@ -375,12 +379,13 @@ Svga3VlknStatus VlknBackend::initDevice(const Svga3VlknConfig *config) {
     /* Create Descriptor Pool for shader uniform buffers and texture samplers */
     VkDescriptorPoolSize poolSizes[] = {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1024 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2048 },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2048 }
     };
     VkDescriptorPoolCreateInfo descPoolInfo = {};
     descPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     descPoolInfo.maxSets = 1024;
-    descPoolInfo.poolSizeCount = 2;
+    descPoolInfo.poolSizeCount = 3;
     descPoolInfo.pPoolSizes = poolSizes;
     descPoolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
 
@@ -602,6 +607,8 @@ Svga3VlknStatus VlknBackend::flushCommandBuffer() {
     res = m_dispatch.vkQueueWaitIdle(m_queue);
     if (res != VK_SUCCESS) {
         log_msg("[libqemu_svga3d] vkQueueWaitIdle error: %d\n", res);
+    } else {
+        ++m_completedSubmissionSerial;
     }
     m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
 

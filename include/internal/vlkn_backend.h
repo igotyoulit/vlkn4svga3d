@@ -23,6 +23,7 @@ public:
     Svga3VlknStatus init(const Svga3VlknConfig *config);
     void shutdown();
     Svga3VlknStatus waitIdle();
+    uint64_t completedSubmissionSerial() const { return m_completedSubmissionSerial; }
 
     /* Memory allocation helpers */
     int findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
@@ -107,6 +108,7 @@ private:
     VkCommandPool m_cmdPool;
     VkCommandBuffer m_cmdBuffer;
     bool m_cmdBufferRecording;
+    uint64_t m_completedSubmissionSerial;
 
     VkDescriptorPool m_descriptorPool;
 

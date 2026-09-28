@@ -855,6 +855,11 @@ static VkResult VKAPI_CALL mock_vkAllocateDescriptorSets(VkDevice device, const 
     return VK_SUCCESS;
 }
 
+static VkResult VKAPI_CALL mock_vkFreeDescriptorSets(VkDevice device, VkDescriptorPool pool, uint32_t descriptorSetCount, const VkDescriptorSet* pDescriptorSets) {
+    (void)device; (void)pool; (void)descriptorSetCount; (void)pDescriptorSets;
+    return VK_SUCCESS;
+}
+
 static void VKAPI_CALL mock_vkUpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount, const VkWriteDescriptorSet* pDescriptorWrites, uint32_t descriptorCopyCount, const VkCopyDescriptorSet* pDescriptorCopies) {
     (void)device; (void)descriptorWriteCount; (void)pDescriptorWrites; (void)descriptorCopyCount; (void)pDescriptorCopies;
 }
@@ -889,6 +894,7 @@ static void populate_mock_table(VlknDispatchTable *t) {
     t->vkCreateDescriptorPool = mock_vkCreateDescriptorPool;
     t->vkDestroyDescriptorPool = mock_vkDestroyDescriptorPool;
     t->vkAllocateDescriptorSets = mock_vkAllocateDescriptorSets;
+    t->vkFreeDescriptorSets = mock_vkFreeDescriptorSets;
     t->vkUpdateDescriptorSets = mock_vkUpdateDescriptorSets;
     t->vkCmdBindDescriptorSets = mock_vkCmdBindDescriptorSets;
     t->vkCmdPushConstants = mock_vkCmdPushConstants;
@@ -1078,6 +1084,7 @@ bool vlkn_dispatch_init_device(VlknDispatchTable *table, VkInstance instance, Vk
     LOAD_DEV(vkCreateDescriptorPool);
     LOAD_DEV(vkDestroyDescriptorPool);
     LOAD_DEV(vkAllocateDescriptorSets);
+    LOAD_DEV(vkFreeDescriptorSets);
     LOAD_DEV(vkUpdateDescriptorSets);
     LOAD_DEV(vkCmdBindDescriptorSets);
     LOAD_DEV(vkCmdPushConstants);

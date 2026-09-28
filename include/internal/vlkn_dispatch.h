@@ -42,6 +42,7 @@ typedef struct VlknDispatchTable {
     PFN_vkCreateDescriptorPool               vkCreateDescriptorPool;
     PFN_vkDestroyDescriptorPool              vkDestroyDescriptorPool;
     PFN_vkAllocateDescriptorSets             vkAllocateDescriptorSets;
+    PFN_vkFreeDescriptorSets                 vkFreeDescriptorSets;
     PFN_vkUpdateDescriptorSets               vkUpdateDescriptorSets;
     PFN_vkCmdBindDescriptorSets              vkCmdBindDescriptorSets;
     PFN_vkCmdPushConstants                   vkCmdPushConstants;

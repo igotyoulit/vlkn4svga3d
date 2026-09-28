@@ -8,8 +8,21 @@
 #include <cstring>
 #include <algorithm>
 #include <iostream>
+#include <cstdlib>
+#include <type_traits>
 
 extern "C" void log_msg(const char *fmt, ...);
+
+namespace {
+template <typename Handle>
+static uint64_t descriptorHandleKey(Handle handle) {
+    if constexpr (std::is_pointer<Handle>::value) {
+        return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(handle));
+    } else {
+        return static_cast<uint64_t>(handle);
+    }
+}
+}
 
 /* Extern "C" conversion functions from svga3_vlkn.h */
 extern "C" {
@@ -130,11 +143,21 @@ VlknContext::VlknContext(VlknBackend *backend, VlknSurfaceManager *surfaceMgr, u
     , m_defaultVS(VK_NULL_HANDLE)
     , m_defaultFS(VK_NULL_HANDLE)
     , m_defaultFSTex(VK_NULL_HANDLE)
+    , m_descriptorSet(VK_NULL_HANDLE)
     , m_descriptorSetInitialized(false)
     , m_descriptorSetDirty(true)
     , m_constantsDirty(true)
     , m_vsConstsUploadedForFf(false)
     , m_lastFfMvp{}
+    , m_constantRingBuffer(VK_NULL_HANDLE)
+    , m_constantRingMemory(VK_NULL_HANDLE)
+    , m_constantRingMapped(nullptr)
+    , m_constantRingSize(4 * 1024 * 1024)
+    , m_constantRingCursor(0)
+    , m_constantRingStride(0)
+    , m_vsConstDynamicOffset(0)
+    , m_psConstDynamicOffset(0)
+    , m_constantRingSubmissionSerial(0)
     , m_dummyImage(VK_NULL_HANDLE)
     , m_dummyMemory(VK_NULL_HANDLE)
     , m_dummyView(VK_NULL_HANDLE)
@@ -209,12 +232,12 @@ VlknContext::VlknContext(VlknBackend *backend, VlknSurfaceManager *surfaceMgr, u
     /* Create descriptor set layout for UBOs (bindings 0, 1) and samplers (bindings 2..9) */
     VkDescriptorSetLayoutBinding descBindings[10] = {};
     descBindings[0].binding = 0;
-    descBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    descBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     descBindings[0].descriptorCount = 1;
     descBindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
     descBindings[1].binding = 1;
-    descBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    descBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     descBindings[1].descriptorCount = 1;
     descBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
@@ -238,29 +261,25 @@ VlknContext::VlknContext(VlknBackend *backend, VlknSurfaceManager *surfaceMgr, u
     layoutInfo.pSetLayouts = &m_descriptorSetLayout;
     m_backend->dispatch().vkCreatePipelineLayout(m_backend->device(), &layoutInfo, nullptr, &m_defaultPipelineLayout);
 
-    /* Allocate descriptor set */
-    VkDescriptorSetAllocateInfo dsAlloc = {};
-    dsAlloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsAlloc.descriptorPool = m_backend->descriptorPool();
-    dsAlloc.descriptorSetCount = 1;
-    dsAlloc.pSetLayouts = &m_descriptorSetLayout;
-    m_backend->dispatch().vkAllocateDescriptorSets(m_backend->device(), &dsAlloc, &m_descriptorSet);
-
-    /* Create VS and PS constant buffers (4096 bytes each for 256 vec4 constants) */
+    /* Dynamic UBO slices let each draw keep its constants without waiting for
+     * the GPU before the next update. Retire and wrap the ring only after a
+     * completed queue submission. */
+    VkDeviceSize alignment = m_backend->properties().limits.minUniformBufferOffsetAlignment;
+    if (alignment == 0) alignment = 1;
+    m_constantRingStride = (4096 + alignment - 1) / alignment * alignment;
+    m_constantRingSize -= m_constantRingSize % (m_constantRingStride * 2);
     m_backend->createBuffer(
-        4096,
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        m_constantRingSize,
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        &m_vsConstBuffer,
-        &m_vsConstMemory
+        &m_constantRingBuffer,
+        &m_constantRingMemory
     );
-    m_backend->createBuffer(
-        4096,
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        &m_psConstBuffer,
-        &m_psConstMemory
-    );
+    if (m_constantRingMemory) {
+        m_backend->dispatch().vkMapMemory(m_backend->device(), m_constantRingMemory, 0,
+                                          m_constantRingSize, 0, &m_constantRingMapped);
+    }
+    m_constantRingSubmissionSerial = m_backend->completedSubmissionSerial();
 
     /* Create 1x1 dummy texture and sampler for unbound sampler stages */
     VkImageCreateInfo imgInfo = {};
@@ -493,7 +512,7 @@ VlknContext::~VlknContext() {
     endRenderPassIfActive();
     if (m_backend) {
         m_backend->flushCommandBuffer();
-        m_backend->waitIdle();
+        clearDescriptorSetCache();
     }
 
     for (auto &pair : m_pipelineCache) {
@@ -581,21 +600,17 @@ VlknContext::~VlknContext() {
         m_backend->freeMemory(m_dummyVbMemory);
         m_dummyVbMemory = VK_NULL_HANDLE;
     }
-    if (m_vsConstBuffer) {
-        m_backend->dispatch().vkDestroyBuffer(m_backend->device(), m_vsConstBuffer, nullptr);
-        m_vsConstBuffer = VK_NULL_HANDLE;
+    if (m_constantRingMemory && m_constantRingMapped) {
+        m_backend->dispatch().vkUnmapMemory(m_backend->device(), m_constantRingMemory);
+        m_constantRingMapped = nullptr;
     }
-    if (m_vsConstMemory) {
-        m_backend->freeMemory(m_vsConstMemory);
-        m_vsConstMemory = VK_NULL_HANDLE;
+    if (m_constantRingBuffer) {
+        m_backend->dispatch().vkDestroyBuffer(m_backend->device(), m_constantRingBuffer, nullptr);
+        m_constantRingBuffer = VK_NULL_HANDLE;
     }
-    if (m_psConstBuffer) {
-        m_backend->dispatch().vkDestroyBuffer(m_backend->device(), m_psConstBuffer, nullptr);
-        m_psConstBuffer = VK_NULL_HANDLE;
-    }
-    if (m_psConstMemory) {
-        m_backend->freeMemory(m_psConstMemory);
-        m_psConstMemory = VK_NULL_HANDLE;
+    if (m_constantRingMemory) {
+        m_backend->freeMemory(m_constantRingMemory);
+        m_constantRingMemory = VK_NULL_HANDLE;
     }
     if (m_defaultPipelineLayout) {
         m_backend->dispatch().vkDestroyPipelineLayout(m_backend->device(), m_defaultPipelineLayout, nullptr);
@@ -1164,7 +1179,6 @@ Svga3VlknStatus VlknContext::ensureRenderPassActive() {
     if (fbNeedsRebuild) {
         if (m_activeFramebuffer != VK_NULL_HANDLE) {
             m_backend->flushCommandBuffer();
-            m_backend->waitIdle();
             m_backend->dispatch().vkDestroyFramebuffer(m_backend->device(), m_activeFramebuffer, nullptr);
             m_activeFramebuffer = VK_NULL_HANDLE;
         }
@@ -1274,12 +1288,38 @@ void VlknContext::endRenderPassIfActive() {
         VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
         m_backend->dispatch().vkCmdEndRenderPass(cb);
         m_inRenderPass = false;
-        m_backend->flushCommandBuffer();
     }
+}
+
+void VlknContext::clearDescriptorSetCache() {
+    if (!m_backend || m_descriptorSetCache.empty()) {
+        m_descriptorSet = VK_NULL_HANDLE;
+        m_descriptorSetInitialized = false;
+        return;
+    }
+
+    std::vector<VkDescriptorSet> sets;
+    sets.reserve(m_descriptorSetCache.size());
+    for (const auto &entry : m_descriptorSetCache) {
+        sets.push_back(entry.second);
+    }
+    if (m_backend->dispatch().vkFreeDescriptorSets) {
+        m_backend->dispatch().vkFreeDescriptorSets(m_backend->device(), m_backend->descriptorPool(),
+                                                    static_cast<uint32_t>(sets.size()), sets.data());
+    }
+    m_descriptorSetCache.clear();
+    m_descriptorSet = VK_NULL_HANDLE;
+    m_descriptorSetInitialized = false;
 }
 
 void VlknContext::invalidateSurface(uint32_t sid) {
     endRenderPassIfActive();
+    /* The surface may still be referenced by recorded draws or descriptors. */
+    m_backend->flushCommandBuffer();
+    /* Descriptor sets are immutable while commands using them are pending.
+     * Retire the cache after the flush so destroyed image views are released. */
+    clearDescriptorSetCache();
+    m_descriptorSetDirty = true;
 
     bool fbAffected = false;
     for (uint32_t i = 0; i < SVGA3_MAX_RENDER_TARGETS; ++i) {
@@ -1294,8 +1334,6 @@ void VlknContext::invalidateSurface(uint32_t sid) {
 
     if (fbAffected) {
         if (m_activeFramebuffer != VK_NULL_HANDLE) {
-            m_backend->flushCommandBuffer();
-            m_backend->waitIdle();
             m_backend->dispatch().vkDestroyFramebuffer(m_backend->device(), m_activeFramebuffer, nullptr);
             m_activeFramebuffer = VK_NULL_HANDLE;
         }
@@ -1394,6 +1432,7 @@ Svga3VlknStatus VlknContext::clear(SVGA3dClearFlag flags,
     if (rtSid != 0 && rtSid != SVGA3D_INVALID_ID) {
         VlknSurface *rtSurf = m_surfaceMgr->getSurface(rtSid);
         if (rtSurf && rtSurf->width() >= 128 && rtSurf->height() >= 128 && !rtSurf->isDepthStencil()) {
+            rtSurf->invalidateReadback();
             markWindowDrawn(rtSid);
         }
     }
@@ -1752,111 +1791,123 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
 
     /* 1. Update Constant Buffers (UBOs) */
     if (m_constantsDirty) {
-        endRenderPassIfActive();
+        if (m_constantRingMapped && m_constantRingBuffer) {
+            const uint64_t submissionSerial = m_backend->completedSubmissionSerial();
+            if (submissionSerial != m_constantRingSubmissionSerial) {
+                m_constantRingCursor = 0;
+                m_constantRingSubmissionSerial = submissionSerial;
+            }
+            const size_t slotSize = m_constantRingStride * 2;
+            if (m_constantRingCursor + slotSize > m_constantRingSize) {
+                /* The ring is full. Submit and wait before reusing any slice. */
+                endRenderPassIfActive();
+                m_backend->flushCommandBuffer();
+                m_constantRingCursor = 0;
+                m_constantRingSubmissionSerial = m_backend->completedSubmissionSerial();
+            }
 
-        if (m_vsConstBuffer && m_vsConstMemory) {
-            void *mapped = nullptr;
-            if (m_backend->dispatch().vkMapMemory(m_backend->device(), m_vsConstMemory, 0, sizeof(m_vsConsts.floatConsts), 0, &mapped) == VK_SUCCESS) {
-                if (m_boundVS == SVGA3D_INVALID_ID) {
-                    float tempConsts[256][4];
-                    memcpy(tempConsts, m_vsConsts.floatConsts, sizeof(tempConsts));
-                    for (int col = 0; col < 4; ++col) {
-                        for (int row = 0; row < 4; ++row) {
-                            tempConsts[col][row] = ffMvp[row * 4 + col];
-                        }
+            const size_t vsOffset = m_constantRingCursor;
+            const size_t psOffset = vsOffset + m_constantRingStride;
+            uint8_t *mapped = static_cast<uint8_t*>(m_constantRingMapped);
+            if (m_boundVS == SVGA3D_INVALID_ID) {
+                float tempConsts[256][4];
+                memcpy(tempConsts, m_vsConsts.floatConsts, sizeof(tempConsts));
+                for (int col = 0; col < 4; ++col) {
+                    for (int row = 0; row < 4; ++row) {
+                        tempConsts[col][row] = ffMvp[row * 4 + col];
                     }
-                    memcpy(mapped, tempConsts, sizeof(tempConsts));
-                    m_lastFfMvp = ffMvp;
-                    m_vsConstsUploadedForFf = true;
-                } else {
-                    memcpy(mapped, m_vsConsts.floatConsts, sizeof(m_vsConsts.floatConsts));
-                    m_vsConstsUploadedForFf = false;
                 }
-                m_backend->dispatch().vkUnmapMemory(m_backend->device(), m_vsConstMemory);
+                memcpy(mapped + vsOffset, tempConsts, sizeof(tempConsts));
+                m_lastFfMvp = ffMvp;
+                m_vsConstsUploadedForFf = true;
+            } else {
+                memcpy(mapped + vsOffset, m_vsConsts.floatConsts, sizeof(m_vsConsts.floatConsts));
+                m_vsConstsUploadedForFf = false;
             }
-        }
-        if (m_psConstBuffer && m_psConstMemory) {
-            void *mapped = nullptr;
-            if (m_backend->dispatch().vkMapMemory(m_backend->device(), m_psConstMemory, 0, sizeof(m_psConsts.floatConsts), 0, &mapped) == VK_SUCCESS) {
-                memcpy(mapped, m_psConsts.floatConsts, sizeof(m_psConsts.floatConsts));
-                m_backend->dispatch().vkUnmapMemory(m_backend->device(), m_psConstMemory);
-            }
+            memcpy(mapped + psOffset, m_psConsts.floatConsts, sizeof(m_psConsts.floatConsts));
+            m_vsConstDynamicOffset = static_cast<uint32_t>(vsOffset);
+            m_psConstDynamicOffset = static_cast<uint32_t>(psOffset);
+            m_constantRingCursor += slotSize;
         }
         m_constantsDirty = false;
     }
 
-    /* 2. Update Descriptor Set (only when dirty or not yet initialized or underlying imageViews/samplers changed) */
-    bool needDescriptorUpdate = m_descriptorSetDirty || !m_descriptorSetInitialized;
-    if (!needDescriptorUpdate) {
-        for (uint32_t i = 0; i < 8; ++i) {
-            bool stageBound = (m_stages[i].sid != SVGA3D_INVALID_ID && m_stages[i].sid != 0);
-            VlknSurface *surf = stageBound ? m_surfaceMgr->getSurface(m_stages[i].sid) : nullptr;
-            VkImageView expView = (surf && surf->imageView()) ? surf->imageView() : m_whiteView;
-            VkSampler expSamp = (surf && surf->imageView()) ? getOrCreateSampler(i) : m_dummySampler;
-            if (m_boundImageViews[i] != expView || m_boundSamplers[i] != expSamp) {
-                needDescriptorUpdate = true;
-                break;
-            }
+    /* Descriptor sets are immutable once a recorded draw references them.
+     * Cache one set per texture/sampler tuple so state changes never force a
+     * queue-idle just to rewrite a shared set. */
+    using DescriptorKey = std::array<uint64_t, SVGA3_MAX_TEXTURE_STAGES * 2>;
+    DescriptorKey descriptorKey{};
+    VkDescriptorImageInfo imageInfos[SVGA3_MAX_TEXTURE_STAGES] = {};
+    for (uint32_t i = 0; i < SVGA3_MAX_TEXTURE_STAGES; ++i) {
+        imageInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        bool stageBound = (m_stages[i].sid != SVGA3D_INVALID_ID && m_stages[i].sid != 0);
+        VlknSurface *surf = stageBound ? m_surfaceMgr->getSurface(m_stages[i].sid) : nullptr;
+        if (surf && surf->imageView()) {
+            imageInfos[i].imageView = surf->imageView();
+            imageInfos[i].sampler = getOrCreateSampler(i);
+        } else {
+            imageInfos[i].imageView = m_whiteView;
+            imageInfos[i].sampler = m_dummySampler;
         }
+        m_boundImageViews[i] = imageInfos[i].imageView;
+        m_boundSamplers[i] = imageInfos[i].sampler;
+        descriptorKey[i * 2] = descriptorHandleKey(imageInfos[i].imageView);
+        descriptorKey[i * 2 + 1] = descriptorHandleKey(imageInfos[i].sampler);
     }
 
-    if (m_descriptorSet && needDescriptorUpdate) {
-        endRenderPassIfActive();
+    auto descriptorIt = m_descriptorSetCache.find(descriptorKey);
+    if (descriptorIt != m_descriptorSetCache.end()) {
+        m_descriptorSet = descriptorIt->second;
+    } else {
+        VkDescriptorSet newSet = VK_NULL_HANDLE;
+        VkDescriptorSetAllocateInfo dsAlloc = {};
+        dsAlloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsAlloc.descriptorPool = m_backend->descriptorPool();
+        dsAlloc.descriptorSetCount = 1;
+        dsAlloc.pSetLayouts = &m_descriptorSetLayout;
+        VkResult allocResult = m_backend->dispatch().vkAllocateDescriptorSets(
+            m_backend->device(), &dsAlloc, &newSet);
+        if (allocResult != VK_SUCCESS) {
+            log_msg("[libqemu_svga3d] vkAllocateDescriptorSets failed: %d\n", allocResult);
+            return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+        }
 
         VkDescriptorBufferInfo vsBufInfo = {};
-        vsBufInfo.buffer = m_vsConstBuffer;
+        vsBufInfo.buffer = m_constantRingBuffer;
         vsBufInfo.offset = 0;
         vsBufInfo.range = sizeof(m_vsConsts.floatConsts);
-
         VkDescriptorBufferInfo psBufInfo = {};
-        psBufInfo.buffer = m_psConstBuffer;
+        psBufInfo.buffer = m_constantRingBuffer;
         psBufInfo.offset = 0;
         psBufInfo.range = sizeof(m_psConsts.floatConsts);
 
-        VkDescriptorImageInfo imageInfos[8];
-        for (uint32_t i = 0; i < 8; ++i) {
-            imageInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            bool stageBound = (m_stages[i].sid != SVGA3D_INVALID_ID && m_stages[i].sid != 0);
-            VlknSurface *surf = stageBound ? m_surfaceMgr->getSurface(m_stages[i].sid) : nullptr;
-            if (surf && surf->imageView()) {
-                imageInfos[i].imageView = surf->imageView();
-                imageInfos[i].sampler = getOrCreateSampler(i);
-            } else {
-                imageInfos[i].imageView = m_whiteView;
-                imageInfos[i].sampler = m_dummySampler;
-            }
-            m_boundImageViews[i] = imageInfos[i].imageView;
-            m_boundSamplers[i] = imageInfos[i].sampler;
-        }
-
         VkWriteDescriptorSet writes[10] = {};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = m_descriptorSet;
+        writes[0].dstSet = newSet;
         writes[0].dstBinding = 0;
         writes[0].descriptorCount = 1;
-        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         writes[0].pBufferInfo = &vsBufInfo;
-
         writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = m_descriptorSet;
+        writes[1].dstSet = newSet;
         writes[1].dstBinding = 1;
         writes[1].descriptorCount = 1;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         writes[1].pBufferInfo = &psBufInfo;
-
-        for (uint32_t i = 0; i < 8; ++i) {
+        for (uint32_t i = 0; i < SVGA3_MAX_TEXTURE_STAGES; ++i) {
             writes[2 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[2 + i].dstSet = m_descriptorSet;
+            writes[2 + i].dstSet = newSet;
             writes[2 + i].dstBinding = 2 + i;
             writes[2 + i].descriptorCount = 1;
             writes[2 + i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             writes[2 + i].pImageInfo = &imageInfos[i];
         }
-
         m_backend->dispatch().vkUpdateDescriptorSets(m_backend->device(), 10, writes, 0, nullptr);
-        m_descriptorSetInitialized = true;
-        m_descriptorSetDirty = false;
+        m_descriptorSetCache.emplace(descriptorKey, newSet);
+        m_descriptorSet = newSet;
     }
+    m_descriptorSetInitialized = true;
+    m_descriptorSetDirty = false;
 
     /* Ensure all bound textures are transitioned to SHADER_READ_ONLY_OPTIMAL */
     for (uint32_t i = 0; i < SVGA3_MAX_TEXTURE_STAGES; ++i) {
@@ -1933,18 +1984,26 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
     ensureRenderPassActive();
     VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
 
+    /* Draw tracing inspects and maps vertex buffers. Keep it opt-in so normal
+     * rendering avoids per-draw log I/O and host-memory map/unmap calls. */
+    static const bool traceDraws = []() {
+        const char *value = std::getenv("SVGA3D_TRACE_DRAWS");
+        return value && value[0] != '\0' && value[0] != '0';
+    }();
     bool isHand = false;
-    for (uint32_t i = 0; i < numRanges; ++i) {
-        if (ranges[i].primitiveCount == 12) {
-            isHand = true;
-            break;
+    if (traceDraws) {
+        for (uint32_t i = 0; i < numRanges; ++i) {
+            if (ranges[i].primitiveCount == 12) {
+                isHand = true;
+                break;
+            }
         }
     }
     static uint32_t handLogCount = 0;
     bool shouldLogHand = isHand && (handLogCount < 20 || (handLogCount % 300) == 0);
     if (isHand) handLogCount++;
 
-    if (shouldLogHand || m_drawCount <= 5 || (m_drawCount % 500) == 0 || m_boundVS == 7 || m_stages[0].sid == 73) {
+    if (traceDraws && (shouldLogHand || m_drawCount <= 5 || (m_drawCount % 500) == 0 || m_boundVS == 7 || m_stages[0].sid == 73)) {
         bool useFfTex = (m_boundPS == SVGA3D_INVALID_ID && m_stages[0].sid != SVGA3D_INVALID_ID && m_stages[0].sid != 0 && m_surfaceMgr->getSurface(m_stages[0].sid) != nullptr);
         log_msg("[libqemu_svga3d] ctx::draw #%u (cid=%u, isHand=%d): boundVS=%u, boundPS=%u, useFfTex=%d, stage0.sid=%u, rtSid=%u, cull=%u, vp=(%.1f,%.1f %.1fx%.1f)\n",
                 m_drawCount + 1, m_cid, (int)isHand, m_boundVS, m_boundPS, (int)useFfTex, m_stages[0].sid, m_renderTargets[0].sid, m_renderStates[SVGA3D_RS_CULLMODE],
@@ -2021,8 +2080,9 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
     m_backend->dispatch().vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
     if (m_descriptorSet) {
+        uint32_t dynamicOffsets[2] = {m_vsConstDynamicOffset, m_psConstDynamicOffset};
         m_backend->dispatch().vkCmdBindDescriptorSets(
-            cb, VK_PIPELINE_BIND_POINT_GRAPHICS, m_defaultPipelineLayout, 0, 1, &m_descriptorSet, 0, nullptr
+            cb, VK_PIPELINE_BIND_POINT_GRAPHICS, m_defaultPipelineLayout, 0, 1, &m_descriptorSet, 2, dynamicOffsets
         );
     }
 
@@ -2121,6 +2181,7 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
     if (rtSid != 0 && rtSid != SVGA3D_INVALID_ID) {
         VlknSurface *rtSurf = m_surfaceMgr->getSurface(rtSid);
         if (rtSurf && rtSurf->width() >= 128 && rtSurf->height() >= 128 && !rtSurf->isDepthStencil()) {
+            rtSurf->invalidateReadback();
             markWindowDrawn(rtSid);
         }
     }

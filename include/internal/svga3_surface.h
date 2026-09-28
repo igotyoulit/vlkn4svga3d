@@ -104,6 +104,14 @@ public:
                                         size_t *outRowPitch,
                                         std::unique_lock<std::mutex> &outLock);
 
+    void invalidateReadback() { m_readbackValid = false; }
+    bool hasReadback(uint32_t w, uint32_t h) const {
+        return m_readbackValid && m_readbackW == w && m_readbackH == h && !m_readback.empty();
+    }
+    const uint8_t *readbackData() const { return m_readback.data(); }
+    size_t readbackPitch() const { return m_readbackPitch; }
+    void storeReadback(uint32_t w, uint32_t h, size_t pitch, const void *src);
+
 private:
     VlknBackend *m_backend;
     uint32_t m_sid;
@@ -131,6 +139,12 @@ private:
     VkBuffer m_buffer;
     VkDeviceMemory m_bufferMemory;
     size_t m_bufferSize;
+
+    bool m_readbackValid;
+    uint32_t m_readbackW;
+    uint32_t m_readbackH;
+    size_t m_readbackPitch;
+    std::vector<uint8_t> m_readback;
 
     std::vector<SurfaceMipLevel> m_mips;
     std::unordered_map<uint64_t, VkImageView> m_rtViews;

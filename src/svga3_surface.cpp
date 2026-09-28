@@ -151,6 +151,10 @@ VlknSurface::VlknSurface(VlknBackend *backend,
     , m_buffer(VK_NULL_HANDLE)
     , m_bufferMemory(VK_NULL_HANDLE)
     , m_bufferSize(0)
+    , m_readbackValid(false)
+    , m_readbackW(0)
+    , m_readbackH(0)
+    , m_readbackPitch(0)
 {
     m_vkFormat = (VkFormat)svga3d_to_vk_format((uint32_t)format);
     if (m_vkFormat == VK_FORMAT_UNDEFINED) {
@@ -359,6 +363,10 @@ Svga3VlknStatus VlknSurface::ensureBufferSize(size_t requiredSize) {
     }
     newSize = (newSize + 65535) & ~((size_t)65535);
 
+    /* The old allocation can be in flight, and its contents must be stable
+     * while copied into the replacement buffer. */
+    m_backend->flushCommandBuffer();
+
     VkBuffer newBuffer = VK_NULL_HANDLE;
     VkDeviceMemory newMemory = VK_NULL_HANDLE;
 
@@ -387,9 +395,6 @@ Svga3VlknStatus VlknSurface::ensureBufferSize(size_t requiredSize) {
         }
         m_backend->dispatch().vkUnmapMemory(m_backend->device(), newMemory);
     }
-
-    m_backend->flushCommandBuffer();
-    m_backend->waitIdle();
 
     if (m_buffer) {
         m_backend->dispatch().vkDestroyBuffer(m_backend->device(), m_buffer, nullptr);
@@ -448,7 +453,6 @@ void VlknSurface::ensureViewMipLevels(uint32_t levels) {
 void VlknSurface::destroy() {
     if (m_backend) {
         m_backend->flushCommandBuffer();
-        m_backend->waitIdle();
     }
 
     if (m_buffer) {
@@ -527,6 +531,7 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
     if (!guestData || mipLevel >= m_mipLevels) {
         return SVGA3_VLKN_ERROR_INVALID_PARAM;
     }
+    invalidateReadback();
 
     const SurfaceMipLevel &mip = m_mips[mipLevel];
     uint32_t bw = box ? box->w : mip.width;
@@ -929,6 +934,11 @@ Svga3VlknStatus VlknSurface::dmaDownload(uint32_t mipLevel,
                 }
             }
         }
+        bool fullMip = bx == 0 && by == 0 && bz == 0 &&
+                       bw == mip.width && bh == mip.height && bd == 1;
+        if (mipLevel == 0 && !m_isDepthStencil && fullMip) {
+            storeReadback(bw, bh, rowPitch, mapped);
+        }
         return SVGA3_VLKN_SUCCESS;
     }
 
@@ -1019,10 +1029,29 @@ Svga3VlknStatus VlknSurface::dmaDownload(uint32_t mipLevel,
         }
     }
 
+    bool fullMip = bx == 0 && by == 0 && bz == 0 &&
+                   bw == mip.width && bh == mip.height && bd == 1;
+    if (mipLevel == 0 && !m_isDepthStencil && fullMip) {
+        storeReadback(bw, bh, copyRowBytes, mapped);
+    }
+
     m_backend->dispatch().vkUnmapMemory(m_backend->device(), stagingMem);
     m_backend->destroyBuffer(stagingBuf, stagingMem);
 
     return SVGA3_VLKN_SUCCESS;
+}
+
+void VlknSurface::storeReadback(uint32_t w, uint32_t h, size_t pitch, const void *src) {
+    if (!src || w == 0 || h == 0 || pitch == 0) {
+        m_readbackValid = false;
+        return;
+    }
+    m_readback.resize(pitch * h);
+    memcpy(m_readback.data(), src, pitch * h);
+    m_readbackW = w;
+    m_readbackH = h;
+    m_readbackPitch = pitch;
+    m_readbackValid = true;
 }
 
 VlknSurfaceManager::VlknSurfaceManager(VlknBackend *backend)
@@ -1042,7 +1071,6 @@ Svga3VlknStatus VlknSurfaceManager::defineSurface(uint32_t sid,
     std::lock_guard<std::mutex> lock(m_mutex);
     auto it = m_surfaces.find(sid);
     if (it != m_surfaces.end()) {
-        if (m_backend) m_backend->waitIdle();
         if (m_contextMgr) m_contextMgr->invalidateSurface(sid);
         m_surfaces.erase(it);
     }
@@ -1064,7 +1092,6 @@ Svga3VlknStatus VlknSurfaceManager::destroySurface(uint32_t sid) {
         return SVGA3_VLKN_ERROR_NOT_FOUND;
     }
 
-    if (m_backend) m_backend->waitIdle();
     if (m_contextMgr) m_contextMgr->invalidateSurface(sid);
     m_surfaces.erase(it);
     return SVGA3_VLKN_SUCCESS;
@@ -1179,7 +1206,6 @@ Svga3VlknStatus VlknSurfaceManager::defineSurfaceV2(uint32_t sid,
     std::lock_guard<std::mutex> lock(m_mutex);
     auto it = m_surfaces.find(sid);
     if (it != m_surfaces.end()) {
-        if (m_backend) m_backend->waitIdle();
         if (m_contextMgr) m_contextMgr->invalidateSurface(sid);
         m_surfaces.erase(it);
     }

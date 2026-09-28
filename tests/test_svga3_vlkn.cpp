@@ -25,6 +25,16 @@
 
 static int g_testsPassed = 0;
 static int g_testsFailed = 0;
+static PFN_vkQueueSubmit g_originalQueueSubmit = nullptr;
+static uint32_t g_queueSubmitCount = 0;
+
+static VkResult VKAPI_CALL countQueueSubmit(VkQueue queue,
+                                           uint32_t submitCount,
+                                           const VkSubmitInfo *submits,
+                                           VkFence fence) {
+    ++g_queueSubmitCount;
+    return g_originalQueueSubmit(queue, submitCount, submits, fence);
+}
 
 #define TEST_CHECK(cond, desc) do { \
     if (cond) { \
@@ -34,6 +44,41 @@ static int g_testsFailed = 0;
         std::cerr << ANSI_RED << "  [FAIL] " << desc << " (" << __FILE__ << ":" << __LINE__ << ")" << ANSI_RESET << std::endl; \
     } \
 } while(0)
+
+static void TestRenderPassEndingBatchesCommands() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create batching regression device");
+    if (!dev) return;
+
+    SVGA3dSize size = {64, 64, 1};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 9100, SVGA3D_SURFACE_HINT_RENDERTARGET,
+                                         SVGA3D_A8R8G8B8, &size, 1) == SVGA3_VLKN_SUCCESS,
+               "Create render target for batching regression");
+    TEST_CHECK(svga3_vlkn_context_create(dev, 9100) == SVGA3_VLKN_SUCCESS,
+               "Create context for batching regression");
+    TEST_CHECK(svga3_vlkn_context_set_render_target(dev, 9100, SVGA3D_RT_COLOR0, 9100, 0, 0) ==
+                   SVGA3_VLKN_SUCCESS,
+               "Bind batching regression render target");
+
+    auto &dispatch = dev->backend->dispatch();
+    g_originalQueueSubmit = dispatch.vkQueueSubmit;
+    g_queueSubmitCount = 0;
+    dispatch.vkQueueSubmit = countQueueSubmit;
+    TEST_CHECK(svga3_vlkn_context_clear(dev, 9100, SVGA3D_CLEAR_COLOR, 0xff336699, 1.0f, 0,
+                                       nullptr, 0) == SVGA3_VLKN_SUCCESS,
+               "Record clear in active render pass");
+    TEST_CHECK(svga3_vlkn_context_set_render_target(dev, 9100, SVGA3D_RT_COLOR0, 9100, 0, 0) ==
+                   SVGA3_VLKN_SUCCESS,
+               "End render pass without submitting the command buffer");
+    TEST_CHECK(g_queueSubmitCount == 0, "Render pass end does not submit or wait for the queue");
+
+    dev->backend->flushCommandBuffer();
+    TEST_CHECK(g_queueSubmitCount == 1, "Explicit flush submits the batched render work");
+    dispatch.vkQueueSubmit = g_originalQueueSubmit;
+    svga3_vlkn_device_destroy(dev);
+}
 
 /* --------------------------------------------------------------------------
  * Test 1: Device Lifecycle & Oracle Capability Verification
@@ -576,6 +621,31 @@ static void TestDrawPrimitives(Svga3VlknDevice *dev) {
         );
         TEST_CHECK(st == SVGA3_VLKN_SUCCESS, "Draw cached pipeline " + std::to_string(topologies[t]));
     }
+
+    /* A fixed-function transform update gets a new ring slice and must not
+     * submit/wait for the command buffer that contains earlier draws. */
+    auto &dispatch = dev->backend->dispatch();
+    g_originalQueueSubmit = dispatch.vkQueueSubmit;
+    g_queueSubmitCount = 0;
+    dispatch.vkQueueSubmit = countQueueSubmit;
+    const float movedTransform[16] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0.25f, 0, 0, 1
+    };
+    Svga3VlknStatus st = svga3_vlkn_context_set_transform(dev, cid, SVGA3D_TRANSFORM_WORLD,
+                                                         movedTransform);
+    TEST_CHECK(st == SVGA3_VLKN_SUCCESS, "Update fixed-function transform for ring test");
+    SVGA3dPrimitiveRange ringRange{};
+    ringRange.primType = topologies[5];
+    ringRange.primitiveCount = 4;
+    st = svga3_vlkn_context_draw(dev, cid, topologies[5], decls, 2, &ringRange, 1);
+    TEST_CHECK(st == SVGA3_VLKN_SUCCESS, "Draw with changed constants from a new ring slice");
+    TEST_CHECK(g_queueSubmitCount == 0, "Dynamic constant update does not submit or wait for prior draws");
+    dev->backend->flushCommandBuffer();
+    TEST_CHECK(g_queueSubmitCount == 1, "Explicit flush submits draws using the constant ring");
+    dispatch.vkQueueSubmit = g_originalQueueSubmit;
 
     std::cout << ANSI_GREEN << "  Draw calls across all topologies verified successfully." << ANSI_RESET << std::endl;
 }
@@ -1477,6 +1547,7 @@ int main() {
 
     TestFenceWithoutWindow();
     TestDepthVariantCleanup();
+    TestRenderPassEndingBatchesCommands();
     TestSurfaceFormatMappings();
     TestTopologyMappings();
     TestStateConverters();

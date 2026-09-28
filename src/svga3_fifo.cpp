@@ -26,8 +26,15 @@ static void blitClientSurfaceToFramebuffer(Svga3VlknDevice *dev, uint32_t cid, u
     const void *mapped = nullptr;
     size_t rowPitch = 0;
     std::unique_lock<std::mutex> lock;
-    Svga3VlknStatus stDown = surf->dmaDownloadToStaging(0, nullptr, &mapped, &rowPitch, lock);
-    if (stDown != SVGA3_VLKN_SUCCESS || !mapped) return;
+    bool reused = false;
+    if (surf->hasReadback(surf->width(), surf->height())) {
+        mapped = surf->readbackData();
+        rowPitch = surf->readbackPitch();
+        reused = true;
+    } else {
+        Svga3VlknStatus stDown = surf->dmaDownloadToStaging(0, nullptr, &mapped, &rowPitch, lock);
+        if (stDown != SVGA3_VLKN_SUCCESS || !mapped) return;
+    }
 
     uint32_t surfW = surf->width();
     uint32_t surfH = surf->height();
@@ -64,10 +71,11 @@ static void blitClientSurfaceToFramebuffer(Svga3VlknDevice *dev, uint32_t cid, u
         uint8_t *dst = fb.hva + (dstY + y) * dstPitch + dstX * dstBpp;
         memcpy(dst, src + y * rowPitch, rowBytes);
     }
+    if (!reused) surf->storeReadback(surfW, surfH, rowPitch, mapped);
 
     dev->guestMem->notifyDisplayUpdate(dstX, dstY, copyW, copyH);
 
-    lock.unlock();
+    if (lock.owns_lock()) lock.unlock();
 
     static uint32_t blit_count = 0;
     blit_count++;
@@ -80,16 +88,20 @@ static void blitClientSurfaceToFramebuffer(Svga3VlknDevice *dev, uint32_t cid, u
 void svga3_vlkn_present_client_surfaces(Svga3VlknDevice *dev, const char *reason) {
     if (!dev) return;
 
-    /* The preload fence handler signals completion after this returns. Finish
-     * queued work even when it only touches offscreen/depth targets. */
+    /* Close active passes before readback. A pending window readback submits
+     * the draw and copy together, so flushing here would add a queue-idle per
+     * frame before the readback's own queue-idle. */
     if (dev->contextMgr) dev->contextMgr->endAllRenderPasses();
-    if (dev->backend) dev->backend->flushCommandBuffer();
 
     if (!dev->contextMgr || !dev->surfaceMgr || !dev->guestMem) return;
     auto pending = dev->contextMgr->collectPendingWindowPresents();
     for (const auto &item : pending) {
         blitClientSurfaceToFramebuffer(dev, item.first, item.second, reason);
     }
+
+    /* The readback normally flushed the command buffer. This also completes
+     * work submitted on paths that have no window surface to read back. */
+    if (dev->backend) dev->backend->flushCommandBuffer();
 }
 
 Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
