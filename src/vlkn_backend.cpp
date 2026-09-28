@@ -245,7 +245,10 @@ Svga3VlknStatus VlknBackend::initInstance(const Svga3VlknConfig *config) {
         return SVGA3_VLKN_ERROR_VULKAN_INIT_FAILED;
     }
 
-    vlkn_dispatch_init_instance(&m_dispatch, m_instance);
+    if (!vlkn_dispatch_init_instance(&m_dispatch, m_instance)) {
+        log_msg("[libqemu_svga3d] vlkn_dispatch_init_instance failed\n");
+        return SVGA3_VLKN_ERROR_VULKAN_INIT_FAILED;
+    }
 
     if (config && config->enableValidationLayers && !m_dispatch.isMock && !extensions.empty()) {
         PFN_vkCreateDebugUtilsMessengerEXT pfnCreateDebugUtils =
@@ -310,12 +313,18 @@ Svga3VlknStatus VlknBackend::selectPhysicalDevice(const Svga3VlknConfig *config)
     std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
     m_dispatch.vkGetPhysicalDeviceQueueFamilyProperties(m_physicalDevice, &queueFamilyCount, queueFamilies.data());
 
+    bool foundGraphicsQueue = false;
     m_queueFamilyIndex = 0;
     for (uint32_t i = 0; i < queueFamilyCount; ++i) {
         if (queueFamilies[i].queueFlags & 0x00000001 /* GRAPHICS_BIT */) {
             m_queueFamilyIndex = i;
+            foundGraphicsQueue = true;
             break;
         }
+    }
+    if (!foundGraphicsQueue) {
+        log_msg("[libqemu_svga3d] No graphics queue family found on selected device\n");
+        return SVGA3_VLKN_ERROR_VULKAN_INIT_FAILED;
     }
 
     return SVGA3_VLKN_SUCCESS;
@@ -349,7 +358,10 @@ Svga3VlknStatus VlknBackend::initDevice(const Svga3VlknConfig *config) {
         return SVGA3_VLKN_ERROR_VULKAN_INIT_FAILED;
     }
 
-    vlkn_dispatch_init_device(&m_dispatch, m_instance, m_device);
+    if (!vlkn_dispatch_init_device(&m_dispatch, m_instance, m_device)) {
+        log_msg("[libqemu_svga3d] vlkn_dispatch_init_device failed: missing device entry points\n");
+        return SVGA3_VLKN_ERROR_VULKAN_INIT_FAILED;
+    }
 
     m_dispatch.vkGetDeviceQueue(m_device, m_queueFamilyIndex, 0, &m_queue);
 
@@ -404,13 +416,11 @@ int VlknBackend::findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags prope
             return (int)i;
         }
     }
-    /* Fallback: any matching type */
-    for (uint32_t i = 0; i < m_memProps.memoryTypeCount; ++i) {
-        if (typeFilter & (1 << i)) {
-            return (int)i;
-        }
-    }
-    return 0;
+    /* No fallback: returning a type without the requested properties (e.g.
+     * device-local memory for a HOST_VISIBLE|HOST_COHERENT request) would
+     * silently produce unmappable or incoherent allocations. Callers must
+     * treat -1 as "no suitable memory type" and fail the allocation. */
+    return -1;
 }
 
 Svga3VlknStatus VlknBackend::allocateMemory(VkDeviceSize size, uint32_t memoryTypeIndex, VkDeviceMemory *outMemory) {
@@ -453,14 +463,28 @@ Svga3VlknStatus VlknBackend::createBuffer(VkDeviceSize size,
     m_dispatch.vkGetBufferMemoryRequirements(m_device, *outBuffer, &memReqs);
 
     int memType = findMemoryType(memReqs.memoryTypeBits, properties);
-    Svga3VlknStatus st = allocateMemory(memReqs.size, memType, outMemory);
+    if (memType < 0) {
+        log_msg("[libqemu_svga3d] createBuffer: no memory type satisfies the requested properties\n");
+        m_dispatch.vkDestroyBuffer(m_device, *outBuffer, nullptr);
+        *outBuffer = VK_NULL_HANDLE;
+        return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+    }
+    Svga3VlknStatus st = allocateMemory(memReqs.size, (uint32_t)memType, outMemory);
     if (st != SVGA3_VLKN_SUCCESS) {
         m_dispatch.vkDestroyBuffer(m_device, *outBuffer, nullptr);
         *outBuffer = VK_NULL_HANDLE;
         return st;
     }
 
-    m_dispatch.vkBindBufferMemory(m_device, *outBuffer, *outMemory, 0);
+    VkResult bindRes = m_dispatch.vkBindBufferMemory(m_device, *outBuffer, *outMemory, 0);
+    if (bindRes != VK_SUCCESS) {
+        log_msg("[libqemu_svga3d] createBuffer: vkBindBufferMemory failed (%d)\n", bindRes);
+        m_dispatch.vkDestroyBuffer(m_device, *outBuffer, nullptr);
+        *outBuffer = VK_NULL_HANDLE;
+        m_dispatch.vkFreeMemory(m_device, *outMemory, nullptr);
+        *outMemory = VK_NULL_HANDLE;
+        return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+    }
     return SVGA3_VLKN_SUCCESS;
 }
 
@@ -524,7 +548,12 @@ Svga3VlknStatus VlknBackend::uploadToBuffer(VkBuffer dstBuffer, VkDeviceSize dst
         if (st != SVGA3_VLKN_SUCCESS) return st;
 
         void *mapped = nullptr;
-        m_dispatch.vkMapMemory(m_device, tempMemory, 0, size, 0, &mapped);
+        VkResult mapRes = m_dispatch.vkMapMemory(m_device, tempMemory, 0, size, 0, &mapped);
+        if (mapRes != VK_SUCCESS || !mapped) {
+            log_msg("[libqemu_svga3d] uploadToBuffer: vkMapMemory failed (%d)\n", mapRes);
+            destroyBuffer(tempBuffer, tempMemory);
+            return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+        }
         memcpy(mapped, srcData, (size_t)size);
         m_dispatch.vkUnmapMemory(m_device, tempMemory);
 
@@ -534,10 +563,10 @@ Svga3VlknStatus VlknBackend::uploadToBuffer(VkBuffer dstBuffer, VkDeviceSize dst
         region.dstOffset = dstOffset;
         region.size = size;
         m_dispatch.vkCmdCopyBuffer(cb, tempBuffer, dstBuffer, 1, &region);
-        flushCommandBuffer();
+        Svga3VlknStatus flushSt = flushCommandBuffer();
 
         destroyBuffer(tempBuffer, tempMemory);
-        return SVGA3_VLKN_SUCCESS;
+        return flushSt;
     }
 
     memcpy(m_stagingMapped, srcData, (size_t)size);
@@ -553,6 +582,41 @@ Svga3VlknStatus VlknBackend::uploadToBuffer(VkBuffer dstBuffer, VkDeviceSize dst
 
 Svga3VlknStatus VlknBackend::downloadFromBuffer(void *dstData, VkBuffer srcBuffer, VkDeviceSize srcOffset, VkDeviceSize size) {
     std::lock_guard<std::mutex> lock(m_stagingMutex);
+    if (size > m_stagingSize) {
+        /* Allocate a temporary staging buffer for large transfers (mirrors uploadToBuffer) */
+        VkBuffer tempBuffer;
+        VkDeviceMemory tempMemory;
+        Svga3VlknStatus st = createBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                          &tempBuffer, &tempMemory);
+        if (st != SVGA3_VLKN_SUCCESS) return st;
+
+        VkCommandBuffer cb = getActiveCommandBuffer();
+        VkBufferCopy region = {};
+        region.srcOffset = srcOffset;
+        region.dstOffset = 0;
+        region.size = size;
+        m_dispatch.vkCmdCopyBuffer(cb, srcBuffer, tempBuffer, 1, &region);
+        st = flushCommandBuffer();
+        if (st != SVGA3_VLKN_SUCCESS) {
+            destroyBuffer(tempBuffer, tempMemory);
+            return st;
+        }
+
+        void *mapped = nullptr;
+        VkResult mapRes = m_dispatch.vkMapMemory(m_device, tempMemory, 0, size, 0, &mapped);
+        if (mapRes != VK_SUCCESS || !mapped) {
+            log_msg("[libqemu_svga3d] downloadFromBuffer: vkMapMemory failed (%d)\n", mapRes);
+            destroyBuffer(tempBuffer, tempMemory);
+            return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+        }
+        memcpy(dstData, mapped, (size_t)size);
+        m_dispatch.vkUnmapMemory(m_device, tempMemory);
+
+        destroyBuffer(tempBuffer, tempMemory);
+        return SVGA3_VLKN_SUCCESS;
+    }
+
     VkCommandBuffer cb = getActiveCommandBuffer();
     VkBufferCopy region = {};
     region.srcOffset = srcOffset;
@@ -683,7 +747,11 @@ VkRenderPass VlknBackend::getOrCreateRenderPass(VkFormat colorFormat, VkFormat d
     rpInfo.pSubpasses = &subpass;
 
     VkRenderPass rp = VK_NULL_HANDLE;
-    m_dispatch.vkCreateRenderPass(m_device, &rpInfo, nullptr, &rp);
+    VkResult res = m_dispatch.vkCreateRenderPass(m_device, &rpInfo, nullptr, &rp);
+    if (res != VK_SUCCESS) {
+        log_msg("[libqemu_svga3d] getOrCreateRenderPass: vkCreateRenderPass failed (%d)\n", res);
+        return VK_NULL_HANDLE;
+    }
 
     m_renderPasses.push_back({ colorFormat, depthFormat, rp });
     return rp;
