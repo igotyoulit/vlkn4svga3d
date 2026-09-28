@@ -1028,13 +1028,18 @@ bool vlkn_dispatch_init_instance(VlknDispatchTable *table, VkInstance instance) 
 
 bool vlkn_dispatch_init_device(VlknDispatchTable *table, VkInstance instance, VkDevice device) {
     if (table->isMock) return true;
+    if (!device || !table->vkGetInstanceProcAddr) return false;
 
 #define LOAD_DEV(fn) table->fn = (PFN_##fn)table->vkGetDeviceProcAddr(device, #fn); \
-    if (!table->fn) table->fn = (PFN_##fn)table->vkGetInstanceProcAddr(instance, #fn);
+    if (!table->fn) table->fn = (PFN_##fn)table->vkGetInstanceProcAddr(instance, #fn); \
+    if (!table->fn) return false;
 
     table->vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)table->vkGetInstanceProcAddr(instance, "vkGetDeviceProcAddr");
     table->vkDestroyDevice = (PFN_vkDestroyDevice)table->vkGetInstanceProcAddr(instance, "vkDestroyDevice");
     table->vkGetDeviceQueue = (PFN_vkGetDeviceQueue)table->vkGetInstanceProcAddr(instance, "vkGetDeviceQueue");
+    if (!table->vkGetDeviceProcAddr || !table->vkDestroyDevice || !table->vkGetDeviceQueue) {
+        return false;
+    }
 
     /* Debug utils extensions (may be null if not enabled) */
     table->vkCreateDebugUtilsMessengerEXT = (PFN_vkCreateDebugUtilsMessengerEXT)table->vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");

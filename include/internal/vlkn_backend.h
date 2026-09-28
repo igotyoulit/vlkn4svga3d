@@ -26,6 +26,8 @@ public:
     uint64_t completedSubmissionSerial() const { return m_completedSubmissionSerial; }
 
     /* Memory allocation helpers */
+    /* Returns the memory type index, or -1 if no type in typeFilter has all
+     * requested properties. Never falls back to a type lacking the properties. */
     int findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
     Svga3VlknStatus allocateMemory(VkDeviceSize size, uint32_t memoryTypeIndex, VkDeviceMemory *outMemory);
     void freeMemory(VkDeviceMemory memory);
