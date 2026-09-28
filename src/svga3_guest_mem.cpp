@@ -11,6 +11,22 @@ extern "C" void log_msg(const char *fmt, ...);
 
 namespace svga3_vlkn {
 
+/* Overflow-safe range containment: [gpa, gpa+size) \subseteq [base, base+extent).
+ * Structured so that no addition can wrap: gpa and size are guest-controlled.
+ * All-unsigned; the subtractions are safe because of the preceding comparisons. */
+static bool rangeWithin(uint64_t gpa, size_t size, uint64_t base, uint64_t extent)
+{
+    if (gpa < base) {
+        return false;
+    }
+    uint64_t off = gpa - base; /* safe: gpa >= base */
+    if (off > extent) {
+        return false;
+    }
+    /* safe: off <= extent, so extent - off cannot wrap */
+    return static_cast<uint64_t>(size) <= extent - off;
+}
+
 GuestMemoryManager::GuestMemoryManager() {
     m_fb = FramebufferInfo{};
 }
@@ -23,12 +39,17 @@ Svga3VlknStatus GuestMemoryManager::registerRamBlock(uint64_t gpaBase, void *hva
     if (!hvaBase || size == 0) {
         return SVGA3_VLKN_ERROR_INVALID_PARAM;
     }
+    /* Reject a wrapping [gpaBase, gpaBase+size) range outright: every range
+     * check below assumes block extents do not wrap. */
+    if (size > UINT64_MAX - gpaBase) {
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    }
     std::lock_guard<std::mutex> lock(m_mutex);
 
     /* Check for overlapping blocks */
     for (const auto &b : m_ramBlocks) {
-        uint64_t bEnd = b.gpaBase + b.size;
-        uint64_t newEnd = gpaBase + size;
+        uint64_t bEnd = b.gpaBase + b.size; /* safe: existing blocks never wrap */
+        uint64_t newEnd = gpaBase + size;   /* safe: checked above */
         if (gpaBase < bEnd && newEnd > b.gpaBase) {
             return SVGA3_VLKN_ERROR_ALREADY_EXISTS;
         }
@@ -100,13 +121,34 @@ Svga3VlknStatus GuestMemoryManager::setFramebuffer(void *hva,
                                                   uint32_t bpp)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    /* Validate before accepting: the blit/present paths do raw pointer
+     * arithmetic against these fields, so inconsistent values would be a
+     * host-side out-of-bounds write. A zero bpp is rejected outright rather
+     * than defaulted. All products are computed in 64-bit; with 32-bit
+     * inputs they cannot wrap. */
+    if (bpp == 0) {
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    }
+    uint32_t bytesPerPixel = (bpp > 8) ? (bpp / 8) : bpp;
+    if (!hva || width == 0 || height == 0 || pitch == 0 ||
+        bytesPerPixel == 0 || size == 0) {
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    }
+    uint64_t rowBytes = static_cast<uint64_t>(width) * bytesPerPixel;
+    if (pitch < rowBytes) {
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    }
+    uint64_t fbBytes = static_cast<uint64_t>(pitch) * height;
+    if (fbBytes > size) {
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    }
     m_fb.hva = reinterpret_cast<uint8_t*>(hva);
     m_fb.gpa = gpa;
     m_fb.size = size;
     m_fb.width = width;
     m_fb.height = height;
     m_fb.pitch = pitch;
-    m_fb.bpp = (bpp > 8) ? (bpp / 8) : (bpp ? bpp : 4);
+    m_fb.bpp = bytesPerPixel;
     return SVGA3_VLKN_SUCCESS;
 }
 
@@ -531,14 +573,14 @@ bool GuestMemoryManager::readPhysicalLocked(uint64_t gpa, void *dstHost, size_t 
 
     /* 1. Direct RAM block lookup */
     for (const auto &block : m_ramBlocks) {
-        if (gpa >= block.gpaBase && (gpa + size) <= (block.gpaBase + block.size)) {
+        if (rangeWithin(gpa, size, block.gpaBase, block.size)) {
             memcpy(dstHost, block.hvaBase + (gpa - block.gpaBase), size);
             return true;
         }
     }
 
     /* 2. Framebuffer range */
-    if (m_fb.hva && gpa >= m_fb.gpa && (gpa + size) <= (m_fb.gpa + m_fb.size)) {
+    if (m_fb.hva && rangeWithin(gpa, size, m_fb.gpa, m_fb.size)) {
         memcpy(dstHost, m_fb.hva + (gpa - m_fb.gpa), size);
         return true;
     }
@@ -565,14 +607,14 @@ bool GuestMemoryManager::writePhysicalLocked(uint64_t gpa, const void *srcHost, 
 
     /* 1. Direct RAM block lookup */
     for (const auto &block : m_ramBlocks) {
-        if (gpa >= block.gpaBase && (gpa + size) <= (block.gpaBase + block.size)) {
+        if (rangeWithin(gpa, size, block.gpaBase, block.size)) {
             memcpy(block.hvaBase + (gpa - block.gpaBase), srcHost, size);
             return true;
         }
     }
 
     /* 2. Framebuffer range */
-    if (m_fb.hva && gpa >= m_fb.gpa && (gpa + size) <= (m_fb.gpa + m_fb.size)) {
+    if (m_fb.hva && rangeWithin(gpa, size, m_fb.gpa, m_fb.size)) {
         memcpy(m_fb.hva + (gpa - m_fb.gpa), srcHost, size);
         return true;
     }
@@ -597,11 +639,11 @@ bool GuestMemoryManager::writePhysicalLocked(uint64_t gpa, const void *srcHost, 
 void* GuestMemoryManager::gpaToHva(uint64_t gpa, size_t size, bool isWrite) {
     std::lock_guard<std::mutex> lock(m_mutex);
     for (const auto &block : m_ramBlocks) {
-        if (gpa >= block.gpaBase && (gpa + size) <= (block.gpaBase + block.size)) {
+        if (rangeWithin(gpa, size, block.gpaBase, block.size)) {
             return block.hvaBase + (gpa - block.gpaBase);
         }
     }
-    if (m_fb.hva && gpa >= m_fb.gpa && (gpa + size) <= (m_fb.gpa + m_fb.size)) {
+    if (m_fb.hva && rangeWithin(gpa, size, m_fb.gpa, m_fb.size)) {
         return m_fb.hva + (gpa - m_fb.gpa);
     }
     if (m_gpaToHva) {

@@ -68,7 +68,13 @@ static void blitClientSurfaceToFramebuffer(Svga3VlknDevice *dev, uint32_t cid, u
     }
 
     for (uint32_t y = 0; y < copyH; ++y) {
-        uint8_t *dst = fb.hva + (dstY + y) * dstPitch + dstX * dstBpp;
+        /* 64-bit offset: the old 32-bit product wrapped for large pitches.
+         * Abort the blit rather than writing outside the framebuffer. */
+        uint64_t dstOff = ((uint64_t)dstY + y) * dstPitch + (uint64_t)dstX * dstBpp;
+        if (dstOff > fb.size || rowBytes > fb.size - dstOff) {
+            return;
+        }
+        uint8_t *dst = fb.hva + (size_t)dstOff;
         memcpy(dst, src + y * rowPitch, rowBytes);
     }
     if (!reused) surf->storeReadback(surfW, surfH, rowPitch, mapped);
@@ -936,17 +942,25 @@ Svga3VlknStatus svga3_vlkn_fifo_execute(Svga3VlknDevice *dev,
         /* Every 3D command carries an SVGA3dCmdHeader size word. The outer
          * FIFO loop sizes the packet from that word, so it has to be
          * consumed here too or the body is read one dword off. */
-        if (remaining >= sizeof(SVGA3dCmdHeader)) {
-            if (cmd >= SVGA_3D_CMD_BASE && cmd < SVGA_3D_CMD_FUTURE_MAX) {
-                const auto *hdr = reinterpret_cast<const SVGA3dCmdHeader*>(ptr);
-                if (hdr->size <= remaining - sizeof(SVGA3dCmdHeader)) {
-                    hasCmdHeader = true;
-                    payloadSize = hdr->size;
-                    ptr += sizeof(SVGA3dCmdHeader);
-                    remaining -= sizeof(SVGA3dCmdHeader);
-                    totalConsumed += sizeof(SVGA3dCmdHeader);
-                }
+        if (cmd >= SVGA_3D_CMD_BASE && cmd < SVGA_3D_CMD_FUTURE_MAX) {
+            if (remaining < sizeof(SVGA3dCmdHeader)) {
+                /* Truncated 3D packet: not even the full header is present. */
+                if (bytesConsumed) *bytesConsumed = totalConsumed;
+                return SVGA3_VLKN_ERROR_INVALID_COMMAND_BUFFER;
             }
+            const auto *hdr = reinterpret_cast<const SVGA3dCmdHeader*>(ptr);
+            if (hdr->size > remaining - sizeof(SVGA3dCmdHeader)) {
+                /* Truncated 3D packet: the declared body extends past the
+                 * end of the buffer. Reject it instead of parsing the
+                 * header bytes as the command body. */
+                if (bytesConsumed) *bytesConsumed = totalConsumed;
+                return SVGA3_VLKN_ERROR_INVALID_COMMAND_BUFFER;
+            }
+            hasCmdHeader = true;
+            payloadSize = hdr->size;
+            ptr += sizeof(SVGA3dCmdHeader);
+            remaining -= sizeof(SVGA3dCmdHeader);
+            totalConsumed += sizeof(SVGA3dCmdHeader);
         }
 
         size_t packetRead = 0;
@@ -957,6 +971,13 @@ Svga3VlknStatus svga3_vlkn_fifo_execute(Svga3VlknDevice *dev,
         size_t toAdvance = hasCmdHeader ? ((payloadSize + 3) & ~3) : packetRead;
         if (!hasCmdHeader && toAdvance == 0) {
             toAdvance = sizeof(uint32_t);
+        }
+        /* Clamp to what is left: dword rounding (up to +3 bytes) or the
+         * fallback above can otherwise exceed `remaining` — including the
+         * case remaining == 0 — and wrap it to SIZE_MAX, sending the loop
+         * past the end of the caller's buffer. The loop then exits cleanly. */
+        if (toAdvance > remaining) {
+            toAdvance = remaining;
         }
         ptr += toAdvance;
         remaining -= toAdvance;
