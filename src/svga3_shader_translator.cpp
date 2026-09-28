@@ -115,6 +115,17 @@ static bool parseSrc(uint32_t token, ParsedSrc &src) {
     return true;
 }
 
+/* Detects the SM 1.x dest-only `tex t#` form: zero length field with a
+ * texture-register destination, carrying only a destination operand and no
+ * coordinate source. */
+static bool isDestOnlyTex(const uint32_t *tokens, uint32_t pc, uint32_t numTokens, uint32_t instLen) {
+    if (instLen != 0 || pc + 1 >= numTokens) {
+        return false;
+    }
+    ParsedDest dst;
+    return parseDest(tokens[pc + 1], dst) && dst.regType == D3DSPR_TEXTURE;
+}
+
 Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                                             const uint32_t *tokens,
                                             uint32_t numTokens,
@@ -157,6 +168,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
 
     /* First pass: validate opcodes and extract DEF constants */
     std::map<uint32_t, ShaderDefConst> defConstants;
+    std::vector<uint32_t> dclPositions; /* true DCL instruction boundaries */
     uint32_t pc = 1;
     bool foundEnd = false;
 
@@ -171,6 +183,10 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
 
         if (op == D3DSIO_COMMENT) {
             uint32_t count = (instToken >> 16) & 0x7FFF;
+            if (1 + count > numTokens - pc) {
+                outError = "Truncated D3DSIO_COMMENT instruction";
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
             pc += 1 + count;
             continue;
         }
@@ -204,21 +220,15 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             case D3DSIO_DP3:
             case D3DSIO_DP4:
             case D3DSIO_M4x4:
-            case D3DSIO_M4x3:
-            case D3DSIO_M3x3:
             case D3DSIO_RCP:
             case D3DSIO_RSQ:
             case D3DSIO_MIN:
             case D3DSIO_MAX:
-            case D3DSIO_SLT:
-            case D3DSIO_SGE:
             case D3DSIO_ABS:
             case D3DSIO_LRP:
-            case D3DSIO_POW:
             case D3DSIO_FRC:
             case D3DSIO_CMP:
             case D3DSIO_TEX:
-            case D3DSIO_TEXCOORD:
             case D3DSIO_DCL:
                 break;
             default: {
@@ -229,18 +239,24 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             }
         }
 
-        /* Advance PC */
+        /* Record true DCL instruction boundaries for the semantic scan. */
+        if (op == D3DSIO_DCL) {
+            dclPositions.push_back(pc);
+        }
+
+        /* Advance PC, verifying the parameter tokens exist first. */
+        uint32_t advance;
         if (instLen > 0) {
-            pc += 1 + instLen;
+            advance = 1 + instLen;
         } else {
             /* Fallback parameter count for SM 1.x where length field was 0 */
             switch (op) {
-                case D3DSIO_NOP: pc += 1; break;
+                case D3DSIO_NOP: advance = 1; break;
                 case D3DSIO_MOV:
                 case D3DSIO_RCP:
                 case D3DSIO_RSQ:
                 case D3DSIO_ABS:
-                case D3DSIO_FRC: pc += 3; break;
+                case D3DSIO_FRC: advance = 3; break;
                 case D3DSIO_ADD:
                 case D3DSIO_SUB:
                 case D3DSIO_MUL:
@@ -248,20 +264,23 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 case D3DSIO_DP4:
                 case D3DSIO_MIN:
                 case D3DSIO_MAX:
-                case D3DSIO_SLT:
-                case D3DSIO_SGE:
-                case D3DSIO_POW:
+                case D3DSIO_M4x4: advance = 4; break;
                 case D3DSIO_TEX:
-                case D3DSIO_M4x4:
-                case D3DSIO_M4x3:
-                case D3DSIO_M3x3: pc += 4; break;
+                    /* SM 1.x dest-only `tex t#` carries just the destination. */
+                    advance = isDestOnlyTex(tokens, pc, numTokens, instLen) ? 2 : 4;
+                    break;
                 case D3DSIO_MAD:
                 case D3DSIO_LRP:
-                case D3DSIO_CMP: pc += 5; break;
-                case D3DSIO_DCL: pc += 3; break;
-                default: pc += 1; break;
+                case D3DSIO_CMP: advance = 5; break;
+                case D3DSIO_DCL: advance = 3; break;
+                default: advance = 1; break;
             }
         }
+        if (advance > numTokens - pc) {
+            outError = "Truncated shader instruction: parameter tokens exceed bytecode length";
+            return SVGA3_VLKN_ERROR_INVALID_PARAM;
+        }
+        pc += advance;
     }
 
     if (!foundEnd) {
@@ -318,22 +337,23 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     };
     std::unordered_map<uint32_t, SemanticInfo> inputRegToSemantic;
     std::unordered_map<uint32_t, SemanticInfo> outputRegToSemantic;
-    for (uint32_t i = 1; i < numTokens; ++i) {
-        uint32_t t = tokens[i];
-        uint32_t o = t & 0xFFFF;
-        if (o == D3DSIO_END) break;
-        if (o == D3DSIO_DCL && i + 2 < numTokens) {
-            uint32_t semToken = tokens[i + 1];
-            uint32_t regToken = tokens[i + 2];
-            uint32_t usage = semToken & 0x1F;
-            uint32_t usageIndex = (semToken >> 16) & 0x0F;
-            uint32_t regNum = regToken & 0x7FF;
-            uint32_t regType = ((regToken >> 28) & 0x7) | (((regToken >> 8) & 0x18));
-            if (regType == D3DSPR_INPUT || regType == D3DSPR_TEXTURE) {
-                inputRegToSemantic[regNum] = { usage, usageIndex };
-            } else if (regType == 6) { /* D3DSPR_OUTPUT in SM 3.0 */
-                outputRegToSemantic[regNum] = { usage, usageIndex };
-            }
+    /* Only honor DCL instructions at true instruction boundaries, as recorded
+     * during pass 1. Scanning raw tokens would misread parameter words or DEF
+     * literals whose low 16 bits happen to equal D3DSIO_DCL. */
+    for (uint32_t dclPc : dclPositions) {
+        if (dclPc + 2 >= numTokens) {
+            continue; /* Cannot happen: pass 1 validated the bounds. */
+        }
+        uint32_t semToken = tokens[dclPc + 1];
+        uint32_t regToken = tokens[dclPc + 2];
+        uint32_t usage = semToken & 0x1F;
+        uint32_t usageIndex = (semToken >> 16) & 0x0F;
+        uint32_t regNum = regToken & 0x7FF;
+        uint32_t regType = ((regToken >> 28) & 0x7) | (((regToken >> 8) & 0x18));
+        if (regType == D3DSPR_INPUT || regType == D3DSPR_TEXTURE) {
+            inputRegToSemantic[regNum] = { usage, usageIndex };
+        } else if (regType == 6) { /* D3DSPR_OUTPUT in SM 3.0 */
+            outputRegToSemantic[regNum] = { usage, usageIndex };
         }
     }
 
@@ -611,14 +631,36 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
         b.emitInst(b.functionDefinitions, SpvOpVariable, { ptrFunctionV4Float, outTexCoordVar[t], SpvStorageClassFunction, const0_v4 });
     }
 
+    /* Fail-closed operand validation: the emit helpers below set transError
+     * (and outError) on out-of-range indices, unsupported register classes,
+     * or unimplemented source modifiers. The translation loop checks the
+     * flag once per instruction and aborts. */
+    bool transError = false;
+    Svga3VlknStatus transErrorCode = SVGA3_VLKN_ERROR_INVALID_PARAM;
+
     /* Helper: load source register into vec4 value with swizzle and modifier */
     auto emitLoadSrc = [&](const ParsedSrc &src) -> uint32_t {
+        /* Only None / Negate / Abs / AbsNeg source modifiers are implemented. */
+        if (src.srcMod != 0 && src.srcMod != 1 && src.srcMod != 11 && src.srcMod != 12) {
+            std::ostringstream ss;
+            ss << "Unsupported D3D9 source modifier: " << src.srcMod;
+            outError = ss.str();
+            transError = true;
+            transErrorCode = SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
+            return const0_v4;
+        }
+
         uint32_t baseVal = 0;
 
         if (src.regType == D3DSPR_TEMP) {
-            uint32_t regIdx = (src.regNum < 16) ? src.regNum : 0;
+            if (src.regNum >= 16) {
+                outError = "Temporary register index out of range (r0-r15 supported)";
+                transError = true;
+                transErrorCode = SVGA3_VLKN_ERROR_INVALID_PARAM;
+                return const0_v4;
+            }
             baseVal = b.allocId();
-            b.emitInst(b.functionDefinitions, SpvOpLoad, { typeV4Float, baseVal, rVars[regIdx] });
+            b.emitInst(b.functionDefinitions, SpvOpLoad, { typeV4Float, baseVal, rVars[src.regNum] });
         } else if (src.regType == D3DSPR_INPUT || src.regType == D3DSPR_TEXTURE) {
             baseVal = b.allocId();
             if (isVS) {
@@ -655,6 +697,12 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 }
             }
         } else if (src.regType == D3DSPR_CONST) {
+            if (src.regNum >= 256) {
+                outError = "Constant register index out of range (c0-c255 supported)";
+                transError = true;
+                transErrorCode = SVGA3_VLKN_ERROR_INVALID_PARAM;
+                return const0_v4;
+            }
             /* Check if defined by DEF */
             auto it = defConstants.find(src.regNum);
             if (it != defConstants.end()) {
@@ -678,7 +726,15 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 b.emitInst(b.functionDefinitions, SpvOpLoad, { typeV4Float, baseVal, elemPtr });
             }
         } else {
-            baseVal = const0_v4;
+            /* ADDR-as-source is handled by the TEXTURE branch above; anything
+             * reaching here (integer/bool constants, sampler-as-source, loop
+             * counters, output registers) has no representation. */
+            std::ostringstream ss;
+            ss << "Unsupported D3D9 source register type: " << src.regType;
+            outError = ss.str();
+            transError = true;
+            transErrorCode = SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
+            return const0_v4;
         }
 
         /* Swizzle */
@@ -713,8 +769,13 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     auto emitStoreDest = [&](const ParsedDest &dst, uint32_t val) {
         uint32_t dstVar = 0;
         if (dst.regType == D3DSPR_TEMP) {
-            uint32_t regIdx = (dst.regNum < 16) ? dst.regNum : 0;
-            dstVar = rVars[regIdx];
+            if (dst.regNum >= 16) {
+                outError = "Temporary register index out of range (r0-r15 supported)";
+                transError = true;
+                transErrorCode = SVGA3_VLKN_ERROR_INVALID_PARAM;
+                return;
+            }
+            dstVar = rVars[dst.regNum];
         } else if (dst.regType == D3DSPR_RASTOUT) {
             dstVar = outPosVar;
         } else if (dst.regType == D3DSPR_ATTROUT || dst.regType == D3DSPR_COLOROUT) {
@@ -793,6 +854,10 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
 
         if (op == D3DSIO_COMMENT) {
             uint32_t count = (instToken >> 16) & 0x7FFF;
+            if (1 + count > numTokens - pc) {
+                outError = "Truncated D3DSIO_COMMENT instruction";
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
             pc += 1 + count;
             continue;
         }
@@ -808,6 +873,57 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
         }
 
         uint32_t instLen = (instToken >> 24) & 0x0F;
+
+        /* Fail-closed instruction sizing: determine how many parameter tokens
+         * this instruction reads and verify they are all present before the
+         * translation switch touches them. */
+        uint32_t paramCount = instLen;
+        bool destOnlyTex = (op == D3DSIO_TEX) && isDestOnlyTex(tokens, pc, numTokens, instLen);
+        if (destOnlyTex) {
+            paramCount = 1; /* SM 1.x dest-only `tex t#`: destination only */
+        } else if (op == D3DSIO_TEX) {
+            if (instLen == 0) {
+                paramCount = 3; /* dest + coord + sampler */
+            } else if (instLen == 1) {
+                paramCount = 2; /* dest + coord, sampler implied by dest */
+            } else {
+                paramCount = 3; /* dest + coord + sampler */
+            }
+        } else if (paramCount == 0) {
+            /* SM 1.x fallback parameter counts (length field is 0). */
+            switch (op) {
+                case D3DSIO_NOP: paramCount = 0; break;
+                case D3DSIO_MOV:
+                case D3DSIO_RCP:
+                case D3DSIO_RSQ:
+                case D3DSIO_ABS:
+                case D3DSIO_FRC: paramCount = 2; break;
+                case D3DSIO_ADD:
+                case D3DSIO_SUB:
+                case D3DSIO_MUL:
+                case D3DSIO_DP3:
+                case D3DSIO_DP4:
+                case D3DSIO_MIN:
+                case D3DSIO_MAX:
+                case D3DSIO_M4x4: paramCount = 3; break;
+                case D3DSIO_MAD:
+                case D3DSIO_LRP:
+                case D3DSIO_CMP: paramCount = 4; break;
+                default: paramCount = 0; break;
+            }
+        }
+        if (paramCount >= numTokens - pc) {
+            outError = "Truncated shader instruction: parameter tokens exceed bytecode length";
+            return SVGA3_VLKN_ERROR_INVALID_PARAM;
+        }
+        /* Operand tokens must carry the parameter-token high bit; otherwise
+         * parseDest/parseSrc would leave the parsed struct uninitialized. */
+        for (uint32_t k = 1; k <= paramCount; ++k) {
+            if ((tokens[pc + k] & 0x80000000) == 0) {
+                outError = "Malformed shader operand token";
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
+        }
 
         switch (op) {
             case D3DSIO_MOV: {
@@ -1044,18 +1160,32 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             }
             case D3DSIO_TEX: {
                 ParsedDest dst;
-                ParsedSrc s0, s1;
                 parseDest(tokens[pc + 1], dst);
-                parseSrc(tokens[pc + 2], s0);
-                uint32_t samplerIdx = 0;
-                if (instLen >= 2) {
-                    parseSrc(tokens[pc + 3], s1);
-                    samplerIdx = (s1.regNum < 8) ? s1.regNum : 0;
-                } else {
-                    samplerIdx = (dst.regNum < 8) ? dst.regNum : 0;
-                }
 
-                uint32_t coord = emitLoadSrc(s0);
+                uint32_t coord;
+                uint32_t samplerIdx;
+                if (destOnlyTex) {
+                    /* SM 1.x `tex t#`: sample the stage with the interpolator
+                     * texture coordinates; there is no source operand. */
+                    if (isVS) {
+                        outError = "Dest-only tex is not supported in vertex shaders";
+                        return SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
+                    }
+                    samplerIdx = (dst.regNum < 8) ? dst.regNum : 0;
+                    coord = b.allocId();
+                    b.emitInst(b.functionDefinitions, SpvOpLoad, { typeV4Float, coord, psInTexCoords[samplerIdx] });
+                } else {
+                    ParsedSrc s0;
+                    parseSrc(tokens[pc + 2], s0);
+                    coord = emitLoadSrc(s0);
+                    if (instLen >= 2) {
+                        ParsedSrc s1;
+                        parseSrc(tokens[pc + 3], s1);
+                        samplerIdx = (s1.regNum < 8) ? s1.regNum : 0;
+                    } else {
+                        samplerIdx = (dst.regNum < 8) ? dst.regNum : 0;
+                    }
+                }
                 uint32_t uv = b.allocId();
                 b.emitInst(b.functionDefinitions, SpvOpVectorShuffle, { typeV2Float, uv, coord, coord, 0, 1 });
 
@@ -1082,16 +1212,23 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 break;
         }
 
+        /* Fail-closed: operand validation errors abort translation. */
+        if (transError) {
+            return transErrorCode;
+        }
+
+        /* Advance PC exactly as validated in pass 1. */
+        uint32_t advance;
         if (instLen > 0) {
-            pc += 1 + instLen;
+            advance = 1 + instLen;
         } else {
             switch (op) {
-                case D3DSIO_NOP: pc += 1; break;
+                case D3DSIO_NOP: advance = 1; break;
                 case D3DSIO_MOV:
                 case D3DSIO_RCP:
                 case D3DSIO_RSQ:
                 case D3DSIO_ABS:
-                case D3DSIO_FRC: pc += 3; break;
+                case D3DSIO_FRC: advance = 3; break;
                 case D3DSIO_ADD:
                 case D3DSIO_SUB:
                 case D3DSIO_MUL:
@@ -1099,19 +1236,21 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 case D3DSIO_DP4:
                 case D3DSIO_MIN:
                 case D3DSIO_MAX:
-                case D3DSIO_SLT:
-                case D3DSIO_SGE:
-                case D3DSIO_POW:
+                case D3DSIO_M4x4: advance = 4; break;
                 case D3DSIO_TEX:
-                case D3DSIO_M4x4:
-                case D3DSIO_M4x3:
-                case D3DSIO_M3x3: pc += 4; break;
+                    advance = destOnlyTex ? 2 : 4;
+                    break;
                 case D3DSIO_MAD:
                 case D3DSIO_LRP:
-                case D3DSIO_CMP: pc += 5; break;
-                default: pc += 1; break;
+                case D3DSIO_CMP: advance = 5; break;
+                default: advance = 1; break;
             }
         }
+        if (advance > numTokens - pc) {
+            outError = "Truncated shader instruction: parameter tokens exceed bytecode length";
+            return SVGA3_VLKN_ERROR_INVALID_PARAM;
+        }
+        pc += advance;
     }
 
     /* Epilogue: copy outputs */
