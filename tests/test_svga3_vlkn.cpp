@@ -1463,6 +1463,32 @@ static void TestFenceWithoutWindow() {
     svga3_vlkn_device_destroy(dev);
 }
 
+static void TestPendingWindowPresentsOnlyWhenDirty() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create window-present regression device");
+    if (!dev) return;
+
+    SVGA3dSize size = {800, 600, 1};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 9200, SVGA3D_SURFACE_HINT_RENDERTARGET,
+                                         SVGA3D_A8R8G8B8, &size, 1) == SVGA3_VLKN_SUCCESS,
+               "Create window surface for present tracking");
+    TEST_CHECK(svga3_vlkn_context_create(dev, 9200) == SVGA3_VLKN_SUCCESS,
+               "Create context for present tracking");
+    auto *ctx = dev->contextMgr->getContext(9200);
+    TEST_CHECK(ctx != nullptr, "Find context for present tracking");
+    if (ctx) ctx->markWindowDrawn(9200);
+
+    auto first = dev->contextMgr->collectPendingWindowPresents();
+    TEST_CHECK(first.size() == 1 && first[0].first == 9200 && first[0].second == 9200,
+               "Collect a newly drawn window surface once");
+    auto second = dev->contextMgr->collectPendingWindowPresents();
+    TEST_CHECK(second.empty(), "Do not re-present an unchanged window surface");
+
+    svga3_vlkn_device_destroy(dev);
+}
+
 static PFN_vkCreateShaderModule savedCreateShaderModule;
 static PFN_vkDestroyShaderModule savedDestroyShaderModule;
 static VkShaderModule trackedShader;
@@ -1546,6 +1572,7 @@ int main() {
     std::cout << ANSI_YELLOW << "==================================================================" << ANSI_RESET << std::endl;
 
     TestFenceWithoutWindow();
+    TestPendingWindowPresentsOnlyWhenDirty();
     TestDepthVariantCleanup();
     TestRenderPassEndingBatchesCommands();
     TestSurfaceFormatMappings();

@@ -2331,10 +2331,7 @@ std::vector<std::pair<uint32_t, uint32_t>> VlknContextManager::collectPendingWin
     std::vector<std::pair<uint32_t, uint32_t>> list;
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     for (auto &pair : m_contexts) {
-        if (pair.first != 246 && pair.second &&
-            (pair.second->hasDrawnToWindow() ||
-             (pair.second->lastDrawnWindowSid() != 0 &&
-              pair.second->lastDrawnWindowSid() != SVGA3D_INVALID_ID))) {
+        if (pair.first != 246 && pair.second && pair.second->hasDrawnToWindow()) {
             uint32_t sid = pair.second->lastDrawnWindowSid();
             if (sid != 0 && sid != SVGA3D_INVALID_ID) {
                 list.push_back({pair.first, sid});
