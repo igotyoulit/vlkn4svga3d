@@ -324,6 +324,48 @@ int main() {
     TEST_CHECK(pBL.r <= 15 && pBL.g <= 15 && pBL.b >= 240, "Quadrant 3 is deterministic BLUE");
     TEST_CHECK(pBR.r >= 240 && pBR.g >= 240 && pBR.b <= 15, "Quadrant 4 is deterministic YELLOW");
 
+    /* Regression: D3D9 TEMP r0 and DCL OUTPUT o0 are distinct registers.
+     * The shader uses r0 as a temporary, then copies it to the explicitly
+     * declared position output. Routing the first write to o0 clips the quad. */
+    constexpr uint32_t SHID_VS_TEMP_OUTPUT_COLLISION = 30;
+    constexpr uint32_t SHID_PS_SOLID_RED = 31;
+    const uint32_t vsTempOutputCollision[] = {
+        0xFFFE0300, /* vs_3_0 */
+        (31) | (2 << 24), 0x80000000 | 0, D3D9_DST(1, 0, 0xF), /* dcl_position v0 */
+        (31) | (2 << 24), 0x80000000 | 0, D3D9_DST(6, 0, 0xF), /* dcl_position o0 */
+        (1) | (2 << 24), D3D9_DST(0, 0, 0xF), D3D9_SRC(1, 0, 0xE4), /* mov r0, v0 */
+        (1) | (2 << 24), D3D9_DST(6, 0, 0xF), D3D9_SRC(0, 0, 0xE4), /* mov o0, r0 */
+        0x0000FFFF
+    };
+    const uint32_t psSolidRed[] = {
+        0xFFFF0300, /* ps_3_0 */
+        (81) | (5 << 24), D3D9_DST(2, 0, 0xF), 0x3F800000, 0, 0, 0x3F800000, /* def c0, red */
+        (1) | (2 << 24), D3D9_DST(8, 0, 0xF), D3D9_SRC(2, 0, 0xE4), /* mov oC0, c0 */
+        0x0000FFFF
+    };
+    TEST_CHECK(svga3_vlkn_context_define_shader(dev, CID1, SHID_VS_TEMP_OUTPUT_COLLISION,
+        SVGA3D_SHADERTYPE_VS, vsTempOutputCollision,
+        sizeof(vsTempOutputCollision) / sizeof(uint32_t)) == SVGA3_VLKN_SUCCESS,
+        "Define VS with colliding TEMP r0 and DCL OUTPUT o0 numbers");
+    TEST_CHECK(svga3_vlkn_context_define_shader(dev, CID1, SHID_PS_SOLID_RED,
+        SVGA3D_SHADERTYPE_PS, psSolidRed, sizeof(psSolidRed) / sizeof(uint32_t)) == SVGA3_VLKN_SUCCESS,
+        "Define solid-red pixel shader for output-register regression");
+    svga3_vlkn_context_set_shader(dev, CID1, SVGA3D_SHADERTYPE_VS, SHID_VS_TEMP_OUTPUT_COLLISION);
+    svga3_vlkn_context_set_shader(dev, CID1, SVGA3D_SHADERTYPE_PS, SHID_PS_SOLID_RED);
+    svga3_vlkn_context_clear(dev, CID1, SVGA3D_CLEAR_COLOR, 0xFF000000, 1.0f, 0, nullptr, 0);
+    TEST_CHECK(svga3_vlkn_context_draw(dev, CID1, SVGA3D_PRIMITIVE_TRIANGLELIST,
+        decls, 1, &range, 1) == SVGA3_VLKN_SUCCESS,
+        "Draw with explicit DCL output and same-numbered temporary");
+    TEST_CHECK(svga3_vlkn_surface_dma_download(dev, SID_RT1, 0, &readBox,
+        fb.data(), RT_WIDTH * sizeof(Pixel)) == SVGA3_VLKN_SUCCESS,
+        "Read back output-register collision regression draw");
+    const Pixel pTempOutput = fb[32 * RT_WIDTH + 32];
+    TEST_CHECK(pTempOutput.r >= 240 && pTempOutput.g <= 15 && pTempOutput.b <= 15,
+        "TEMP r0 remains independent and the DCL-declared position output renders");
+
+    svga3_vlkn_context_set_shader(dev, CID1, SVGA3D_SHADERTYPE_VS, SHID_VS1);
+    svga3_vlkn_context_set_shader(dev, CID1, SVGA3D_SHADERTYPE_PS, SHID_PS1);
+
     /* 5. Independent Shader Constant Modification:
        Change PS constant c0 to (0.5, 0.5, 0.5, 1.0) -> Dim all pixels by 50%
     */

@@ -192,6 +192,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     /* First pass: validate opcodes and extract DEF constants */
     std::map<uint32_t, ShaderDefConst> defConstants;
     std::vector<uint32_t> dclPositions; /* true DCL instruction boundaries */
+    std::unordered_map<uint32_t, bool> explicitVsOutputRegs;
     uint32_t pc = 1;
     bool foundEnd = false;
 
@@ -345,6 +346,15 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
         if (advance > numTokens - pc) {
             outError = "Truncated shader instruction: parameter tokens exceed bytecode length";
             return SVGA3_VLKN_ERROR_INVALID_PARAM;
+        }
+        /* D3D9 TEMP and OUTPUT registers are separate namespaces. Remember
+         * explicit OUTPUT writes so the Mesa TEMP-output compatibility path
+         * below does not steal same-numbered temporaries used for calculations. */
+        if (isVS && major >= 3 && op != D3DSIO_DCL && advance > 1) {
+            ParsedDest dst;
+            if (parseDest(tokens[pc + 1], dst) && dst.regType == D3DSPR_OUTPUT) {
+                explicitVsOutputRegs[dst.regNum] = true;
+            }
         }
         pc += advance;
     }
@@ -834,16 +844,20 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     /* Helper: store vec4 value into destination register with write mask */
     auto emitStoreDest = [&](const ParsedDest &dst, uint32_t val) {
         uint32_t dstVar = 0;
-        /* If the register was declared as OUTPUT via DCL, honor the DCL even if
-         * the instruction token encodes it as TEMP. Mesa's SVGA backend emits
-         * MOV dst tokens with regType=TEMP for DCL-declared outputs. */
-        bool isDclOutput = (isVS && major >= 3 && outputRegToSemantic.find(dst.regNum) != outputRegToSemantic.end());
+        /* Mesa's SVGA backend can encode a DCL-declared output destination as
+         * TEMP. Only apply this compatibility fallback if the shader never
+         * explicitly writes that OUTPUT register: TEMP and OUTPUT register
+         * numbers are independent, and real shaders commonly use both r0 and o0. */
+        bool isDclOutput = (isVS && major >= 3 && dst.regType == D3DSPR_TEMP &&
+                            outputRegToSemantic.find(dst.regNum) != outputRegToSemantic.end() &&
+                            explicitVsOutputRegs.find(dst.regNum) == explicitVsOutputRegs.end());
         /* SM 3.0 VS without output DCLs: implicit outputs o0=position, o1=color.
          * Mesa encodes these as TEMP in MOV dst tokens. Treat reg 0 as
          * position, reg 1 as color. */
         bool isImplicitVsOutput = (isVS && major >= 3 && outputRegToSemantic.empty() &&
                                    dst.regType == D3DSPR_TEMP &&
-                                   (dst.regNum == 0 || dst.regNum == 1));
+                                   (dst.regNum == 0 || dst.regNum == 1) &&
+                                   explicitVsOutputRegs.find(dst.regNum) == explicitVsOutputRegs.end());
         uint32_t effectiveRegType = (isDclOutput || isImplicitVsOutput) ? 6 : dst.regType;
         if (effectiveRegType == D3DSPR_TEMP) {
             if (dst.regNum >= 16) {
