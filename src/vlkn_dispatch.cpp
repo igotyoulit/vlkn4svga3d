@@ -1020,6 +1020,13 @@ bool vlkn_dispatch_init_instance(VlknDispatchTable *table, VkInstance instance) 
     table->vkGetPhysicalDeviceQueueFamilyProperties = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)table->vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceQueueFamilyProperties");
     table->vkCreateDevice = (PFN_vkCreateDevice)table->vkGetInstanceProcAddr(instance, "vkCreateDevice");
 
+    if (!table->vkDestroyInstance || !table->vkEnumeratePhysicalDevices ||
+        !table->vkGetPhysicalDeviceProperties || !table->vkGetPhysicalDeviceFeatures ||
+        !table->vkGetPhysicalDeviceMemoryProperties ||
+        !table->vkGetPhysicalDeviceQueueFamilyProperties || !table->vkCreateDevice) {
+        return false;
+    }
+
     table->vkCreateDebugUtilsMessengerEXT = (PFN_vkCreateDebugUtilsMessengerEXT)table->vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");
     table->vkDestroyDebugUtilsMessengerEXT = (PFN_vkDestroyDebugUtilsMessengerEXT)table->vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT");
 

@@ -143,6 +143,15 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
         return SVGA3_VLKN_ERROR_INVALID_PARAM;
     }
 
+    /* Cap shader bytecode: without a limit a guest can submit megabytes of
+     * bytecode, exhausting host memory in the translator and SPIR-V
+     * builder. 64K dwords (256KB) is far above any legitimate shader. */
+    static const uint32_t MAX_SHADER_DWORDS = 65536;
+    if (numTokens > MAX_SHADER_DWORDS) {
+        outError = "Shader bytecode exceeds maximum size";
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    }
+
     uint32_t versionToken = tokens[0];
     uint32_t magic = versionToken >> 16;
     uint32_t major = (versionToken >> 8) & 0xFF;
@@ -959,9 +968,41 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             outError = "Truncated shader instruction: parameter tokens exceed bytecode length";
             return SVGA3_VLKN_ERROR_INVALID_PARAM;
         }
+        /* Declared-length vs consumed-operand-count mismatch: the switch
+         * below consumes the opcode's NATURAL operand count, but paramCount
+         * above is the DECLARED length. If declared < natural (e.g. ADD
+         * with instLen=1), the switch would read past the validated range.
+         * Validate the max of both. */
+        uint32_t naturalCount = 0;
+        switch (op) {
+            case D3DSIO_NOP: naturalCount = 0; break;
+            case D3DSIO_MOV:
+            case D3DSIO_RCP:
+            case D3DSIO_RSQ:
+            case D3DSIO_ABS:
+            case D3DSIO_FRC: naturalCount = 2; break;
+            case D3DSIO_ADD:
+            case D3DSIO_SUB:
+            case D3DSIO_MUL:
+            case D3DSIO_DP3:
+            case D3DSIO_DP4:
+            case D3DSIO_MIN:
+            case D3DSIO_MAX:
+            case D3DSIO_M4x4: naturalCount = 3; break;
+            case D3DSIO_MAD:
+            case D3DSIO_LRP:
+            case D3DSIO_CMP: naturalCount = 4; break;
+            case D3DSIO_TEX: naturalCount = paramCount; break;
+            default: naturalCount = paramCount; break;
+        }
+        uint32_t checkCount = (naturalCount > paramCount) ? naturalCount : paramCount;
+        if (checkCount >= numTokens - pc) {
+            outError = "Truncated shader instruction: parameter tokens exceed bytecode length";
+            return SVGA3_VLKN_ERROR_INVALID_PARAM;
+        }
         /* Operand tokens must carry the parameter-token high bit; otherwise
          * parseDest/parseSrc would leave the parsed struct uninitialized. */
-        for (uint32_t k = 1; k <= paramCount; ++k) {
+        for (uint32_t k = 1; k <= checkCount; ++k) {
             if ((tokens[pc + k] & 0x80000000) == 0) {
                 outError = "Malformed shader operand token";
                 return SVGA3_VLKN_ERROR_INVALID_PARAM;

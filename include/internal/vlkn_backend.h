@@ -7,6 +7,7 @@
 
 #include "svga3_vlkn.h"
 #include "vlkn_dispatch.h"
+#include "vlkn_resource_budgets.h"
 #include <vector>
 #include <string>
 #include <memory>
@@ -72,6 +73,12 @@ public:
     uint32_t vendorId() const { return m_props.vendorID; }
     uint32_t deviceId() const { return m_props.deviceID; }
     bool isSoftware() const { return m_props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU; }
+
+    /* Device-wide aggregate resource budgets (guest-exhaustion guard).
+     * Shared by the surface and context managers; see
+     * vlkn_resource_budgets.h. */
+    VlknResourceBudgets& resourceBudgets() { return m_budgets; }
+    const VlknResourceBudgets& resourceBudgets() const { return m_budgets; }
 
     /* Default / shared RenderPass for color + depth/stencil */
     VkRenderPass getOrCreateRenderPass(VkFormat colorFormat, VkFormat depthFormat);
@@ -142,6 +149,9 @@ private:
     };
     std::vector<RenderPassEntry> m_renderPasses;
     std::mutex m_mutex;
+
+    /* Aggregate device resource budgets (see vlkn_resource_budgets.h). */
+    VlknResourceBudgets m_budgets;
 };
 
 } // namespace svga3_vlkn

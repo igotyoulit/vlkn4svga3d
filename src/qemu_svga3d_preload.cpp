@@ -445,6 +445,10 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
         if (cmd == SVGA_CMD_UPDATE || cmd == SVGA_CMD_UPDATE_VERBOSE) {
             redraw(s, P(1), P(2), P(3), P(4));
             if (g_vlknDev && g_vlknDev->surfaceMgr && g_vlknDev->guestMem) {
+                /* Serialize with the FIFO thread: getSurface returns an
+                 * unlocked raw pointer, so the surface must not be
+                 * destroyed concurrently. */
+                std::lock_guard<std::mutex> devLock(g_vlknDev->mutex);
                 svga3_vlkn::VlknSurface *surf1 = g_vlknDev->surfaceMgr->getSurface(1);
                 if (surf1) {
                     const auto &fb = g_vlknDev->guestMem->getFramebuffer();
@@ -462,6 +466,7 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
         } else if (cmd == SVGA_CMD_RECT_FILL) {
             draw_rect(s, false, P(1), 0, 0, P(2), P(3), P(4), P(5));
             if (g_vlknDev && g_vlknDev->surfaceMgr && g_vlknDev->guestMem) {
+                std::lock_guard<std::mutex> devLock(g_vlknDev->mutex);
                 svga3_vlkn::VlknSurface *surf1 = g_vlknDev->surfaceMgr->getSurface(1);
                 if (surf1) {
                     const auto &fb = g_vlknDev->guestMem->getFramebuffer();
@@ -479,6 +484,7 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
         } else if (cmd == SVGA_CMD_RECT_COPY) {
             draw_rect(s, true, 0, P(1), P(2), P(3), P(4), P(5), P(6));
             if (g_vlknDev && g_vlknDev->surfaceMgr && g_vlknDev->guestMem) {
+                std::lock_guard<std::mutex> devLock(g_vlknDev->mutex);
                 svga3_vlkn::VlknSurface *surf1 = g_vlknDev->surfaceMgr->getSurface(1);
                 if (surf1) {
                     const auto &fb = g_vlknDev->guestMem->getFramebuffer();
@@ -559,15 +565,23 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
                     log_msg("[libqemu_svga3d] 3D cmd %u (payloadBytes=%u, words=%lu, total=%u)\n",
                             cmd, (cmd >= SVGA_3D_CMD_BASE) ? P(1) : 0, (unsigned long)words, total_3d);
                 }
+                /* Snapshot the packet into a host-private buffer before parsing:
+                 * the FIFO ring lives in guest-shared memory, so a second
+                 * guest vCPU can mutate packet bytes between the length
+                 * check above and field validation inside the handlers
+                 * (TOCTOU). The wraparound path already copied; the fast
+                 * path parsed live guest memory. Cap the snapshot: the
+                 * packet length was validated against available words. */
+                size_t wordsToCopy = packetBytes / 4;
+                std::vector<uint32_t> packetWords(wordsToCopy);
                 if (stop + packetBytes <= max) {
-                    svga3_vlkn_fifo_execute(g_vlknDev, (const uint8_t *)fifo + stop, packetBytes, &bytesConsumed);
+                    memcpy(packetWords.data(), (const uint8_t *)fifo + stop, wordsToCopy * 4);
                 } else {
-                    std::vector<uint32_t> packetWords(words);
-                    for (uint64_t w = 0; w < words; ++w) {
+                    for (uint64_t w = 0; w < wordsToCopy; ++w) {
                         packetWords[w] = P(w);
                     }
-                    svga3_vlkn_fifo_execute(g_vlknDev, packetWords.data(), packetBytes, &bytesConsumed);
                 }
+                svga3_vlkn_fifo_execute(g_vlknDev, packetWords.data(), packetBytes, &bytesConsumed);
             }
         }
 

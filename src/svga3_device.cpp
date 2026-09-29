@@ -99,7 +99,7 @@ static const CapTableEntry kDeviceCaps[] = {
     { SVGA3D_DEVCAP_AUTOGENMIPMAPS, 1, true },
     { SVGA3D_DEVCAP_SURFACEFMT_NV12, 0x4f, true },
     { SVGA3D_DEVCAP_SURFACEFMT_AYUV, 0x4f, true },
-    { SVGA3D_DEVCAP_MAX_CONTEXT_IDS, 256, true },
+    { SVGA3D_DEVCAP_MAX_CONTEXT_IDS, 64, true },
     { SVGA3D_DEVCAP_MAX_SURFACE_IDS, 1024, true },
     { SVGA3D_DEVCAP_SURFACEFMT_Z_DF16, 0x10, true },
     { SVGA3D_DEVCAP_SURFACEFMT_Z_DF24, 0x10, true },
@@ -209,7 +209,25 @@ uint32_t svga3_vlkn_query_cap(Svga3VlknDevice *dev, uint32_t capIndex, uint32_t 
             if (!kDeviceCaps[i].supported) {
                 return 0;
             }
-            *outCapValue = kDeviceCaps[i].val;
+            uint32_t val = kDeviceCaps[i].val;
+            /* Mesa requires SVGA3DFORMAT_OP_ZSTENCIL before it exposes a
+             * depth visual. 0x10 (SAME_FORMAT_RENDERTARGET) is not enough.
+             * (Mirrors advertised_devcap in qemu_svga3d_preload.cpp.) */
+            switch (capIndex) {
+            case SVGA3D_DEVCAP_SURFACEFMT_Z_D16:
+            case SVGA3D_DEVCAP_SURFACEFMT_Z_D24S8:
+            case SVGA3D_DEVCAP_SURFACEFMT_Z_D24X8:
+            case SVGA3D_DEVCAP_SURFACEFMT_Z_DF16:
+            case SVGA3D_DEVCAP_SURFACEFMT_Z_DF24:
+            case SVGA3D_DEVCAP_SURFACEFMT_Z_D24S8_INT:
+                val = SVGA3DFORMAT_OP_ZSTENCIL
+                    | SVGA3DFORMAT_OP_ZSTENCIL_WITH_ARBITRARY_COLOR_DEPTH
+                    | SVGA3DFORMAT_OP_TEXTURE;
+                break;
+            default:
+                break;
+            }
+            *outCapValue = val;
             return 1;
         }
     }

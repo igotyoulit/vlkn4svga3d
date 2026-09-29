@@ -14,6 +14,13 @@
 
 namespace svga3_vlkn {
 
+/* Security bounds for guest-controlled surface parameters. */
+constexpr uint32_t SVGA3_MAX_MIP_LEVELS = 16;      /* 2^16 = 65536 max dimension */
+constexpr uint32_t SVGA3_MAX_SURFACE_DIM = 16384;  /* Max width/height/depth */
+constexpr size_t SVGA3_MAX_DMA_BYTES = 256 * 1024 * 1024; /* Max single DMA transfer */
+constexpr uint32_t SVGA3_MAX_SURFACES = 4096;              /* Max live surfaces */
+constexpr uint32_t SVGA3_MAX_RT_VIEWS = 256;               /* Max cached RT views per surface */
+
 class VlknContextManager;
 
 class GuestMemoryManager;
@@ -73,6 +80,10 @@ public:
     void setActive(bool active) { m_active = active; }
 
     const SurfaceMipLevel* getMipInfo(uint32_t mipLevel) const;
+
+    /* Bytes currently charged against the device-wide surface budget for
+     * this surface (initial estimate, grown by ensureBufferSize). */
+    size_t budgetedBytes() const { return m_budgetedBytes; }
 
     Svga3VlknStatus dmaUpload(uint32_t mipLevel,
                               const SVGA3dBox *box,
@@ -145,6 +156,14 @@ private:
     uint32_t m_readbackH;
     size_t m_readbackPitch;
     std::vector<uint8_t> m_readback;
+
+    /* Set when the constructor rejects guest parameters; allocate() then
+     * fails closed instead of creating a malformed surface. */
+    bool m_allocFailed = false;
+
+    /* Bytes charged against the device aggregate surface budget. */
+    size_t m_budgetedBytes = 0;
+    size_t estimatedBytes() const;
 
     std::vector<SurfaceMipLevel> m_mips;
     std::unordered_map<uint64_t, VkImageView> m_rtViews;

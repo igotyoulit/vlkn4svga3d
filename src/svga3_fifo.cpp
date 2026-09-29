@@ -128,9 +128,15 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
 
             uint32_t numFaces = (pCmd->surfaceFlags & SVGA3D_SURFACE_CUBEMAP) ? 6 : 1;
             uint32_t numMipLevels = pCmd->face[0].numMipLevels;
-            uint32_t totalSizes = numFaces * numMipLevels;
+            /* 64-bit: numFaces * numMipLevels wrapped in 32-bit for huge
+             * numMipLevels, shrinking sizesBytes and bypassing the bounds
+             * check below. Cap mip levels at a sane maximum first. */
+            if (numMipLevels > SVGA3_MAX_MIP_LEVELS) {
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
+            uint64_t totalSizes = (uint64_t)numFaces * numMipLevels;
 
-            size_t sizesBytes = totalSizes * sizeof(SVGA3dSize);
+            size_t sizesBytes = (size_t)totalSizes * sizeof(SVGA3dSize);
             if (offset + sizesBytes > payloadSize) {
                 return SVGA3_VLKN_ERROR_INVALID_COMMAND_BUFFER;
             }
@@ -139,12 +145,14 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
             offset += sizesBytes;
 
             Svga3VlknStatus st = dev->surfaceMgr->defineSurface(
-                pCmd->sid, pCmd->surfaceFlags, pCmd->format, sizes, totalSizes
+                pCmd->sid, pCmd->surfaceFlags, pCmd->format, sizes, (uint32_t)totalSizes
             );
             if (st == SVGA3_VLKN_SUCCESS) {
                 dev->stats.surfacesCreated++;
-                log_msg("[libqemu_svga3d] SURFACE_DEFINE: sid=%u, fmt=%u, w=%u, h=%u, mips=%u\n",
-                        pCmd->sid, pCmd->format, sizes[0].width, sizes[0].height, numMipLevels);
+                if (totalSizes > 0) {
+                    log_msg("[libqemu_svga3d] SURFACE_DEFINE: sid=%u, fmt=%u, w=%u, h=%u, mips=%u\n",
+                            pCmd->sid, pCmd->format, sizes[0].width, sizes[0].height, numMipLevels);
+                }
             }
             *bytesRead = offset;
             return st;
@@ -519,6 +527,20 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
             VlknContext *ctx = dev->contextMgr->getContext(pCmd->cid);
             if (!ctx) return SVGA3_VLKN_ERROR_NOT_FOUND;
 
+            /* Cap guest-controlled counts: unbounded decls blow up pipeline
+             * creation (binding vectors, vkCreateGraphicsPipelines past
+             * device limits) and unbounded ranges bloat command buffers. */
+            if (pCmd->numVertexDecls > SVGA3_MAX_VERTEX_DECLS) {
+                log_msg("[libqemu_svga3d] DRAW_PRIMITIVES error: numVertexDecls %u exceeds max %u\n",
+                        pCmd->numVertexDecls, SVGA3_MAX_VERTEX_DECLS);
+                return SVGA3_VLKN_ERROR_INVALID_COMMAND_BUFFER;
+            }
+            if (pCmd->numRanges > SVGA3_MAX_PRIMITIVE_RANGES) {
+                log_msg("[libqemu_svga3d] DRAW_PRIMITIVES error: numRanges %u exceeds max %u\n",
+                        pCmd->numRanges, SVGA3_MAX_PRIMITIVE_RANGES);
+                return SVGA3_VLKN_ERROR_INVALID_COMMAND_BUFFER;
+            }
+
             size_t declsBytes = pCmd->numVertexDecls * sizeof(SVGA3dVertexDecl);
             size_t rangesBytes = pCmd->numRanges * sizeof(SVGA3dPrimitiveRange);
 
@@ -750,9 +772,15 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
 
             uint32_t numFaces = (pCmd->surfaceFlags & SVGA3D_SURFACE_CUBEMAP) ? 6 : 1;
             uint32_t numMipLevels = pCmd->face[0].numMipLevels;
-            uint32_t totalSizes = numFaces * numMipLevels;
+            /* 64-bit: numFaces * numMipLevels wrapped in 32-bit for huge
+             * numMipLevels, shrinking sizesBytes and bypassing the bounds
+             * check below. Cap mip levels at a sane maximum first. */
+            if (numMipLevels > SVGA3_MAX_MIP_LEVELS) {
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
+            uint64_t totalSizes = (uint64_t)numFaces * numMipLevels;
 
-            size_t sizesBytes = totalSizes * sizeof(SVGA3dSize);
+            size_t sizesBytes = (size_t)totalSizes * sizeof(SVGA3dSize);
             if (offset + sizesBytes > payloadSize) {
                 return SVGA3_VLKN_ERROR_INVALID_COMMAND_BUFFER;
             }
@@ -763,7 +791,7 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
             Svga3VlknStatus st = dev->surfaceMgr->defineSurfaceV2(
                 pCmd->sid, pCmd->surfaceFlags, pCmd->format,
                 pCmd->multisampleCount, pCmd->autogenFilter,
-                sizes, totalSizes
+                sizes, (uint32_t)totalSizes
             );
             if (st == SVGA3_VLKN_SUCCESS) {
                 dev->stats.surfacesCreated++;

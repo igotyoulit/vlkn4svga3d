@@ -23,6 +23,13 @@ namespace svga3_vlkn {
 constexpr uint32_t SVGA3_MAX_RENDER_TARGETS = 4;
 constexpr uint32_t SVGA3_MAX_TEXTURE_STAGES = 8;
 constexpr uint32_t SVGA3_MAX_VERTEX_DECLS   = 32;
+/* Security caps for guest-controlled draw parameters. */
+constexpr uint32_t SVGA3_MAX_PRIMITIVES_PER_DRAW = 1u << 24; /* 16M primitives */
+constexpr uint32_t SVGA3_MAX_VERTICES_PER_DRAW   = 1u << 24; /* 16M vertices */
+constexpr uint32_t SVGA3_MAX_DECL_USAGE_INDEX    = 16;
+constexpr size_t   SVGA3_MAX_SHADERS_PER_CONTEXT = 4096;
+constexpr uint32_t SVGA3_MAX_CONTEXTS = 64;
+constexpr uint32_t SVGA3_MAX_PRIMITIVE_RANGES = 4096;
 
 struct RenderTargetBinding {
     uint32_t sid;

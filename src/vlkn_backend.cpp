@@ -656,6 +656,9 @@ Svga3VlknStatus VlknBackend::flushCommandBuffer() {
     VkResult res = m_dispatch.vkEndCommandBuffer(m_cmdBuffer);
     if (res != VK_SUCCESS) {
         log_msg("[libqemu_svga3d] vkEndCommandBuffer error: %d\n", res);
+        m_cmdBufferRecording = false;
+        m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
+        return SVGA3_VLKN_ERROR_DEVICE_LOST;
     }
     m_cmdBufferRecording = false;
 
@@ -667,13 +670,16 @@ Svga3VlknStatus VlknBackend::flushCommandBuffer() {
     res = m_dispatch.vkQueueSubmit(m_queue, 1, &submitInfo, VK_NULL_HANDLE);
     if (res != VK_SUCCESS) {
         log_msg("[libqemu_svga3d] vkQueueSubmit error: %d\n", res);
+        m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
+        return SVGA3_VLKN_ERROR_DEVICE_LOST;
     }
     res = m_dispatch.vkQueueWaitIdle(m_queue);
     if (res != VK_SUCCESS) {
         log_msg("[libqemu_svga3d] vkQueueWaitIdle error: %d\n", res);
-    } else {
-        ++m_completedSubmissionSerial;
+        m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
+        return SVGA3_VLKN_ERROR_DEVICE_LOST;
     }
+    ++m_completedSubmissionSerial;
     m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
 
     return SVGA3_VLKN_SUCCESS;
