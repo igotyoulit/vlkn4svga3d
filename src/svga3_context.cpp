@@ -300,8 +300,11 @@ VlknContext::VlknContext(VlknBackend *backend, VlknSurfaceManager *surfaceMgr, u
     VkMemoryRequirements memReqs;
     m_backend->dispatch().vkGetImageMemoryRequirements(m_backend->device(), m_dummyImage, &memReqs);
     int memType = m_backend->findMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    m_backend->allocateMemory(memReqs.size, memType, &m_dummyMemory);
-    m_backend->dispatch().vkBindImageMemory(m_backend->device(), m_dummyImage, m_dummyMemory, 0);
+    if (memType >= 0) {
+        if (m_backend->allocateMemory(memReqs.size, memType, &m_dummyMemory) == SVGA3_VLKN_SUCCESS) {
+            m_backend->dispatch().vkBindImageMemory(m_backend->device(), m_dummyImage, m_dummyMemory, 0);
+        }
+    }
 
     VkImageViewCreateInfo viewInfo = {};
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -374,8 +377,11 @@ VlknContext::VlknContext(VlknBackend *backend, VlknSurfaceManager *surfaceMgr, u
     m_backend->dispatch().vkCreateImage(m_backend->device(), &imgInfo, nullptr, &m_whiteImage);
     m_backend->dispatch().vkGetImageMemoryRequirements(m_backend->device(), m_whiteImage, &memReqs);
     memType = m_backend->findMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    m_backend->allocateMemory(memReqs.size, memType, &m_whiteMemory);
-    m_backend->dispatch().vkBindImageMemory(m_backend->device(), m_whiteImage, m_whiteMemory, 0);
+    if (memType >= 0) {
+        if (m_backend->allocateMemory(memReqs.size, memType, &m_whiteMemory) == SVGA3_VLKN_SUCCESS) {
+            m_backend->dispatch().vkBindImageMemory(m_backend->device(), m_whiteImage, m_whiteMemory, 0);
+        }
+    }
     viewInfo.image = m_whiteImage;
     m_backend->dispatch().vkCreateImageView(m_backend->device(), &viewInfo, nullptr, &m_whiteView);
 
@@ -508,6 +514,21 @@ VlknContext::VlknContext(VlknBackend *backend, VlknSurfaceManager *surfaceMgr, u
 #undef D3D9_SRC
 }
 
+/* Aggregate budget accounting for one shader-table entry: the stored D3D9
+ * bytecode bytes, plus one VkShaderModule per owned module (the base module
+ * plus any depth variants that own a distinct module; failed variants
+ * borrow the base module and own nothing). */
+static uint64_t shaderBudgetBytes(const Svga3Shader &shader) {
+    return (uint64_t)shader.bytecode.size() * sizeof(uint32_t);
+}
+static uint64_t shaderBudgetModules(const Svga3Shader &shader) {
+    uint64_t n = 1; /* base module */
+    for (const auto &variant : shader.depthVariants) {
+        if (variant.second && variant.second != shader.module) ++n;
+    }
+    return n;
+}
+
 VlknContext::~VlknContext() {
     endRenderPassIfActive();
     if (m_backend) {
@@ -533,6 +554,8 @@ VlknContext::~VlknContext() {
         if (pair.second.module && pair.second.module != m_defaultVS) {
             m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), pair.second.module, nullptr);
         }
+        m_backend->resourceBudgets().releaseShaderBytes(shaderBudgetBytes(pair.second));
+        m_backend->resourceBudgets().releaseShaderModules(shaderBudgetModules(pair.second));
     }
     m_vertexShaders.clear();
 
@@ -545,6 +568,8 @@ VlknContext::~VlknContext() {
                 m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), variant.second, nullptr);
             }
         }
+        m_backend->resourceBudgets().releaseShaderBytes(shaderBudgetBytes(pair.second));
+        m_backend->resourceBudgets().releaseShaderModules(shaderBudgetModules(pair.second));
     }
     m_pixelShaders.clear();
 
@@ -927,27 +952,53 @@ bool VlknContext::isLightEnabled(uint32_t index) const {
 
 Svga3VlknStatus VlknContext::defineShader(uint32_t shid, SVGA3dShaderType type, const uint32_t *bytecode, uint32_t numDwords) {
     if (!bytecode || numDwords == 0) return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    /* Reject unknown shader types instead of silently treating them as PS. */
+    if (type != SVGA3D_SHADERTYPE_VS && type != SVGA3D_SHADERTYPE_PS) {
+        log_msg("[libqemu_svga3d] defineShader error: bad shader type %u\n", (unsigned)type);
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    }
 
     auto &table = (type == SVGA3D_SHADERTYPE_VS) ? m_vertexShaders : m_pixelShaders;
     auto it = table.find(shid);
+    /* Cap the shader table: without a limit a guest can define an
+     * unbounded number of shaders and exhaust host memory. */
+    if (it == table.end() && table.size() >= SVGA3_MAX_SHADERS_PER_CONTEXT) {
+        log_msg("[libqemu_svga3d] defineShader error: shader table full (%zu)\n", table.size());
+        return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+    }
     if (it != table.end()) {
-        /* Pipelines can remain referenced by recorded draw commands. Complete
-         * those commands before evicting their cached pipelines. */
-        endRenderPassIfActive();
-        Svga3VlknStatus flushStatus = m_backend->flushCommandBuffer();
-        if (flushStatus != SVGA3_VLKN_SUCCESS) return flushStatus;
-        /* Evict before destroying the module so a later draw cannot hit a
-         * pipeline cache entry built from the old shader. */
-        for (auto pcIt = m_pipelineCache.begin(); pcIt != m_pipelineCache.end(); ) {
-            bool usesShader = (type == SVGA3D_SHADERTYPE_VS) ? (pcIt->first.boundVS == shid)
-                                                             : (pcIt->first.boundPS == shid);
+        /* Only flush if cached pipelines actually reference this shader.
+         * A redefine with no dependent pipelines needs no queue drain;
+         * flushing unconditionally would stall the draw/shader-creation
+         * path on every redefine. */
+        bool hasDependentPipelines = false;
+        for (const auto &entry : m_pipelineCache) {
+            bool usesShader = (type == SVGA3D_SHADERTYPE_VS) ? (entry.first.boundVS == shid)
+                                                             : (entry.first.boundPS == shid);
             if (usesShader) {
-                if (pcIt->second) {
-                    m_backend->dispatch().vkDestroyPipeline(m_backend->device(), pcIt->second, nullptr);
+                hasDependentPipelines = true;
+                break;
+            }
+        }
+        if (hasDependentPipelines) {
+            /* Pipelines can remain referenced by recorded draw commands.
+             * Complete those commands before evicting their cached pipelines. */
+            endRenderPassIfActive();
+            Svga3VlknStatus flushStatus = m_backend->flushCommandBuffer();
+            if (flushStatus != SVGA3_VLKN_SUCCESS) return flushStatus;
+            /* Evict before destroying the module so a later draw cannot hit a
+             * pipeline cache entry built from the old shader. */
+            for (auto pcIt = m_pipelineCache.begin(); pcIt != m_pipelineCache.end(); ) {
+                bool usesShader = (type == SVGA3D_SHADERTYPE_VS) ? (pcIt->first.boundVS == shid)
+                                                                 : (pcIt->first.boundPS == shid);
+                if (usesShader) {
+                    if (pcIt->second) {
+                        m_backend->dispatch().vkDestroyPipeline(m_backend->device(), pcIt->second, nullptr);
+                    }
+                    pcIt = m_pipelineCache.erase(pcIt);
+                } else {
+                    ++pcIt;
                 }
-                pcIt = m_pipelineCache.erase(pcIt);
-            } else {
-                ++pcIt;
             }
         }
         if (it->second.module && it->second.module != m_defaultVS && it->second.module != m_defaultFS) {
@@ -959,8 +1010,41 @@ Svga3VlknStatus VlknContext::defineShader(uint32_t shid, SVGA3dShaderType type, 
                 m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), variant.second, nullptr);
             }
         }
+        /* Redefine replaces the old shader: release its aggregate budget
+         * first so the new reservation is not charged on top of it. */
+        m_backend->resourceBudgets().releaseShaderBytes(shaderBudgetBytes(it->second));
+        m_backend->resourceBudgets().releaseShaderModules(shaderBudgetModules(it->second));
         table.erase(it);
     }
+
+    /* Aggregate device budget: reject before translating or creating the
+     * module, so a guest cannot exhaust host memory with many
+     * per-object-legal shaders. */
+    uint64_t newBytecodeBytes = (uint64_t)numDwords * sizeof(uint32_t);
+    if (!m_backend->resourceBudgets().tryReserveShaderBytes(newBytecodeBytes)) {
+        log_msg("[libqemu_svga3d] defineShader error: aggregate shader bytecode budget exhausted (shid=%u)\n",
+                shid);
+        return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+    }
+    if (!m_backend->resourceBudgets().tryReserveShaderModules(1)) {
+        m_backend->resourceBudgets().releaseShaderBytes(newBytecodeBytes);
+        log_msg("[libqemu_svga3d] defineShader error: aggregate shader module budget exhausted (shid=%u)\n",
+                shid);
+        return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+    }
+    /* Exception-safe release of the reservation on every failure path
+     * below; committed once the shader lands in the table. */
+    struct ShaderBudgetGuard {
+        VlknBackend *backend;
+        uint64_t bytes;
+        bool active = true;
+        ~ShaderBudgetGuard() {
+            if (active && backend) {
+                backend->resourceBudgets().releaseShaderBytes(bytes);
+                backend->resourceBudgets().releaseShaderModules(1);
+            }
+        }
+    } budgetGuard{m_backend, newBytecodeBytes};
 
     Svga3Shader shader;
     shader.shid = shid;
@@ -969,7 +1053,23 @@ Svga3VlknStatus VlknContext::defineShader(uint32_t shid, SVGA3dShaderType type, 
     shader.inputLocationMask = 0;
 
     static const uint32_t SPIRV_MAGIC = 0x07230203;
+    /* Raw guest SPIR-V passthrough: the D3D9 translator is bypassed
+     * entirely and guest bytes go straight into vkCreateShaderModule,
+     * exposing the host Vulkan driver's SPIR-V parser to the guest.
+     * Rejected unconditionally in production builds. To enable for local
+     * development only, compile with -DSVGA3_VLKN_DEV_ALLOW_GUEST_SPIRV.
+     * There is intentionally no runtime (environment variable) escape:
+     * a guest that can set host environment variables has already won. */
+#ifdef SVGA3_VLKN_DEV_ALLOW_GUEST_SPIRV
+    static const bool allowGuestSpirv = true;
+#else
+    static const bool allowGuestSpirv = false;
+#endif
     if (bytecode[0] == SPIRV_MAGIC) {
+        if (!allowGuestSpirv) {
+            log_msg("[libqemu_svga3d] defineShader error: raw guest SPIR-V rejected (dev-only gate)\n");
+            return SVGA3_VLKN_ERROR_INVALID_PARAM;
+        }
         VkShaderModuleCreateInfo info = {};
         info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         info.codeSize = numDwords * sizeof(uint32_t);
@@ -998,6 +1098,8 @@ Svga3VlknStatus VlknContext::defineShader(uint32_t shid, SVGA3dShaderType type, 
     }
 
     table[shid] = std::move(shader);
+    budgetGuard.active = false;
+
     return SVGA3_VLKN_SUCCESS;
 }
 
@@ -1007,20 +1109,33 @@ Svga3VlknStatus VlknContext::destroyShader(uint32_t shid, SVGA3dShaderType type)
     if (it == table.end()) {
         return SVGA3_VLKN_ERROR_NOT_FOUND;
     }
-    /* Wait for recorded users before evicting the cached pipeline. */
-    endRenderPassIfActive();
-    Svga3VlknStatus flushStatus = m_backend->flushCommandBuffer();
-    if (flushStatus != SVGA3_VLKN_SUCCESS) return flushStatus;
-    for (auto pcIt = m_pipelineCache.begin(); pcIt != m_pipelineCache.end(); ) {
-        bool usesShader = (type == SVGA3D_SHADERTYPE_VS) ? (pcIt->first.boundVS == shid)
-                                                         : (pcIt->first.boundPS == shid);
+    /* Only flush if cached pipelines actually reference this shader.
+     * A destroy with no dependent pipelines needs no queue drain. */
+    bool hasDependentPipelines = false;
+    for (const auto &entry : m_pipelineCache) {
+        bool usesShader = (type == SVGA3D_SHADERTYPE_VS) ? (entry.first.boundVS == shid)
+                                                         : (entry.first.boundPS == shid);
         if (usesShader) {
-            if (pcIt->second) {
-                m_backend->dispatch().vkDestroyPipeline(m_backend->device(), pcIt->second, nullptr);
+            hasDependentPipelines = true;
+            break;
+        }
+    }
+    if (hasDependentPipelines) {
+        /* Wait for recorded users before evicting the cached pipeline. */
+        endRenderPassIfActive();
+        Svga3VlknStatus flushStatus = m_backend->flushCommandBuffer();
+        if (flushStatus != SVGA3_VLKN_SUCCESS) return flushStatus;
+        for (auto pcIt = m_pipelineCache.begin(); pcIt != m_pipelineCache.end(); ) {
+            bool usesShader = (type == SVGA3D_SHADERTYPE_VS) ? (pcIt->first.boundVS == shid)
+                                                             : (pcIt->first.boundPS == shid);
+            if (usesShader) {
+                if (pcIt->second) {
+                    m_backend->dispatch().vkDestroyPipeline(m_backend->device(), pcIt->second, nullptr);
+                }
+                pcIt = m_pipelineCache.erase(pcIt);
+            } else {
+                ++pcIt;
             }
-            pcIt = m_pipelineCache.erase(pcIt);
-        } else {
-            ++pcIt;
         }
     }
     if (it->second.module && it->second.module != m_defaultVS && it->second.module != m_defaultFS) {
@@ -1032,6 +1147,8 @@ Svga3VlknStatus VlknContext::destroyShader(uint32_t shid, SVGA3dShaderType type)
             m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), variant.second, nullptr);
         }
     }
+    m_backend->resourceBudgets().releaseShaderBytes(shaderBudgetBytes(it->second));
+    m_backend->resourceBudgets().releaseShaderModules(shaderBudgetModules(it->second));
     table.erase(it);
     if (type == SVGA3D_SHADERTYPE_VS && m_boundVS == shid) {
         m_boundVS = SVGA3D_INVALID_ID;
@@ -1184,6 +1301,10 @@ Svga3VlknStatus VlknContext::ensureRenderPassActive() {
     }
 
     m_activeRenderPass = m_backend->getOrCreateRenderPass(colorFmt, depthFmt);
+    if (m_activeRenderPass == VK_NULL_HANDLE) {
+        log_msg("[libqemu_svga3d] ensureRenderPassActive error: render pass creation failed\n");
+        return SVGA3_VLKN_ERROR_DEVICE_LOST;
+    }
 
     /* Build Framebuffer */
     uint32_t fbWidth = 800;
@@ -1594,6 +1715,16 @@ VkPipeline VlknContext::getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
                         info.pCode = spirv.data();
                         m_backend->dispatch().vkCreateShaderModule(m_backend->device(), &info, nullptr, &depthModule);
                     }
+                    if (depthModule != VK_NULL_HANDLE) {
+                        /* Aggregate module budget: a guest that forces many
+                         * distinct depth-sampler masks must not mint
+                         * unbounded shader modules. On exhaustion, borrow
+                         * the base module like a failed variant. */
+                        if (!m_backend->resourceBudgets().tryReserveShaderModules(1)) {
+                            m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), depthModule, nullptr);
+                            depthModule = VK_NULL_HANDLE;
+                        }
+                    }
                     if (depthModule == VK_NULL_HANDLE) {
                         log_msg("[libqemu_svga3d] depth shader variant failed for ps %u mask 0x%x: %s\n",
                                 m_boundPS, key.depthSamplerMask, err.c_str());
@@ -1613,11 +1744,15 @@ VkPipeline VlknContext::getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
     pipeInfo.pStages = stages;
 
     /* Vertex Input State */
+    /* Cap guest-controlled decl count: uncapped counts exceeded device
+     * vertex-binding limits and wasted pipeline-cache entries. */
+    uint32_t effNumDecls = std::min(numDecls, SVGA3_MAX_VERTEX_DECLS);
+
     std::vector<VkVertexInputBindingDescription> bindings;
     std::vector<VkVertexInputAttributeDescription> attrs;
 
-    if (numDecls > 0 && decls) {
-        for (uint32_t i = 0; i < numDecls; ++i) {
+    if (effNumDecls > 0 && decls) {
+        for (uint32_t i = 0; i < effNumDecls; ++i) {
             VkVertexInputBindingDescription b = {};
             b.binding = i;
             b.stride = decls[i].array.stride;
@@ -1632,7 +1767,10 @@ VkPipeline VlknContext::getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
             } else if (decls[i].identity.usage == SVGA3D_DECLUSAGE_COLOR) {
                 loc = (decls[i].identity.usageIndex == 0) ? 1 : 7;
             } else if (decls[i].identity.usage == SVGA3D_DECLUSAGE_TEXCOORD) {
-                loc = 2 + decls[i].identity.usageIndex;
+                /* usageIndex is guest-controlled: 2+0xFFFFFFFF wrapped in
+                 * 32-bit. Clamp it. */
+                uint32_t uidx = std::min(decls[i].identity.usageIndex, SVGA3_MAX_DECL_USAGE_INDEX);
+                loc = 2 + uidx;
             } else if (decls[i].identity.usage == SVGA3D_DECLUSAGE_NORMAL) {
                 loc = 6;
             }
@@ -1792,16 +1930,26 @@ VkPipeline VlknContext::getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
     return pipeline;
 }
 
+/* Overflow-safe vertex count: primCount is guest-controlled, and
+ * primCount*3 wrapped in 32-bit. Clamp to a sane maximum. */
 static uint32_t calcVertexCount(SVGA3dPrimitiveType type, uint32_t primCount) {
-    switch (type) {
-        case SVGA3D_PRIMITIVE_POINTLIST:     return primCount;
-        case SVGA3D_PRIMITIVE_LINELIST:      return primCount * 2;
-        case SVGA3D_PRIMITIVE_LINESTRIP:     return primCount + 1;
-        case SVGA3D_PRIMITIVE_TRIANGLELIST:  return primCount * 3;
-        case SVGA3D_PRIMITIVE_TRIANGLESTRIP: return primCount + 2;
-        case SVGA3D_PRIMITIVE_TRIANGLEFAN:   return primCount + 2;
-        default:                             return primCount * 3;
+    if (primCount > SVGA3_MAX_PRIMITIVES_PER_DRAW) {
+        primCount = SVGA3_MAX_PRIMITIVES_PER_DRAW;
     }
+    uint64_t count = 0;
+    switch (type) {
+        case SVGA3D_PRIMITIVE_POINTLIST:     count = primCount; break;
+        case SVGA3D_PRIMITIVE_LINELIST:      count = (uint64_t)primCount * 2; break;
+        case SVGA3D_PRIMITIVE_LINESTRIP:     count = (uint64_t)primCount + 1; break;
+        case SVGA3D_PRIMITIVE_TRIANGLELIST:  count = (uint64_t)primCount * 3; break;
+        case SVGA3D_PRIMITIVE_TRIANGLESTRIP: count = (uint64_t)primCount + 2; break;
+        case SVGA3D_PRIMITIVE_TRIANGLEFAN:   count = (uint64_t)primCount + 2; break;
+        default:                             count = (uint64_t)primCount * 3; break;
+    }
+    if (count > SVGA3_MAX_VERTICES_PER_DRAW) {
+        count = SVGA3_MAX_VERTICES_PER_DRAW;
+    }
+    return (uint32_t)count;
 }
 
 Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
@@ -1982,21 +2130,37 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         }
     }
 
-    /* Ensure buffer capacity for vertex declarations BEFORE starting render pass */
+    /* Ensure buffer capacity for vertex declarations BEFORE starting render pass.
+     * Size for the actual draw: offset + stride * maxVertexCount, in 64-bit
+     * with overflow checks. The old code only covered 4096 vertices, so any
+     * larger draw let the GPU read out of bounds. */
+    uint32_t maxVertexCount = 0;
+    for (uint32_t i = 0; i < numRanges; ++i) {
+        SVGA3dPrimitiveType ptype = (ranges[i].primType != SVGA3D_PRIMITIVE_INVALID)
+            ? (SVGA3dPrimitiveType)ranges[i].primType : primitiveType;
+        uint32_t c = calcVertexCount(ptype, ranges[i].primitiveCount);
+        if (c > maxVertexCount) maxVertexCount = c;
+    }
     if (numDecls > 0 && decls) {
-        for (uint32_t i = 0; i < numDecls; ++i) {
+        uint32_t cappedDecls = std::min(numDecls, SVGA3_MAX_VERTEX_DECLS);
+        for (uint32_t i = 0; i < cappedDecls; ++i) {
             uint32_t sid = decls[i].array.surfaceId;
             VlknSurface *surf = m_surfaceMgr->getSurface(sid);
             if (surf) {
                 if (surf->height() <= 1 && surf->depth() <= 1) {
                     surf->addFlags(SVGA3D_SURFACE_HINT_VERTEXBUFFER);
                 }
-                /* 64-bit: stride*4096 used to wrap in 32-bit, undersizing the
-                 * vertex buffer and letting the GPU read out of bounds. */
-                size_t attrMax = static_cast<size_t>(decls[i].array.offset) +
-                    (decls[i].array.stride ? static_cast<size_t>(decls[i].array.stride) * 4096 : 4096);
+                uint64_t stride = decls[i].array.stride ? decls[i].array.stride : 1;
+                uint64_t attrMax = 0;
+                bool ov = __builtin_mul_overflow(stride, (uint64_t)maxVertexCount, &attrMax) ||
+                          __builtin_add_overflow(attrMax, (uint64_t)decls[i].array.offset, &attrMax);
+                if (ov || attrMax > SVGA3_MAX_DMA_BYTES) {
+                    log_msg("[libqemu_svga3d] draw error: vertex range overflow (decl=%u)\n", i);
+                    return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                }
                 if (attrMax > surf->bufferSize()) {
-                    surf->ensureBufferSize(attrMax);
+                    Svga3VlknStatus ensSt = surf->ensureBufferSize((size_t)attrMax);
+                    if (ensSt != SVGA3_VLKN_SUCCESS) return ensSt;
                 }
             }
         }
@@ -2013,10 +2177,23 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
                 }
                 SVGA3dPrimitiveType ptype = (r.primType != SVGA3D_PRIMITIVE_INVALID) ? (SVGA3dPrimitiveType)r.primType : primitiveType;
                 uint32_t count = calcVertexCount(ptype, r.primitiveCount);
+                /* Index width must be 2 or 4; anything else is rejected
+                 * rather than misinterpreted. 64-bit: count*stride wrapped. */
                 uint32_t idxStride = r.indexWidth ? r.indexWidth : r.indexArray.stride;
-                size_t neededIdxBytes = r.indexArray.offset + count * (idxStride ? idxStride : 2);
+                if (idxStride != 2 && idxStride != 4) {
+                    log_msg("[libqemu_svga3d] draw error: bad index stride %u\n", idxStride);
+                    return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                }
+                uint64_t neededIdxBytes = 0;
+                bool ov = __builtin_mul_overflow((uint64_t)count, (uint64_t)idxStride, &neededIdxBytes) ||
+                          __builtin_add_overflow(neededIdxBytes, (uint64_t)r.indexArray.offset, &neededIdxBytes);
+                if (ov || neededIdxBytes > SVGA3_MAX_DMA_BYTES) {
+                    log_msg("[libqemu_svga3d] draw error: index range overflow\n");
+                    return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                }
                 if (neededIdxBytes > idxSurf->bufferSize()) {
-                    idxSurf->ensureBufferSize(neededIdxBytes);
+                    Svga3VlknStatus ensSt = idxSurf->ensureBufferSize((size_t)neededIdxBytes);
+                    if (ensSt != SVGA3_VLKN_SUCCESS) return ensSt;
                 }
             }
         }
@@ -2165,11 +2342,11 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
     uint32_t requiredInputMask = (m_boundVS != SVGA3D_INVALID_ID) ?
         m_vertexShaders[m_boundVS].inputLocationMask : m_defaultVsInputMask;
     uint32_t providedInputMask = 0;
-    for (uint32_t i = 0; i < numDecls; ++i) {
+    for (uint32_t i = 0; i < std::min(numDecls, SVGA3_MAX_VERTEX_DECLS); ++i) {
         uint32_t loc = i;
         if (decls[i].identity.usage == SVGA3D_DECLUSAGE_POSITION) loc = 0;
         else if (decls[i].identity.usage == SVGA3D_DECLUSAGE_COLOR) loc = (decls[i].identity.usageIndex == 0) ? 1 : 7;
-        else if (decls[i].identity.usage == SVGA3D_DECLUSAGE_TEXCOORD) loc = 2 + decls[i].identity.usageIndex;
+        else if (decls[i].identity.usage == SVGA3D_DECLUSAGE_TEXCOORD) loc = 2 + std::min(decls[i].identity.usageIndex, SVGA3_MAX_DECL_USAGE_INDEX);
         else if (decls[i].identity.usage == SVGA3D_DECLUSAGE_NORMAL) loc = 6;
         /* loc is guest-derived (usageIndex); shifting by >= 32 is UB. */
         if (loc < 32) {
@@ -2182,7 +2359,7 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
     }
     if ((requiredInputMask & ~providedInputMask) != 0 && fallbackBuf) {
         VkDeviceSize offset = 0;
-        uint32_t dummyBindingIdx = numDecls;
+        uint32_t dummyBindingIdx = std::min(numDecls, SVGA3_MAX_VERTEX_DECLS);
         m_backend->dispatch().vkCmdBindVertexBuffers(cb, dummyBindingIdx, 1, &fallbackBuf, &offset);
     }
 
@@ -2312,6 +2489,13 @@ Svga3VlknStatus VlknContextManager::createContext(uint32_t cid) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (m_contexts.find(cid) != m_contexts.end()) {
         return SVGA3_VLKN_ERROR_ALREADY_EXISTS;
+    }
+    /* Cap contexts: each holds pipelines, shaders and buffers, so an
+     * unbounded count exhausts host memory. */
+    if (m_contexts.size() >= SVGA3_MAX_CONTEXTS) {
+        log_msg("[libqemu_svga3d] createContext error: context limit %u reached\n",
+                SVGA3_MAX_CONTEXTS);
+        return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
     }
 
     m_contexts[cid] = std::make_unique<VlknContext>(m_backend, m_surfaceMgr, cid);

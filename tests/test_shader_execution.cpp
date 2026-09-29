@@ -572,6 +572,19 @@ int main() {
         "Redefine shader while its pipeline is pending");
     TEST_CHECK(backend->completedSubmissionSerial() > submissionsBeforeRedefine,
         "Shader replacement waits before retiring the pending pipeline");
+    /* Redefine with no dependent pipelines must NOT flush (no stall).
+     * Use a fresh shader ID that has never been drawn with. */
+    const uint32_t noPipeShaderId = 400;
+    TEST_CHECK(svga3_vlkn_context_define_shader(dev, CID1, noPipeShaderId, SVGA3D_SHADERTYPE_PS,
+        queuedRed, sizeof(queuedRed) / sizeof(queuedRed[0])) == SVGA3_VLKN_SUCCESS,
+        "Define shader with no dependent pipelines");
+    const uint64_t serialBeforeNoPipeRedefine = backend->completedSubmissionSerial();
+    TEST_CHECK(svga3_vlkn_context_define_shader(dev, CID1, noPipeShaderId, SVGA3D_SHADERTYPE_PS,
+        queuedGreen, sizeof(queuedGreen) / sizeof(queuedGreen[0])) == SVGA3_VLKN_SUCCESS,
+        "Redefine shader with no dependent pipelines");
+    TEST_CHECK(backend->completedSubmissionSerial() == serialBeforeNoPipeRedefine,
+        "Redefine with no dependent pipelines does not flush (no stall)");
+    svga3_vlkn_context_destroy_shader(dev, CID1, noPipeShaderId, SVGA3D_SHADERTYPE_PS);
     TEST_CHECK(svga3_vlkn_surface_dma_download(dev, SID_RT1, 0, &readBox,
         fb.data(), RT_WIDTH * sizeof(Pixel)) == SVGA3_VLKN_SUCCESS, "Submit and read pending old pipeline");
     TEST_CHECK(fb[16 * RT_WIDTH + 16].r >= 240 && fb[16 * RT_WIDTH + 16].g <= 15,
@@ -590,6 +603,27 @@ int main() {
         fb.data(), RT_WIDTH * sizeof(Pixel)) == SVGA3_VLKN_SUCCESS, "Read draw submitted during shader destruction");
     TEST_CHECK(fb[16 * RT_WIDTH + 16].g >= 240 && fb[16 * RT_WIDTH + 16].r <= 15,
         "Destroying a shader completes queued draws before pipeline eviction");
+
+    /* Destroy-then-redefine with the same ID must not reuse a stale pipeline.
+     * The shader was destroyed above; defining a new (blue) shader under the
+     * same ID must compile a fresh pipeline, not hit a cache entry from the
+     * old (green) shader. */
+    const uint32_t queuedBlue[] = {
+        0xFFFF0300,
+        81 | (5 << 24), D3D9_DST(2, 0, 0xF), 0, 0, 0x3F800000, 0x3F800000,
+        1 | (2 << 24), D3D9_DST(8, 0, 0xF), D3D9_SRC(2, 0, 0xE4),
+        0x0000FFFF
+    };
+    TEST_CHECK(svga3_vlkn_context_define_shader(dev, CID1, queuedShaderId, SVGA3D_SHADERTYPE_PS,
+        queuedBlue, sizeof(queuedBlue) / sizeof(queuedBlue[0])) == SVGA3_VLKN_SUCCESS,
+        "Redefine shader ID after destroy");
+    svga3_vlkn_context_set_shader(dev, CID1, SVGA3D_SHADERTYPE_PS, queuedShaderId);
+    TEST_CHECK(svga3_vlkn_context_draw(dev, CID1, SVGA3D_PRIMITIVE_TRIANGLELIST,
+        decls, 2, &range, 1) == SVGA3_VLKN_SUCCESS, "Draw with redefined shader");
+    TEST_CHECK(svga3_vlkn_surface_dma_download(dev, SID_RT1, 0, &readBox,
+        fb.data(), RT_WIDTH * sizeof(Pixel)) == SVGA3_VLKN_SUCCESS, "Read redefined shader output");
+    TEST_CHECK(fb[16 * RT_WIDTH + 16].b >= 240 && fb[16 * RT_WIDTH + 16].r <= 15,
+        "Redefined shader after destroy renders blue (no stale pipeline)");
 
     /* Cleanup */
     svga3_vlkn_context_destroy(dev, CID1);

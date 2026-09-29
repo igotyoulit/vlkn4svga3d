@@ -165,9 +165,30 @@ VlknSurface::VlknSurface(VlknBackend *backend,
     m_isCubeMap = (surfaceFlags & SVGA3D_SURFACE_CUBEMAP) != 0;
 
     if (numSizes > 0 && sizes) {
-        m_width = sizes[0].width ? sizes[0].width : 1;
-        m_height = sizes[0].height ? sizes[0].height : 1;
-        m_depth = sizes[0].depth ? sizes[0].depth : 1;
+        /* Cap guest-controlled dimensions: uncapped 32-bit dimensions
+         * overflowed the pitch arithmetic below (wrapping to small values)
+         * and could request absurd Vulkan images.
+         * Note: 1D surfaces (h<=1, d<=1) with large width are legitimate
+         * linear buffers (e.g. 32768x1x1 vertex data); they take the
+         * pureBuffer path in allocate(), which has its own size cap. */
+        uint32_t w0 = sizes[0].width ? sizes[0].width : 1;
+        uint32_t h0 = sizes[0].height ? sizes[0].height : 1;
+        uint32_t d0 = sizes[0].depth ? sizes[0].depth : 1;
+        bool is1D = (h0 <= 1 && d0 <= 1);
+        if ((w0 > SVGA3_MAX_SURFACE_DIM && !is1D) || h0 > SVGA3_MAX_SURFACE_DIM ||
+            d0 > SVGA3_MAX_SURFACE_DIM) {
+            log_msg("[libqemu_svga3d] defineSurface error: dimensions %ux%ux%u exceed max %u (sid=%u)\n",
+                    w0, h0, d0, SVGA3_MAX_SURFACE_DIM, sid);
+            m_width = 1; m_height = 1; m_depth = 1;
+            m_mipLevels = 1; m_arrayLayers = 1;
+            m_mips.push_back(SurfaceMipLevel{1, 1, 1, 4, 4, 4});
+            m_allocFailed = true;
+            m_budgetedBytes = estimatedBytes();
+            return;
+        }
+        m_width = w0;
+        m_height = h0;
+        m_depth = d0;
 
         if (m_isCubeMap) {
             m_arrayLayers = 6;
@@ -176,6 +197,16 @@ VlknSurface::VlknSurface(VlknBackend *backend,
         } else {
             m_arrayLayers = 1;
             m_mipLevels = numSizes;
+        }
+        if (m_mipLevels == 0 || m_mipLevels > SVGA3_MAX_MIP_LEVELS) {
+            log_msg("[libqemu_svga3d] defineSurface error: mip levels %u exceeds max %u (sid=%u)\n",
+                    m_mipLevels, SVGA3_MAX_MIP_LEVELS, sid);
+            m_width = 1; m_height = 1; m_depth = 1;
+            m_mipLevels = 1; m_arrayLayers = 1;
+            m_mips.push_back(SurfaceMipLevel{1, 1, 1, 4, 4, 4});
+            m_allocFailed = true;
+            m_budgetedBytes = estimatedBytes();
+            return;
         }
 
         size_t bpp = svga3_format_bytes_per_pixel(format);
@@ -187,17 +218,30 @@ VlknSurface::VlknSurface(VlknBackend *backend,
             mip.height = std::max(1u, m_height >> i);
             mip.depth = std::max(1u, m_depth >> i);
 
+            /* Overflow-checked: guest dimensions are capped above, but
+             * belt-and-braces against future changes. */
+            size_t rowPitch = 0, slicePitch = 0, totalBytes = 0;
+            bool overflow = false;
             if (compressed) {
                 uint32_t blocksW = (mip.width + 3) / 4;
                 uint32_t blocksH = (mip.height + 3) / 4;
-                mip.rowPitch = blocksW * bpp;
-                mip.slicePitch = mip.rowPitch * blocksH;
-                mip.totalBytes = mip.slicePitch * mip.depth;
+                overflow = __builtin_mul_overflow((size_t)blocksW, bpp, &rowPitch) ||
+                           __builtin_mul_overflow(rowPitch, (size_t)blocksH, &slicePitch) ||
+                           __builtin_mul_overflow(slicePitch, (size_t)mip.depth, &totalBytes);
             } else {
-                mip.rowPitch = mip.width * bpp;
-                mip.slicePitch = mip.rowPitch * mip.height;
-                mip.totalBytes = mip.slicePitch * mip.depth;
+                overflow = __builtin_mul_overflow((size_t)mip.width, bpp, &rowPitch) ||
+                           __builtin_mul_overflow(rowPitch, (size_t)mip.height, &slicePitch) ||
+                           __builtin_mul_overflow(slicePitch, (size_t)mip.depth, &totalBytes);
             }
+            if (overflow) {
+                log_msg("[libqemu_svga3d] defineSurface error: mip pitch overflow (sid=%u)\n", sid);
+                m_allocFailed = true;
+                m_budgetedBytes = estimatedBytes();
+                return;
+            }
+            mip.rowPitch = rowPitch;
+            mip.slicePitch = slicePitch;
+            mip.totalBytes = totalBytes;
             m_mips.push_back(mip);
         }
     } else {
@@ -209,13 +253,46 @@ VlknSurface::VlknSurface(VlknBackend *backend,
         SurfaceMipLevel mip = { 1, 1, 1, 4, 4, 4 };
         m_mips.push_back(mip);
     }
+    m_budgetedBytes = estimatedBytes();
 }
 
 VlknSurface::~VlknSurface() {
     destroy();
 }
 
+/* Upper bound on the host/device memory this surface will consume, used
+ * for the device-wide aggregate budget. Mirrors the pureBuffer decision in
+ * allocate(): 1D/buffer surfaces allocate a host-visible buffer of at
+ * least 256 KiB; image surfaces allocate one image covering all mips,
+ * array layers, and MSAA samples. */
+size_t VlknSurface::estimatedBytes() const {
+    bool pureBuffer = (m_svgaFormat == SVGA3D_BUFFER) ||
+                      ((m_flags & (SVGA3D_SURFACE_HINT_VERTEXBUFFER | SVGA3D_SURFACE_HINT_INDEXBUFFER)) != 0 && m_height <= 1 && m_depth <= 1) ||
+                      (m_height <= 1 && m_depth <= 1 && m_width > 16384);
+    if (pureBuffer) {
+        size_t mip0Bytes = m_mips.empty() ? (size_t)m_width : m_mips[0].totalBytes;
+        return std::max((size_t)262144, mip0Bytes);
+    }
+    /* Clamp the sample factor the way allocate() does: it maps the guest
+     * count to a VkSampleCountFlagBits, so charging the same factor keeps
+     * the estimate aligned with the real image. */
+    uint64_t samples = 1;
+    if (m_multisampleCount >= 16) samples = 16;
+    else if (m_multisampleCount >= 8) samples = 8;
+    else if (m_multisampleCount >= 4) samples = 4;
+    else if (m_multisampleCount >= 2) samples = 2;
+    uint64_t total = 0;
+    for (const auto &mip : m_mips) {
+        total += (uint64_t)mip.totalBytes;
+    }
+    total *= (uint64_t)m_arrayLayers * samples;
+    return total > (uint64_t)SIZE_MAX ? SIZE_MAX : (size_t)total;
+}
+
 Svga3VlknStatus VlknSurface::allocate() {
+    if (m_allocFailed) {
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    }
     bool pureBuffer = (m_svgaFormat == SVGA3D_BUFFER) ||
                       ((m_flags & (SVGA3D_SURFACE_HINT_VERTEXBUFFER | SVGA3D_SURFACE_HINT_INDEXBUFFER)) != 0 && m_height <= 1 && m_depth <= 1) ||
                       (m_height <= 1 && m_depth <= 1 && m_width > 16384);
@@ -225,6 +302,16 @@ Svga3VlknStatus VlknSurface::allocate() {
         m_imageView = VK_NULL_HANDLE;
         m_currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         size_t mip0Bytes = m_mips.empty() ? m_width : m_mips[0].totalBytes;
+        /* Cap buffer size: a 1D surface with width 2^30 would otherwise
+         * allocate 1GB+ of host memory (H3). 256MB is generous for
+         * vertex/index/constant buffers. */
+        static const size_t MAX_BUFFER_BYTES = 256 * 1024 * 1024;
+        if (mip0Bytes > MAX_BUFFER_BYTES) {
+            log_msg("[libqemu_svga3d] allocate error: buffer size %zu exceeds max %zu (sid=%u)\n",
+                    mip0Bytes, MAX_BUFFER_BYTES, m_sid);
+            m_allocFailed = true;
+            return SVGA3_VLKN_ERROR_INVALID_PARAM;
+        }
         m_bufferSize = std::max((size_t)262144, mip0Bytes);
         Svga3VlknStatus st = m_backend->createBuffer(
             m_bufferSize,
@@ -285,6 +372,11 @@ Svga3VlknStatus VlknSurface::allocate() {
     m_backend->dispatch().vkGetImageMemoryRequirements(m_backend->device(), m_image, &memReqs);
 
     int memType = m_backend->findMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (memType < 0) {
+        m_backend->dispatch().vkDestroyImage(m_backend->device(), m_image, nullptr);
+        m_image = VK_NULL_HANDLE;
+        return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+    }
     Svga3VlknStatus st = m_backend->allocateMemory(memReqs.size, memType, &m_memory);
     if (st != SVGA3_VLKN_SUCCESS) {
         m_backend->dispatch().vkDestroyImage(m_backend->device(), m_image, nullptr);
@@ -356,12 +448,42 @@ Svga3VlknStatus VlknSurface::ensureBufferSize(size_t requiredSize) {
     if (requiredSize <= m_bufferSize) {
         return SVGA3_VLKN_SUCCESS;
     }
+    /* Cap growth: a single guest command must not be able to demand
+     * gigabytes of host memory. */
+    if (requiredSize > SVGA3_MAX_DMA_BYTES) {
+        log_msg("[libqemu_svga3d] ensureBufferSize error: %zu exceeds max %zu (sid=%u)\n",
+                requiredSize, SVGA3_MAX_DMA_BYTES, m_sid);
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    }
 
     size_t newSize = m_bufferSize ? m_bufferSize : 262144;
     while (newSize < requiredSize) {
-        newSize = (newSize * 3) / 2;
+        /* Overflow-checked growth: newSize*3 used to wrap past SIZE_MAX
+         * for huge requiredSize, spinning forever. */
+        size_t grown = 0;
+        if (__builtin_mul_overflow(newSize, 3, &grown)) {
+            grown = requiredSize;
+        } else {
+            grown = grown / 2;
+        }
+        if (grown <= newSize) {
+            grown = requiredSize;
+        }
+        newSize = grown;
     }
     newSize = (newSize + 65535) & ~((size_t)65535);
+
+    /* Aggregate budget: buffer growth is guest-triggered host memory.
+     * Reserve the delta before allocating; release it if creation fails. */
+    size_t growthDelta = 0;
+    if (newSize > m_budgetedBytes) {
+        growthDelta = newSize - m_budgetedBytes;
+        if (!m_backend->resourceBudgets().tryReserveSurfaceBytes(growthDelta)) {
+            log_msg("[libqemu_svga3d] ensureBufferSize error: aggregate surface budget exhausted (sid=%u)\n",
+                    m_sid);
+            return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+        }
+    }
 
     /* The old allocation can be in flight, and its contents must be stable
      * while copied into the replacement buffer. */
@@ -379,6 +501,9 @@ Svga3VlknStatus VlknSurface::ensureBufferSize(size_t requiredSize) {
         &newMemory
     );
     if (st != SVGA3_VLKN_SUCCESS) {
+        if (growthDelta > 0) {
+            m_backend->resourceBudgets().releaseSurfaceBytes(growthDelta);
+        }
         log_msg("[libqemu_svga3d] ERROR: Failed to expand buffer for sid=%u to %zu bytes\n", m_sid, newSize);
         return st;
     }
@@ -406,6 +531,9 @@ Svga3VlknStatus VlknSurface::ensureBufferSize(size_t requiredSize) {
     m_buffer = newBuffer;
     m_bufferMemory = newMemory;
     m_bufferSize = newSize;
+    if (growthDelta > 0) {
+        m_budgetedBytes = newSize;
+    }
 
     log_msg("[libqemu_svga3d] Expanded buffer for sid=%u to %zu bytes\n", m_sid, m_bufferSize);
     return SVGA3_VLKN_SUCCESS;
@@ -489,6 +617,16 @@ void VlknSurface::destroy() {
 }
 
 VkImageView VlknSurface::getRenderTargetView(uint32_t mip, uint32_t face) {
+    /* Validate against the surface: out-of-range levels/faces make
+     * vkCreateImageView fail or misbehave, and each unique (mip,face)
+     * caches a view — unbounded without this check. */
+    if (mip >= m_mipLevels || face >= m_arrayLayers) {
+        return VK_NULL_HANDLE;
+    }
+    /* Bound the view cache: each entry holds a driver-side VkImageView. */
+    if (m_rtViews.size() >= SVGA3_MAX_RT_VIEWS) {
+        return VK_NULL_HANDLE;
+    }
     uint64_t key = ((uint64_t)mip << 32) | (uint64_t)face;
     auto it = m_rtViews.find(key);
     if (it != m_rtViews.end()) {
@@ -547,11 +685,22 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
                           (m_height <= 1 && m_depth <= 1 && (bw > mip.width || (bx + bw) > mip.width));
 
     if (isLinearBuffer) {
-        uint32_t offset = bx;
-        uint32_t len = bw;
-        if (offset + len > m_bufferSize) {
-            ensureBufferSize(offset + len);
+        /* 64-bit: bx + bw wrapped in 32-bit for huge boxes, bypassing the
+         * ensureBufferSize growth and making copyLen read past guestData. */
+        uint64_t offset64 = bx;
+        uint64_t len64 = bw;
+        uint64_t end64 = offset64 + len64;
+        if (end64 > m_bufferSize) {
+            if (end64 > SVGA3_MAX_DMA_BYTES) {
+                log_msg("[libqemu_svga3d] dmaUpload error: linear range %lu exceeds max %lu (sid=%u)\n",
+                        (unsigned long)end64, (unsigned long)SVGA3_MAX_DMA_BYTES, m_sid);
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
+            Svga3VlknStatus ensSt = ensureBufferSize((size_t)end64);
+            if (ensSt != SVGA3_VLKN_SUCCESS) return ensSt;
         }
+        uint32_t offset = bx;
+        size_t len = bw;
         if (!m_buffer || !m_bufferMemory) return SVGA3_VLKN_ERROR_INVALID_PARAM;
         if (offset < m_bufferSize) {
             void *bufMapped = nullptr;
@@ -687,8 +836,21 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
 
     /* Also copy into vertex/index backing VkBuffer */
     if (mipLevel == 0) {
-        size_t maxOffset = (static_cast<size_t>(bz + bd - 1) * mip.height + (by + bh - 1)) * mip.rowPitch + static_cast<size_t>(bx + bw) * bpp;
-        ensureBufferSize(maxOffset);
+        /* 64-bit: (bx+bw) wrapped in 32-bit, undersizing the buffer. */
+        uint64_t bxw = (uint64_t)bx + bw;
+        uint64_t bzw = (uint64_t)bz + bd;
+        uint64_t byh = (uint64_t)by + bh;
+        uint64_t maxOffset64 = 0;
+        bool ov = (bd == 0 || bzw == 0) ||
+                  __builtin_mul_overflow(bzw - 1, (uint64_t)mip.height, &maxOffset64) ||
+                  __builtin_add_overflow(maxOffset64, byh - (bh ? 1 : 0), &maxOffset64) ||
+                  __builtin_mul_overflow(maxOffset64, (uint64_t)mip.rowPitch, &maxOffset64) ||
+                  __builtin_add_overflow(maxOffset64, bxw * bpp, &maxOffset64);
+        if (ov || maxOffset64 > SVGA3_MAX_DMA_BYTES) {
+            return SVGA3_VLKN_ERROR_INVALID_PARAM;
+        }
+        Svga3VlknStatus ensSt = ensureBufferSize((size_t)maxOffset64);
+        if (ensSt != SVGA3_VLKN_SUCCESS) return ensSt;
         if (m_buffer && m_bufferMemory) {
             void *bufMapped = nullptr;
             if (m_backend->dispatch().vkMapMemory(m_backend->device(), m_bufferMemory, 0, m_bufferSize, 0, &bufMapped) == VK_SUCCESS) {
@@ -776,6 +938,10 @@ Svga3VlknStatus VlknSurface::dmaDownloadToStaging(uint32_t mipLevel,
                                                 std::unique_lock<std::mutex> &outLock)
 {
     if (!outMappedData || !outRowPitch || mipLevel >= m_mipLevels) {
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    }
+    /* Buffer surfaces have no VkImage; the copy below would null-deref. */
+    if (m_image == VK_NULL_HANDLE) {
         return SVGA3_VLKN_ERROR_INVALID_PARAM;
     }
 
@@ -1086,12 +1252,33 @@ Svga3VlknStatus VlknSurfaceManager::defineSurface(uint32_t sid,
     auto it = m_surfaces.find(sid);
     if (it != m_surfaces.end()) {
         if (m_contextMgr) m_contextMgr->invalidateSurface(sid);
+        /* Redefine replaces the old surface: release its budget first so
+         * the new reservation is not charged on top of the old one. */
+        m_backend->resourceBudgets().releaseSurfaceBytes(it->second->budgetedBytes());
         m_surfaces.erase(it);
+    } else {
+        /* Cap surfaces: each holds a Vulkan image/buffer, so an unbounded
+         * count exhausts host and device memory. */
+        if (m_surfaces.size() >= SVGA3_MAX_SURFACES) {
+            log_msg("[libqemu_svga3d] defineSurface error: surface limit %u reached\n",
+                    SVGA3_MAX_SURFACES);
+            return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+        }
     }
 
     auto surf = std::make_unique<VlknSurface>(m_backend, sid, surfaceFlags, format, sizes, numSizes);
+    /* Aggregate device budget: reject before touching the host allocator,
+     * so a guest cannot exhaust host memory with many per-object-legal
+     * surfaces. */
+    size_t needBytes = surf->budgetedBytes();
+    if (!m_backend->resourceBudgets().tryReserveSurfaceBytes(needBytes)) {
+        log_msg("[libqemu_svga3d] defineSurface error: aggregate surface budget exhausted (%zu bytes, sid=%u)\n",
+                needBytes, sid);
+        return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+    }
     Svga3VlknStatus st = surf->allocate();
     if (st != SVGA3_VLKN_SUCCESS) {
+        m_backend->resourceBudgets().releaseSurfaceBytes(needBytes);
         return st;
     }
 
@@ -1107,6 +1294,7 @@ Svga3VlknStatus VlknSurfaceManager::destroySurface(uint32_t sid) {
     }
 
     if (m_contextMgr) m_contextMgr->invalidateSurface(sid);
+    m_backend->resourceBudgets().releaseSurfaceBytes(it->second->budgetedBytes());
     m_surfaces.erase(it);
     return SVGA3_VLKN_SUCCESS;
 }
@@ -1131,6 +1319,11 @@ void VlknSurfaceManager::clear() {
     if (m_contextMgr) {
         for (const auto &pair : m_surfaces) {
             m_contextMgr->invalidateSurface(pair.first);
+        }
+    }
+    if (m_backend) {
+        for (const auto &pair : m_surfaces) {
+            m_backend->resourceBudgets().releaseSurfaceBytes(pair.second->budgetedBytes());
         }
     }
     m_surfaces.clear();
@@ -1159,12 +1352,22 @@ Svga3VlknStatus VlknSurfaceManager::copy(uint32_t srcSid,
 
         /* Copy backing buffer if present */
         if (src->buffer() && dst->buffer()) {
+            /* Overflow-checked: b.w*b.h*b.d*bpp wrapped for huge boxes,
+             * shrinking copyBytes and bypassing the bounds checks below. */
             size_t copyBytes = b.w;
             if (src->image() != VK_NULL_HANDLE) {
                 size_t bpp = svga3_format_bytes_per_pixel(src->svgaFormat());
-                copyBytes = b.w * (b.h ? b.h : 1) * (b.d ? b.d : 1) * bpp;
+                size_t whd = 0;
+                if (__builtin_mul_overflow((size_t)b.w, (size_t)(b.h ? b.h : 1), &whd) ||
+                    __builtin_mul_overflow(whd, (size_t)(b.d ? b.d : 1), &whd) ||
+                    __builtin_mul_overflow(whd, bpp, &copyBytes)) {
+                    continue;
+                }
             }
-            if (b.srcx + copyBytes <= src->bufferSize() && b.x + copyBytes <= dst->bufferSize()) {
+            /* 64-bit: b.srcx + copyBytes wrapped in 32-bit for huge boxes. */
+            uint64_t srcEnd = (uint64_t)b.srcx + copyBytes;
+            uint64_t dstEnd = (uint64_t)b.x + copyBytes;
+            if (srcEnd <= src->bufferSize() && dstEnd <= dst->bufferSize()) {
                 VkBufferCopy bufCopy = {};
                 bufCopy.srcOffset = b.srcx;
                 bufCopy.dstOffset = b.x;
@@ -1173,8 +1376,20 @@ Svga3VlknStatus VlknSurfaceManager::copy(uint32_t srcSid,
             }
         }
 
-        /* Copy VkImage if both surfaces have images */
+        /* Copy VkImage if both surfaces have images.
+         * 64-bit box validation (C5): guest box fields went verbatim into
+         * VkImageCopy; out-of-extents copies are Vulkan-level OOB. */
         if (src->image() != VK_NULL_HANDLE && dst->image() != VK_NULL_HANDLE) {
+            uint32_t bd = b.d ? b.d : 1;
+            if ((uint64_t)b.srcx + b.w > src->width() ||
+                (uint64_t)b.srcy + (b.h ? b.h : 1) > src->height() ||
+                (uint64_t)b.srcz + bd > src->depth() ||
+                (uint64_t)b.x + b.w > dst->width() ||
+                (uint64_t)b.y + (b.h ? b.h : 1) > dst->height() ||
+                (uint64_t)b.z + bd > dst->depth()) {
+                log_msg("[libqemu_svga3d] copy error: box %u out of image bounds\n", i);
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
             VkImageCopy copyRegion = {};
             copyRegion.srcSubresource.aspectMask = src->isDepthStencil() ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
             copyRegion.srcSubresource.mipLevel = 0;
@@ -1221,12 +1436,20 @@ Svga3VlknStatus VlknSurfaceManager::defineSurfaceV2(uint32_t sid,
     auto it = m_surfaces.find(sid);
     if (it != m_surfaces.end()) {
         if (m_contextMgr) m_contextMgr->invalidateSurface(sid);
+        m_backend->resourceBudgets().releaseSurfaceBytes(it->second->budgetedBytes());
         m_surfaces.erase(it);
     }
 
     auto surf = std::make_unique<VlknSurface>(m_backend, sid, surfaceFlags, format, sizes, numSizes, multisampleCount, autogenFilter);
+    size_t needBytes = surf->budgetedBytes();
+    if (!m_backend->resourceBudgets().tryReserveSurfaceBytes(needBytes)) {
+        log_msg("[libqemu_svga3d] defineSurfaceV2 error: aggregate surface budget exhausted (%zu bytes, sid=%u)\n",
+                needBytes, sid);
+        return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+    }
     Svga3VlknStatus st = surf->allocate();
     if (st != SVGA3_VLKN_SUCCESS) {
+        m_backend->resourceBudgets().releaseSurfaceBytes(needBytes);
         return st;
     }
 
@@ -1244,6 +1467,21 @@ Svga3VlknStatus VlknSurfaceManager::stretchBlt(uint32_t srcSid,
     VlknSurface *dst = getSurface(dstSid);
     if (!src || !dst) {
         return SVGA3_VLKN_ERROR_NOT_FOUND;
+    }
+    /* Buffer surfaces have no VkImage; blitting would null-deref. */
+    if (src->image() == VK_NULL_HANDLE || dst->image() == VK_NULL_HANDLE) {
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    }
+    /* 64-bit box validation: (x+w) wrapped in 32-bit, producing negative
+     * Vulkan extents and out-of-image blits. */
+    if ((uint64_t)boxSrc.x + boxSrc.w > src->width() ||
+        (uint64_t)boxSrc.y + boxSrc.h > src->height() ||
+        (uint64_t)boxSrc.z + (boxSrc.d ? boxSrc.d : 1) > src->depth() ||
+        (uint64_t)boxDest.x + boxDest.w > dst->width() ||
+        (uint64_t)boxDest.y + boxDest.h > dst->height() ||
+        (uint64_t)boxDest.z + (boxDest.d ? boxDest.d : 1) > dst->depth()) {
+        log_msg("[libqemu_svga3d] stretchBlt error: box out of image bounds\n");
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
     }
 
     VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
@@ -1332,6 +1570,13 @@ Svga3VlknStatus VlknSurfaceManager::surfaceDMA(const SVGA3dGuestImage &guest,
             size_t totalBytes = 0;
             if (__builtin_mul_overflow(rowBytes, static_cast<size_t>(bh), &totalBytes) ||
                 __builtin_mul_overflow(totalBytes, static_cast<size_t>(bd), &totalBytes)) {
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
+            /* Cap the staging allocation: one guest DMA must not allocate
+             * gigabytes of host memory (DoS). */
+            if (totalBytes > SVGA3_MAX_DMA_BYTES) {
+                log_msg("[libqemu_svga3d] surfaceDMA error: transfer %zu bytes exceeds max %zu (sid=%u)\n",
+                        totalBytes, SVGA3_MAX_DMA_BYTES, surf->sid());
                 return SVGA3_VLKN_ERROR_INVALID_PARAM;
             }
             std::vector<uint8_t> staging(totalBytes);
@@ -1441,6 +1686,8 @@ Svga3VlknStatus VlknSurfaceManager::generateMipmaps(uint32_t sid, SVGA3dTextureF
     VlknSurface *surf = getSurface(sid);
     if (!surf) return SVGA3_VLKN_ERROR_NOT_FOUND;
     if (surf->mipLevels() <= 1) return SVGA3_VLKN_SUCCESS;
+    /* Buffer surfaces have no VkImage; blitting would null-deref. */
+    if (surf->image() == VK_NULL_HANDLE) return SVGA3_VLKN_ERROR_INVALID_PARAM;
 
     VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
     VkFilter vkFilt = (filter == SVGA3D_TEX_FILTER_NEAREST) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;

@@ -152,7 +152,13 @@ class SpirvBuilder {
 public:
     SpirvBuilder() : m_nextId(1) {}
 
+    /* Saturate near 2^32: wrapped IDs would duplicate and the header
+     * bound would understate IDs in use, producing invalid SPIR-V.
+     * Unreachable in practice once the shader-size cap (M2) applies. */
     uint32_t allocId() {
+        if (m_nextId >= 0xFFFFFF00u) {
+            return 0xFFFFFF00u;
+        }
         return m_nextId++;
     }
 
