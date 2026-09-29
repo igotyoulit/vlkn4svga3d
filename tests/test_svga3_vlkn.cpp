@@ -1463,6 +1463,56 @@ static void TestFenceWithoutWindow() {
     svga3_vlkn_device_destroy(dev);
 }
 
+static VkResult g_injectedWaitResult = VK_SUCCESS;
+static VkResult g_injectedDeviceWaitResult = VK_SUCCESS;
+static PFN_vkQueueWaitIdle g_savedErrorQueueWait = nullptr;
+static PFN_vkDeviceWaitIdle g_savedErrorDeviceWait = nullptr;
+static VkResult VKAPI_CALL injectQueueWaitResult(VkQueue queue) {
+    return g_injectedWaitResult == VK_SUCCESS ? g_savedErrorQueueWait(queue) : g_injectedWaitResult;
+}
+static VkResult VKAPI_CALL injectDeviceWaitResult(VkDevice device) {
+    return g_injectedDeviceWaitResult == VK_SUCCESS ? g_savedErrorDeviceWait(device) : g_injectedDeviceWaitResult;
+}
+
+static void TestFlushPropagatesWaitFailures() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create flush error regression device");
+    if (!dev) return;
+    auto &backend = *dev->backend;
+    auto &dispatch = backend.dispatch();
+    g_savedErrorQueueWait = dispatch.vkQueueWaitIdle;
+    g_savedErrorDeviceWait = dispatch.vkDeviceWaitIdle;
+    dispatch.vkQueueWaitIdle = injectQueueWaitResult;
+    dispatch.vkDeviceWaitIdle = injectDeviceWaitResult;
+
+    const uint64_t serial = backend.completedSubmissionSerial();
+    backend.getActiveCommandBuffer();
+    g_injectedWaitResult = VK_ERROR_DEVICE_LOST;
+    TEST_CHECK(backend.flushCommandBuffer() == SVGA3_VLKN_ERROR_DEVICE_LOST,
+               "Queue wait failure is returned from flush");
+    TEST_CHECK(backend.completedSubmissionSerial() == serial,
+               "Failed queue wait does not report submission complete");
+
+    g_injectedWaitResult = VK_SUCCESS;
+    g_injectedDeviceWaitResult = VK_ERROR_DEVICE_LOST;
+    TEST_CHECK(backend.waitIdle() == SVGA3_VLKN_ERROR_DEVICE_LOST,
+               "Device wait failure is returned to caller");
+    TEST_CHECK(backend.completedSubmissionSerial() == serial,
+               "Failed device wait does not advance completion serial");
+
+    g_injectedDeviceWaitResult = VK_SUCCESS;
+    TEST_CHECK(backend.waitIdle() == SVGA3_VLKN_SUCCESS,
+               "Successful device wait recovers pending submission");
+    TEST_CHECK(backend.completedSubmissionSerial() == serial + 1,
+               "Completion serial advances once after confirmed completion");
+
+    dispatch.vkQueueWaitIdle = g_savedErrorQueueWait;
+    dispatch.vkDeviceWaitIdle = g_savedErrorDeviceWait;
+    svga3_vlkn_device_destroy(dev);
+}
+
 static void TestPendingWindowPresentsOnlyWhenDirty() {
     Svga3VlknConfig cfg{};
     cfg.forceMockBackend = true;
@@ -1572,6 +1622,7 @@ int main() {
     std::cout << ANSI_YELLOW << "==================================================================" << ANSI_RESET << std::endl;
 
     TestFenceWithoutWindow();
+    TestFlushPropagatesWaitFailures();
     TestPendingWindowPresentsOnlyWhenDirty();
     TestDepthVariantCleanup();
     TestRenderPassEndingBatchesCommands();

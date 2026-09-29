@@ -170,7 +170,8 @@ Svga3VlknStatus svga3_vlkn_device_reset(Svga3VlknDevice *dev)
     if (!dev) return SVGA3_VLKN_ERROR_INVALID_PARAM;
     std::lock_guard<std::mutex> lock(dev->mutex);
     if (dev->backend) {
-        dev->backend->waitIdle();
+        Svga3VlknStatus waitStatus = dev->backend->waitIdle();
+        if (waitStatus != SVGA3_VLKN_SUCCESS) return waitStatus;
     }
     if (dev->contextMgr) {
         dev->contextMgr->clear();

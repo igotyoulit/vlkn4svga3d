@@ -117,6 +117,7 @@ private:
     VkCommandPool m_cmdPool;
     VkCommandBuffer m_cmdBuffer;
     bool m_cmdBufferRecording;
+    bool m_cmdBufferPending;
     uint64_t m_completedSubmissionSerial;
 
     VkDescriptorPool m_descriptorPool;

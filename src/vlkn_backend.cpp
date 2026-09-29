@@ -37,6 +37,7 @@ VlknBackend::VlknBackend()
     , m_cmdPool(VK_NULL_HANDLE)
     , m_cmdBuffer(VK_NULL_HANDLE)
     , m_cmdBufferRecording(false)
+    , m_cmdBufferPending(false)
     , m_completedSubmissionSerial(0)
     , m_descriptorPool(VK_NULL_HANDLE)
     , m_debugMessenger(VK_NULL_HANDLE)
@@ -163,10 +164,24 @@ void VlknBackend::shutdown() {
 
 Svga3VlknStatus VlknBackend::waitIdle() {
     if (m_device && m_dispatch.vkDeviceWaitIdle) {
-        m_dispatch.vkDeviceWaitIdle(m_device);
-        if (!m_cmdBufferRecording) {
-            ++m_completedSubmissionSerial;
+        VkResult res = m_dispatch.vkDeviceWaitIdle(m_device);
+        if (res != VK_SUCCESS) {
+            log_msg("[libqemu_svga3d] vkDeviceWaitIdle error: %d\n", res);
+            return SVGA3_VLKN_ERROR_DEVICE_LOST;
         }
+        if (m_cmdBufferPending) {
+            ++m_completedSubmissionSerial;
+            m_cmdBufferPending = false;
+            if (m_cmdBuffer && m_dispatch.vkResetCommandBuffer) {
+                res = m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
+                if (res != VK_SUCCESS) {
+                    log_msg("[libqemu_svga3d] vkResetCommandBuffer error after idle: %d\n", res);
+                    return SVGA3_VLKN_ERROR_DEVICE_LOST;
+                }
+            }
+        }
+    } else if (m_device) {
+        return SVGA3_VLKN_ERROR_DEVICE_LOST;
     }
     return SVGA3_VLKN_SUCCESS;
 }
@@ -643,6 +658,12 @@ VkCommandBuffer VlknBackend::getActiveCommandBuffer() {
 }
 
 Svga3VlknStatus VlknBackend::flushCommandBuffer() {
+    /* A prior submit may have succeeded even when its queue wait failed. Do
+     * not reset or reuse that command buffer until device idle confirms it. */
+    if (m_cmdBufferPending) {
+        Svga3VlknStatus idleStatus = waitIdle();
+        if (idleStatus != SVGA3_VLKN_SUCCESS) return idleStatus;
+    }
     if (!m_cmdBufferRecording) return SVGA3_VLKN_SUCCESS;
 
     if (m_preFlushHook) {
@@ -657,7 +678,9 @@ Svga3VlknStatus VlknBackend::flushCommandBuffer() {
     if (res != VK_SUCCESS) {
         log_msg("[libqemu_svga3d] vkEndCommandBuffer error: %d\n", res);
         m_cmdBufferRecording = false;
-        m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
+        VkResult resetRes = m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
+        if (resetRes != VK_SUCCESS)
+            log_msg("[libqemu_svga3d] vkResetCommandBuffer error after end failure: %d\n", resetRes);
         return SVGA3_VLKN_ERROR_DEVICE_LOST;
     }
     m_cmdBufferRecording = false;
@@ -670,17 +693,26 @@ Svga3VlknStatus VlknBackend::flushCommandBuffer() {
     res = m_dispatch.vkQueueSubmit(m_queue, 1, &submitInfo, VK_NULL_HANDLE);
     if (res != VK_SUCCESS) {
         log_msg("[libqemu_svga3d] vkQueueSubmit error: %d\n", res);
-        m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
+        VkResult resetRes = m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
+        if (resetRes != VK_SUCCESS)
+            log_msg("[libqemu_svga3d] vkResetCommandBuffer error after submit failure: %d\n", resetRes);
         return SVGA3_VLKN_ERROR_DEVICE_LOST;
     }
+    m_cmdBufferPending = true;
     res = m_dispatch.vkQueueWaitIdle(m_queue);
     if (res != VK_SUCCESS) {
         log_msg("[libqemu_svga3d] vkQueueWaitIdle error: %d\n", res);
-        m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
+        /* The submit was accepted. Keep its buffer pending until waitIdle()
+         * establishes completion; resetting it here would race the GPU. */
         return SVGA3_VLKN_ERROR_DEVICE_LOST;
     }
     ++m_completedSubmissionSerial;
-    m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
+    m_cmdBufferPending = false;
+    res = m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
+    if (res != VK_SUCCESS) {
+        log_msg("[libqemu_svga3d] vkResetCommandBuffer error: %d\n", res);
+        return SVGA3_VLKN_ERROR_DEVICE_LOST;
+    }
 
     return SVGA3_VLKN_SUCCESS;
 }
