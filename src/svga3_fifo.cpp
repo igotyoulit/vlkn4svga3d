@@ -118,6 +118,11 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
 {
     *bytesRead = 0;
 
+    /* Temporary: trace every FIFO command for rendering investigation. */
+    if (getenv("SVGA3_VLKN_TRACE_FIFO")) {
+        fprintf(stderr, "[fifo-trace] cmd=%u payloadSize=%zu\n", cmd, payloadSize);
+    }
+
     switch (cmd) {
         case SVGA_3D_CMD_SURFACE_DEFINE: {
             if (payloadSize < sizeof(SVGA3dCmdDefineSurface)) {
@@ -737,8 +742,43 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
             VlknContext *ctx = dev->contextMgr->getContext(pCmd->cid);
             if (!ctx) return SVGA3_VLKN_ERROR_NOT_FOUND;
 
-            Svga3VlknStatus st = ctx->setShaderConst(pCmd->reg, pCmd->type, pCmd->ctype, pCmd->values);
-            *bytesRead = sizeof(SVGA3dCmdSetShaderConst);
+            /* Mesa batches consecutive constants in a single command: the
+             * 16-byte header (cid, reg, type, ctype) is followed by N 16-byte
+             * values[4] records. Apply every record; the old code silently
+             * dropped all but the first. */
+            size_t headerSize = offsetof(SVGA3dCmdSetShaderConst, values);
+            size_t bodySize = payloadSize - headerSize;
+            if (bodySize == 0 || bodySize % sizeof(pCmd->values) != 0) {
+                return SVGA3_VLKN_ERROR_INVALID_COMMAND_BUFFER;
+            }
+            /* Validate shader type and constant type before any mutation. */
+            if (pCmd->type != SVGA3D_SHADERTYPE_VS && pCmd->type != SVGA3D_SHADERTYPE_PS) {
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
+            uint32_t maxReg;
+            if (pCmd->ctype == SVGA3D_CONST_TYPE_FLOAT) {
+                maxReg = 256;
+            } else if (pCmd->ctype == SVGA3D_CONST_TYPE_INT ||
+                       pCmd->ctype == SVGA3D_CONST_TYPE_BOOL) {
+                maxReg = 16;
+            } else {
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
+            unsigned numConsts = static_cast<unsigned>(bodySize / sizeof(pCmd->values));
+            /* Validate the entire batch upfront using subtraction to avoid
+             * overflow in reg + numConsts. */
+            if (pCmd->reg >= maxReg || numConsts > maxReg - pCmd->reg) {
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
+            const float (*values)[4] =
+                reinterpret_cast<const float (*)[4]>(payload + headerSize);
+            Svga3VlknStatus st = SVGA3_VLKN_SUCCESS;
+            for (unsigned i = 0; i < numConsts; ++i) {
+                st = ctx->setShaderConst(pCmd->reg + i, pCmd->type, pCmd->ctype,
+                                         reinterpret_cast<const uint32_t*>(values[i]));
+                if (st != SVGA3_VLKN_SUCCESS) break;
+            }
+            *bytesRead = payloadSize;
             return st;
         }
 

@@ -138,6 +138,20 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     outError.clear();
     if (outInputMask) *outInputMask = 0;
 
+    /* Debug: dump D3D9 input alongside SPIR-V when SVGA3_VLKN_DUMP_SPIRV is set. */
+    if (getenv("SVGA3_VLKN_DUMP_SPIRV")) {
+        char path[256];
+        static int d3d9DumpIdx = 0;
+        int idx = __sync_fetch_and_add(&d3d9DumpIdx, 1);
+        snprintf(path, sizeof(path), "/tmp/d3d9_dump_%d_%s.bin",
+                 idx, shaderType == SVGA3D_SHADERTYPE_VS ? "vs" : "ps");
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(tokens, sizeof(uint32_t), numTokens, f);
+            fclose(f);
+        }
+    }
+
     if (!tokens || numTokens < 2) {
         outError = "Shader bytecode too short or null";
         return SVGA3_VLKN_ERROR_INVALID_PARAM;
@@ -825,9 +839,11 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
          * MOV dst tokens with regType=TEMP for DCL-declared outputs. */
         bool isDclOutput = (isVS && major >= 3 && outputRegToSemantic.find(dst.regNum) != outputRegToSemantic.end());
         /* SM 3.0 VS without output DCLs: implicit outputs o0=position, o1=color.
-         * Mesa encodes these as TEMP in MOV dst tokens. Treat reg 0 as position. */
+         * Mesa encodes these as TEMP in MOV dst tokens. Treat reg 0 as
+         * position, reg 1 as color. */
         bool isImplicitVsOutput = (isVS && major >= 3 && outputRegToSemantic.empty() &&
-                                   dst.regType == D3DSPR_TEMP && dst.regNum == 0);
+                                   dst.regType == D3DSPR_TEMP &&
+                                   (dst.regNum == 0 || dst.regNum == 1));
         uint32_t effectiveRegType = (isDclOutput || isImplicitVsOutput) ? 6 : dst.regType;
         if (effectiveRegType == D3DSPR_TEMP) {
             if (dst.regNum >= 16) {
