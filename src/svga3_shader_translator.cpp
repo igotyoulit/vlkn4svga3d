@@ -138,6 +138,20 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     outError.clear();
     if (outInputMask) *outInputMask = 0;
 
+    /* Debug: dump D3D9 input alongside SPIR-V when SVGA3_VLKN_DUMP_SPIRV is set. */
+    if (getenv("SVGA3_VLKN_DUMP_SPIRV")) {
+        char path[256];
+        static int d3d9DumpIdx = 0;
+        int idx = __sync_fetch_and_add(&d3d9DumpIdx, 1);
+        snprintf(path, sizeof(path), "/tmp/d3d9_dump_%d_%s.bin",
+                 idx, shaderType == SVGA3D_SHADERTYPE_VS ? "vs" : "ps");
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(tokens, sizeof(uint32_t), numTokens, f);
+            fclose(f);
+        }
+    }
+
     if (!tokens || numTokens < 2) {
         outError = "Shader bytecode too short or null";
         return SVGA3_VLKN_ERROR_INVALID_PARAM;
@@ -178,6 +192,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     /* First pass: validate opcodes and extract DEF constants */
     std::map<uint32_t, ShaderDefConst> defConstants;
     std::vector<uint32_t> dclPositions; /* true DCL instruction boundaries */
+    std::unordered_map<uint32_t, bool> explicitVsOutputRegs;
     uint32_t pc = 1;
     bool foundEnd = false;
 
@@ -331,6 +346,15 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
         if (advance > numTokens - pc) {
             outError = "Truncated shader instruction: parameter tokens exceed bytecode length";
             return SVGA3_VLKN_ERROR_INVALID_PARAM;
+        }
+        /* D3D9 TEMP and OUTPUT registers are separate namespaces. Remember
+         * explicit OUTPUT writes so the Mesa TEMP-output compatibility path
+         * below does not steal same-numbered temporaries used for calculations. */
+        if (isVS && major >= 3 && op != D3DSIO_DCL && advance > 1) {
+            ParsedDest dst;
+            if (parseDest(tokens[pc + 1], dst) && dst.regType == D3DSPR_OUTPUT) {
+                explicitVsOutputRegs[dst.regNum] = true;
+            }
         }
         pc += advance;
     }
@@ -820,7 +844,22 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     /* Helper: store vec4 value into destination register with write mask */
     auto emitStoreDest = [&](const ParsedDest &dst, uint32_t val) {
         uint32_t dstVar = 0;
-        if (dst.regType == D3DSPR_TEMP) {
+        /* Mesa's SVGA backend can encode a DCL-declared output destination as
+         * TEMP. Only apply this compatibility fallback if the shader never
+         * explicitly writes that OUTPUT register: TEMP and OUTPUT register
+         * numbers are independent, and real shaders commonly use both r0 and o0. */
+        bool isDclOutput = (isVS && major >= 3 && dst.regType == D3DSPR_TEMP &&
+                            outputRegToSemantic.find(dst.regNum) != outputRegToSemantic.end() &&
+                            explicitVsOutputRegs.find(dst.regNum) == explicitVsOutputRegs.end());
+        /* SM 3.0 VS without output DCLs: implicit outputs o0=position, o1=color.
+         * Mesa encodes these as TEMP in MOV dst tokens. Treat reg 0 as
+         * position, reg 1 as color. */
+        bool isImplicitVsOutput = (isVS && major >= 3 && outputRegToSemantic.empty() &&
+                                   dst.regType == D3DSPR_TEMP &&
+                                   (dst.regNum == 0 || dst.regNum == 1) &&
+                                   explicitVsOutputRegs.find(dst.regNum) == explicitVsOutputRegs.end());
+        uint32_t effectiveRegType = (isDclOutput || isImplicitVsOutput) ? 6 : dst.regType;
+        if (effectiveRegType == D3DSPR_TEMP) {
             if (dst.regNum >= 16) {
                 outError = "Temporary register index out of range (r0-r15 supported)";
                 transError = true;
@@ -828,11 +867,11 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 return;
             }
             dstVar = rVars[dst.regNum];
-        } else if (dst.regType == D3DSPR_RASTOUT) {
+        } else if (effectiveRegType == D3DSPR_RASTOUT) {
             dstVar = outPosVar;
-        } else if (dst.regType == D3DSPR_ATTROUT || dst.regType == D3DSPR_COLOROUT) {
+        } else if (effectiveRegType == D3DSPR_ATTROUT || effectiveRegType == D3DSPR_COLOROUT) {
             dstVar = outColorVar[dst.regNum < 2 ? dst.regNum : 0];
-        } else if (dst.regType == 6) { /* D3DSPR_TEXCRDOUT (SM 1/2) or D3DSPR_OUTPUT (SM 3) */
+        } else if (effectiveRegType == 6) { /* D3DSPR_TEXCRDOUT (SM 1/2) or D3DSPR_OUTPUT (SM 3) */
             if (isVS) {
                 if (major >= 3 && !outputRegToSemantic.empty()) {
                     auto it = outputRegToSemantic.find(dst.regNum);
@@ -1389,6 +1428,20 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     b.emitInst(b.functionDefinitions, SpvOpFunctionEnd, {});
 
     outSpirv = b.assemble(b.getBound());
+    /* Debug: dump SPIR-V to /tmp if SVGA3_VLKN_DUMP_SPIRV is set.
+     * Useful for validating with spirv-val/spirv-dis. */
+    if (getenv("SVGA3_VLKN_DUMP_SPIRV")) {
+        char path[256];
+        static int dumpIdx = 0;
+        int idx = __sync_fetch_and_add(&dumpIdx, 1);
+        snprintf(path, sizeof(path), "/tmp/spirv_dump_%d_%s.spv",
+                 idx, isVS ? "vs" : "ps");
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(outSpirv.data(), sizeof(uint32_t), outSpirv.size(), f);
+            fclose(f);
+        }
+    }
     return SVGA3_VLKN_SUCCESS;
 }
 

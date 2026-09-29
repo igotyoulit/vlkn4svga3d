@@ -57,6 +57,7 @@ VLKN_LIB = $(LIB_DIR)/libsvga3_vlkn.a
 VLKN_TEST_TARGET = $(BIN_DIR)/test_svga3_vlkn
 REAL_VULKAN_TEST_TARGET = $(BIN_DIR)/test_real_vulkan
 SHADER_TRANSLATION_TEST_TARGET = $(BIN_DIR)/test_shader_translation
+TRANSLATOR_NOVULKAN_TEST_TARGET = $(BIN_DIR)/test_translator_novulkan
 SHADER_TEST_TARGET = $(BIN_DIR)/test_shader_execution
 GUEST_MEM_TEST_TARGET = $(BIN_DIR)/test_guest_memory
 MALFORMED_INPUT_TEST_TARGET = $(BIN_DIR)/test_malformed_inputs
@@ -67,7 +68,7 @@ LIB_QEMU_SVGA3D = $(LIB_DIR)/libqemu_svga3d.so
 
 .PHONY: all clean test test-oracle test-vlkn test-real-vulkan test-shader-translation test-shader test-guest-mem test-verified-rendering test-presentation test-qemu acceptance dump
 
-all: $(ORACLE_TARGET) $(VLKN_LIB) $(LIB_QEMU_SVGA3D) $(VLKN_TEST_TARGET) $(REAL_VULKAN_TEST_TARGET) $(SHADER_TRANSLATION_TEST_TARGET) $(SHADER_TEST_TARGET) $(GUEST_MEM_TEST_TARGET) $(VERIFIED_RENDERING_TEST_TARGET) $(PRESENTATION_TEST_TARGET) $(QEMU_TEST_TARGET) $(MALFORMED_INPUT_TEST_TARGET)
+all: $(ORACLE_TARGET) $(VLKN_LIB) $(LIB_QEMU_SVGA3D) $(VLKN_TEST_TARGET) $(REAL_VULKAN_TEST_TARGET) $(SHADER_TRANSLATION_TEST_TARGET) $(TRANSLATOR_NOVULKAN_TEST_TARGET) $(SHADER_TEST_TARGET) $(GUEST_MEM_TEST_TARGET) $(VERIFIED_RENDERING_TEST_TARGET) $(PRESENTATION_TEST_TARGET) $(QEMU_TEST_TARGET) $(MALFORMED_INPUT_TEST_TARGET)
 
 # Oracle Binary
 $(ORACLE_TARGET): $(ORACLE_OBJS) | $(BIN_DIR) $(DATA_DIR)
@@ -126,6 +127,9 @@ $(REAL_VULKAN_TEST_TARGET): tests/test_real_vulkan.cpp $(VLKN_LIB) | $(BIN_DIR)
 $(SHADER_TRANSLATION_TEST_TARGET): tests/test_shader_translation.cpp $(VLKN_LIB) | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) $< -L$(LIB_DIR) -lsvga3_vlkn -ldl -o $@
 
+$(TRANSLATOR_NOVULKAN_TEST_TARGET): tests/test_translator_novulkan.cpp $(VLKN_LIB) | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) $< -L$(LIB_DIR) -lsvga3_vlkn -ldl -o $@
+
 $(SHADER_TEST_TARGET): tests/test_shader_execution.cpp $(VLKN_LIB) | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) $< -L$(LIB_DIR) -lsvga3_vlkn -ldl -o $@
 
@@ -152,6 +156,9 @@ test-real-vulkan: $(REAL_VULKAN_TEST_TARGET)
 
 test-shader-translation: $(SHADER_TRANSLATION_TEST_TARGET)
 	./$(SHADER_TRANSLATION_TEST_TARGET)
+
+test-translator-novulkan: $(TRANSLATOR_NOVULKAN_TEST_TARGET)
+	./$(TRANSLATOR_NOVULKAN_TEST_TARGET)
 
 test-shader: $(SHADER_TEST_TARGET)
 	./$(SHADER_TEST_TARGET)

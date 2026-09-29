@@ -1958,6 +1958,15 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
                                  const SVGA3dPrimitiveRange *ranges,
                                  uint32_t numRanges)
 {
+    if (getenv("SVGA3_VLKN_TRACE_FIFO")) {
+        fprintf(stderr, "[draw-state] cullMode=%u (1=NONE,2=FRONT,3=BACK)\n",
+                m_renderStates[SVGA3D_RS_CULLMODE]);
+        fprintf(stderr, "[draw-state] viewport=(%g,%g %gx%g) scissor=(%d,%d %ux%u) rt0=%u\n",
+                m_viewport.x, m_viewport.y, m_viewport.width, m_viewport.height,
+                m_scissor.offset.x, m_scissor.offset.y,
+                m_scissor.extent.width, m_scissor.extent.height,
+                m_renderTargets[0].sid);
+    }
     /* Compute MVP = World * View * Projection when using fixed-function vertex shader */
     std::array<float, 16> ffMvp{};
     if (m_boundVS == SVGA3D_INVALID_ID) {
@@ -2011,6 +2020,13 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
                 m_vsConstsUploadedForFf = false;
             }
             memcpy(mapped + psOffset, m_psConsts.floatConsts, sizeof(m_psConsts.floatConsts));
+            if (getenv("SVGA3_VLKN_TRACE_FIFO")) {
+                fprintf(stderr, "[const-upload] vs c0=[%g %g %g %g] c1=[%g %g %g %g]\n",
+                        m_vsConsts.floatConsts[0][0], m_vsConsts.floatConsts[0][1],
+                        m_vsConsts.floatConsts[0][2], m_vsConsts.floatConsts[0][3],
+                        m_vsConsts.floatConsts[1][0], m_vsConsts.floatConsts[1][1],
+                        m_vsConsts.floatConsts[1][2], m_vsConsts.floatConsts[1][3]);
+            }
             m_vsConstDynamicOffset = static_cast<uint32_t>(vsOffset);
             m_psConstDynamicOffset = static_cast<uint32_t>(psOffset);
             m_constantRingCursor += slotSize;

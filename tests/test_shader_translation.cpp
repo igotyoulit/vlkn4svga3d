@@ -219,6 +219,32 @@ int main() {
     TEST_CHECK(res == VK_SUCCESS, "Create VkShaderModule from _SAT SPIR-V on Lavapipe");
     backend->dispatch().vkDestroyShaderModule(backend->device(), satModule, nullptr);
 
+    /* Mesa-style D3D9: DCL-declared OUTPUT with TEMP-encoded MOV destination.
+     * Mesa's SVGA backend emits MOV dst tokens with regType=TEMP for registers
+     * declared as OUTPUT via DCL. The translator must honor the DCL. */
+    {
+        const uint32_t mesaVsBytecode[] = {
+            0xFFFE0300, /* vs_3_0 */
+            (31) | (2 << 24), /* DCL */
+            0x80000000 | 0,   /* Usage: POSITION 0 */
+            0x80000000 | (6 << 28) | 0 | (0xF << 16), /* o0 (OUTPUT) */
+            (31) | (2 << 24), /* DCL */
+            0x80000000 | 5,   /* Usage: TEXCOORD 0 */
+            0x80000000 | (1 << 28) | 0 | (0xF << 16), /* v0 (INPUT) */
+            (1) | (2 << 24),  /* MOV */
+            0x80000000 | (0 << 28) | 0 | (0xF << 16), /* r0 (TEMP) - Mesa-style! */
+            0x80000000 | (1 << 28) | 0 | (0xE4 << 16), /* v0 */
+            0x0000FFFF        /* END */
+        };
+        std::vector<uint32_t> mesaSpirv;
+        std::string mesaErr;
+        auto mesaSt = svga3_vlkn::svga3_translate_shader_d3d9(
+            SVGA3D_SHADERTYPE_VS, mesaVsBytecode,
+            sizeof(mesaVsBytecode)/sizeof(uint32_t), mesaSpirv, mesaErr);
+        TEST_CHECK(mesaSt == SVGA3_VLKN_SUCCESS,
+                   "Mesa-style DCL/TEMP VS translates (DCL output routing)");
+    }
+
     /* Cleanup */
     backend->dispatch().vkDestroyShaderModule(backend->device(), vsModule, nullptr);
     backend->dispatch().vkDestroyShaderModule(backend->device(), psModule, nullptr);
