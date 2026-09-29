@@ -202,11 +202,54 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 outError = "Malformed D3DSIO_DEF dest parameter";
                 return SVGA3_VLKN_ERROR_INVALID_PARAM;
             }
+            if (dst.regType != D3DSPR_CONST || dst.regNum >= 256 ||
+                (major >= 2 && instLen != 5)) {
+                outError = "Invalid D3DSIO_DEF destination or operand count";
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
             ShaderDefConst def;
             memcpy(def.values, &tokens[pc + 2], sizeof(float) * 4);
             defConstants[dst.regNum] = def;
             pc += 6;
             continue;
+        }
+
+        /* Reject malformed lengths before either pass can read parameters.
+         * D3D9 token lengths count every following parameter token. */
+        uint32_t requiredParams = UINT32_MAX;
+        switch (op) {
+            case D3DSIO_NOP: requiredParams = 0; break;
+            case D3DSIO_MOV: case D3DSIO_RCP: case D3DSIO_RSQ: case D3DSIO_ABS:
+            case D3DSIO_FRC: case D3DSIO_DCL:
+                requiredParams = 2; break;
+            case D3DSIO_ADD: case D3DSIO_SUB: case D3DSIO_MUL: case D3DSIO_DP3:
+            case D3DSIO_DP4: case D3DSIO_MIN: case D3DSIO_MAX: case D3DSIO_M4x4:
+            case D3DSIO_TEX: case D3DSIO_POW:
+                requiredParams = 3; break;
+            case D3DSIO_MAD: case D3DSIO_LRP: case D3DSIO_CMP:
+                requiredParams = 4; break;
+            default: break; /* The opcode allowlist below rejects these. */
+        }
+        if (requiredParams != UINT32_MAX) {
+            if (instToken & (1u << 28)) {
+                outError = "Predicated shader instructions are not supported";
+                return SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
+            }
+            if ((major >= 2 && instLen != requiredParams) ||
+                requiredParams >= numTokens - pc) {
+                outError = "Invalid shader instruction operand count";
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
+            for (uint32_t i = 1; i <= requiredParams; ++i) {
+                if (!(tokens[pc + i] & 0x80000000u)) {
+                    outError = "Invalid shader parameter token";
+                    return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                }
+                if (i > 1 && (tokens[pc + i] & (1u << 13))) {
+                    outError = "Relative register addressing is not supported";
+                    return SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
+                }
+            }
         }
 
         /* Check for unsupported instructions */

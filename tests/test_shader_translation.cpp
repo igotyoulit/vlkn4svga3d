@@ -138,6 +138,20 @@ int main() {
     TEST_CHECK(st == SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER, "Unsupported opcode rejected with error");
     TEST_CHECK(!badErr.empty(), "Error message provided: " + badErr);
 
+    /* Declared instruction length cannot make a missing operand readable. */
+    const std::vector<std::vector<uint32_t>> malformedBytecode = {
+        {0xffff0300, 0x01000002, 0x800f0000, 0xffff}, // ADD with one operand
+        {0xffff0300, 0x02000001, 0x800f0000, 0xffff}, // MOV source replaced by END
+        {0xffff0300, 0x7ffffffe, 0xffff},             // truncated COMMENT payload
+        {0xffff0300, 0x05000051, 0xa00f0000, 0, 0xffff} // truncated DEF
+    };
+    for (const auto &code : malformedBytecode) {
+        st = svga3_vlkn::svga3_translate_shader_d3d9(SVGA3D_SHADERTYPE_PS,
+            code.data(), code.size(), badSpirv, badErr);
+        TEST_CHECK(st == SVGA3_VLKN_ERROR_INVALID_PARAM,
+                   "Truncated or falsely sized shader instruction rejected");
+    }
+
     /* 4. Negative Control: Missing END token */
     const uint32_t noEndBytecode[] = {
         0xFFFF0300,
