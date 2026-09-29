@@ -931,6 +931,25 @@ Svga3VlknStatus VlknContext::defineShader(uint32_t shid, SVGA3dShaderType type, 
     auto &table = (type == SVGA3D_SHADERTYPE_VS) ? m_vertexShaders : m_pixelShaders;
     auto it = table.find(shid);
     if (it != table.end()) {
+        /* Pipelines can remain referenced by recorded draw commands. Complete
+         * those commands before evicting their cached pipelines. */
+        endRenderPassIfActive();
+        Svga3VlknStatus flushStatus = m_backend->flushCommandBuffer();
+        if (flushStatus != SVGA3_VLKN_SUCCESS) return flushStatus;
+        /* Evict before destroying the module so a later draw cannot hit a
+         * pipeline cache entry built from the old shader. */
+        for (auto pcIt = m_pipelineCache.begin(); pcIt != m_pipelineCache.end(); ) {
+            bool usesShader = (type == SVGA3D_SHADERTYPE_VS) ? (pcIt->first.boundVS == shid)
+                                                             : (pcIt->first.boundPS == shid);
+            if (usesShader) {
+                if (pcIt->second) {
+                    m_backend->dispatch().vkDestroyPipeline(m_backend->device(), pcIt->second, nullptr);
+                }
+                pcIt = m_pipelineCache.erase(pcIt);
+            } else {
+                ++pcIt;
+            }
+        }
         if (it->second.module && it->second.module != m_defaultVS && it->second.module != m_defaultFS) {
             m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), it->second.module, nullptr);
         }
@@ -987,6 +1006,22 @@ Svga3VlknStatus VlknContext::destroyShader(uint32_t shid, SVGA3dShaderType type)
     auto it = table.find(shid);
     if (it == table.end()) {
         return SVGA3_VLKN_ERROR_NOT_FOUND;
+    }
+    /* Wait for recorded users before evicting the cached pipeline. */
+    endRenderPassIfActive();
+    Svga3VlknStatus flushStatus = m_backend->flushCommandBuffer();
+    if (flushStatus != SVGA3_VLKN_SUCCESS) return flushStatus;
+    for (auto pcIt = m_pipelineCache.begin(); pcIt != m_pipelineCache.end(); ) {
+        bool usesShader = (type == SVGA3D_SHADERTYPE_VS) ? (pcIt->first.boundVS == shid)
+                                                         : (pcIt->first.boundPS == shid);
+        if (usesShader) {
+            if (pcIt->second) {
+                m_backend->dispatch().vkDestroyPipeline(m_backend->device(), pcIt->second, nullptr);
+            }
+            pcIt = m_pipelineCache.erase(pcIt);
+        } else {
+            ++pcIt;
+        }
     }
     if (it->second.module && it->second.module != m_defaultVS && it->second.module != m_defaultFS) {
         m_backend->dispatch().vkDestroyShaderModule(m_backend->device(), it->second.module, nullptr);
@@ -1610,7 +1645,10 @@ VkPipeline VlknContext::getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
 
     uint32_t providedInputMask = 0;
     for (const auto &a : attrs) {
-        providedInputMask |= (1u << a.location);
+        /* a.location is guest-derived; shifting by >= 32 is UB. */
+        if (a.location < 32) {
+            providedInputMask |= (1u << a.location);
+        }
     }
 
     uint32_t requiredInputMask = (m_boundVS != SVGA3D_INVALID_ID) ?
@@ -1953,7 +1991,10 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
                 if (surf->height() <= 1 && surf->depth() <= 1) {
                     surf->addFlags(SVGA3D_SURFACE_HINT_VERTEXBUFFER);
                 }
-                size_t attrMax = decls[i].array.offset + (decls[i].array.stride ? decls[i].array.stride * 4096 : 4096);
+                /* 64-bit: stride*4096 used to wrap in 32-bit, undersizing the
+                 * vertex buffer and letting the GPU read out of bounds. */
+                size_t attrMax = static_cast<size_t>(decls[i].array.offset) +
+                    (decls[i].array.stride ? static_cast<size_t>(decls[i].array.stride) * 4096 : 4096);
                 if (attrMax > surf->bufferSize()) {
                     surf->ensureBufferSize(attrMax);
                 }
@@ -2130,7 +2171,10 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         else if (decls[i].identity.usage == SVGA3D_DECLUSAGE_COLOR) loc = (decls[i].identity.usageIndex == 0) ? 1 : 7;
         else if (decls[i].identity.usage == SVGA3D_DECLUSAGE_TEXCOORD) loc = 2 + decls[i].identity.usageIndex;
         else if (decls[i].identity.usage == SVGA3D_DECLUSAGE_NORMAL) loc = 6;
-        providedInputMask |= (1u << loc);
+        /* loc is guest-derived (usageIndex); shifting by >= 32 is UB. */
+        if (loc < 32) {
+            providedInputMask |= (1u << loc);
+        }
     }
     if (shouldLogHand) {
         log_msg("   inputMasks: required=0x%x, provided=0x%x, missing=0x%x\n",

@@ -601,10 +601,12 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
     size_t copyRowBytes = bw * bpp;
     size_t totalBytes = copyRowBytes * bh * bd;
 
+    /* 64-bit comparisons: the 32-bit sums wrapped for large boxes,
+     * letting out-of-image boxes pass and driving negative Vulkan extents. */
     bool fitsInImage = (m_image != VK_NULL_HANDLE) &&
-                       (bx + bw <= mip.width) &&
-                       (by + bh <= mip.height) &&
-                       (bz + bd <= mip.depth);
+                       ((uint64_t)bx + bw <= mip.width) &&
+                       ((uint64_t)by + bh <= mip.height) &&
+                       ((uint64_t)bz + bd <= mip.depth);
 
     if (!fitsInImage) {
         log_msg("[libqemu_svga3d] dmaUpload error: box does not fit in image (sid=%u, box=(%u,%u %ux%u), mip=(%ux%u))\n",
@@ -660,7 +662,12 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
             &stagingMem
         );
         if (st != SVGA3_VLKN_SUCCESS) return st;
-        m_backend->dispatch().vkMapMemory(m_backend->device(), stagingMem, 0, totalBytes, 0, &mapped);
+        if (m_backend->dispatch().vkMapMemory(m_backend->device(), stagingMem, 0,
+                                              totalBytes, 0, &mapped) != VK_SUCCESS ||
+            !mapped) {
+            m_backend->destroyBuffer(stagingBuf, stagingMem);
+            return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+        }
     }
 
     if (guestStride == 0 || guestStride == copyRowBytes) {
@@ -901,10 +908,12 @@ Svga3VlknStatus VlknSurface::dmaDownload(uint32_t mipLevel,
     size_t copyRowBytes = bw * bpp;
     size_t totalBytes = copyRowBytes * bh * bd;
 
+    /* 64-bit comparisons: the 32-bit sums wrapped for large boxes,
+     * letting out-of-image boxes pass and driving negative Vulkan extents. */
     bool fitsInImage = (m_image != VK_NULL_HANDLE) &&
-                       (bx + bw <= mip.width) &&
-                       (by + bh <= mip.height) &&
-                       (bz + bd <= mip.depth);
+                       ((uint64_t)bx + bw <= mip.width) &&
+                       ((uint64_t)by + bh <= mip.height) &&
+                       ((uint64_t)bz + bd <= mip.depth);
 
     if (!fitsInImage) {
         log_msg("[libqemu_svga3d] dmaDownload error: box does not fit in image (sid=%u, box=(%u,%u %ux%u), mip=(%ux%u))\n",
@@ -1013,7 +1022,12 @@ Svga3VlknStatus VlknSurface::dmaDownload(uint32_t mipLevel,
     m_backend->flushCommandBuffer();
 
     void *mapped = nullptr;
-    m_backend->dispatch().vkMapMemory(m_backend->device(), stagingMem, 0, totalBytes, 0, &mapped);
+    if (m_backend->dispatch().vkMapMemory(m_backend->device(), stagingMem, 0,
+                                          totalBytes, 0, &mapped) != VK_SUCCESS ||
+        !mapped) {
+        m_backend->destroyBuffer(stagingBuf, stagingMem);
+        return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+    }
 
     if (guestStride == 0 || guestStride == copyRowBytes) {
         memcpy(outGuestData, mapped, totalBytes);
@@ -1312,7 +1326,14 @@ Svga3VlknStatus VlknSurfaceManager::surfaceDMA(const SVGA3dGuestImage &guest,
         sBox.d = bd;
 
         if (guestMem) {
-            size_t totalBytes = rowBytes * bh * bd;
+            /* Overflow-checked: bw/bh/bd are guest-controlled, and a wrapped
+             * product would undersize `staging`, overflowing the heap in the
+             * row loops below. */
+            size_t totalBytes = 0;
+            if (__builtin_mul_overflow(rowBytes, static_cast<size_t>(bh), &totalBytes) ||
+                __builtin_mul_overflow(totalBytes, static_cast<size_t>(bd), &totalBytes)) {
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
             std::vector<uint8_t> staging(totalBytes);
 
             if (transfer == SVGA3D_WRITE_HOST_VRAM) {
@@ -1380,9 +1401,22 @@ Svga3VlknStatus VlknSurfaceManager::surfaceDMA(const SVGA3dGuestImage &guest,
         } else if (guestBuffer) {
             uint64_t guestOffset = static_cast<uint64_t>(guest.ptr.offset) +
                 (isLinearBuffer ? static_cast<uint64_t>(box.srcx) : static_cast<uint64_t>(box.srcx) * bpp);
+            /* Upper bound: the transfer touches (bh*bd) rows of guestStride
+             * bytes starting at guestOffset. The old code only checked the
+             * lower bound, allowing a host-side OOB read/write past
+             * guestBuffer. All arithmetic is overflow-checked. */
+            uint64_t xferBytes = 0;
+            bool rangeOk = !__builtin_mul_overflow(static_cast<uint64_t>(bh),
+                                                   static_cast<uint64_t>(bd),
+                                                   &xferBytes) &&
+                           !__builtin_mul_overflow(xferBytes,
+                                                   static_cast<uint64_t>(guestStride),
+                                                   &xferBytes) &&
+                           guestOffset <= guestBufferSize &&
+                           xferBytes <= guestBufferSize - guestOffset;
             if (transfer == SVGA3D_WRITE_HOST_VRAM) {
                 const uint8_t *srcData = nullptr;
-                if (guestOffset < guestBufferSize) {
+                if (rangeOk) {
                     srcData = reinterpret_cast<const uint8_t*>(guestBuffer) + guestOffset;
                 }
                 if (srcData) {
@@ -1390,7 +1424,7 @@ Svga3VlknStatus VlknSurfaceManager::surfaceDMA(const SVGA3dGuestImage &guest,
                 }
             } else if (transfer == SVGA3D_READ_HOST_VRAM) {
                 uint8_t *dstData = nullptr;
-                if (guestOffset < guestBufferSize) {
+                if (rangeOk) {
                     dstData = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(guestBuffer) + guestOffset);
                 }
                 if (dstData) {
@@ -1514,9 +1548,17 @@ Svga3VlknStatus VlknSurfaceManager::blitSurfaceToScreen(const SVGA3dSurfaceImage
                         if (!inside) continue;
                     }
 
-                    uint8_t *dst = fb.hva + curDy * dstPitch + curDx * dstBpp;
+                    /* 64-bit destination offset: the old 32-bit product wrapped
+                     * for large pitches. Never write outside the registered
+                     * framebuffer. */
+                    uint64_t dstOff = (uint64_t)curDy * dstPitch + (uint64_t)curDx * dstBpp;
+                    size_t pxBytes = std::min(bpp, static_cast<size_t>(dstBpp));
+                    if (dstOff > fb.size || pxBytes > fb.size - dstOff) {
+                        continue;
+                    }
+                    uint8_t *dst = fb.hva + (size_t)dstOff;
                     const uint8_t *src = static_cast<const uint8_t*>(mappedData) + curSy * rowPitch + curSx * bpp;
-                    memcpy(dst, src, std::min(bpp, static_cast<size_t>(dstBpp)));
+                    memcpy(dst, src, pxBytes);
                 }
             }
 
@@ -1625,7 +1667,13 @@ Svga3VlknStatus VlknSurfaceManager::present(uint32_t sid,
             if (numRects == 0 || !rects) {
                 size_t bytesToCopy = copyW * std::min(bpp, static_cast<size_t>(dstBpp));
                 for (uint32_t y = 0; y < copyH; ++y) {
-                    uint8_t *dst = fb.hva + y * dstPitch;
+                    /* 64-bit offset: the old 32-bit y*dstPitch wrapped for
+                     * large pitches. Skip rows outside the framebuffer. */
+                    uint64_t dstOff = (uint64_t)y * dstPitch;
+                    if (dstOff > fb.size || bytesToCopy > fb.size - dstOff) {
+                        continue;
+                    }
+                    uint8_t *dst = fb.hva + (size_t)dstOff;
                     const uint8_t *src = static_cast<const uint8_t*>(mappedData) + y * rowPitch;
                     memcpy(dst, src, bytesToCopy);
                 }
@@ -1643,7 +1691,13 @@ Svga3VlknStatus VlknSurfaceManager::present(uint32_t sid,
 
                     size_t bytesToCopy = cw * std::min(bpp, static_cast<size_t>(dstBpp));
                     for (uint32_t y = 0; y < ch; ++y) {
-                        uint8_t *dst = fb.hva + (r.y + y) * dstPitch + r.x * dstBpp;
+                        /* 64-bit offset: the old 32-bit product wrapped for
+                         * large pitches. Skip rows outside the framebuffer. */
+                        uint64_t dstOff = ((uint64_t)r.y + y) * dstPitch + (uint64_t)r.x * dstBpp;
+                        if (dstOff > fb.size || bytesToCopy > fb.size - dstOff) {
+                            continue;
+                        }
+                        uint8_t *dst = fb.hva + (size_t)dstOff;
                         const uint8_t *src = static_cast<const uint8_t*>(mappedData) + (r.srcy + y) * rowPitch + r.srcx * bpp;
                         memcpy(dst, src, bytesToCopy);
                     }

@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <link.h>
 #include <sys/mman.h>
 #include <errno.h>
@@ -156,7 +157,16 @@ static std::mutex g_vlkn_mutex;
 
 extern "C" void log_msg(const char *fmt, ...) {
     if (!log_file) {
-        log_file = fopen("/tmp/svga3d.log", "a");
+        /* O_NOFOLLOW: /tmp is world-writable; a symlinked log path would
+         * otherwise let an attacker redirect our log writes. Skip file
+         * logging entirely if the path cannot be opened safely. */
+        int fd = open("/tmp/svga3d.log", O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+        if (fd >= 0) {
+            log_file = fdopen(fd, "a");
+            if (!log_file) {
+                close(fd);
+            }
+        }
         if (log_file) setlinebuf(log_file);
     }
     if (log_file) {

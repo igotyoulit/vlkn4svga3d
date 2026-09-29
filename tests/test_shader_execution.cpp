@@ -545,6 +545,52 @@ int main() {
     std::cout << "  [PIXELS] Unbound Stage 1 Modulate Q1 (Expected Red): R=" << (int)pUnbound_Q1.r << " G=" << (int)pUnbound_Q1.g << " B=" << (int)pUnbound_Q1.b << std::endl;
     TEST_CHECK(pUnbound_Q1.r >= 240 && pUnbound_Q1.g <= 15 && pUnbound_Q1.b <= 15, "Unbound Stage 1 sampled white (1,1,1,1) preserving stage 0 texture color");
 
+    /* Replacing a shader must not destroy a pipeline referenced by queued work. */
+    const uint32_t queuedRed[] = {
+        0xFFFF0300,
+        81 | (5 << 24), D3D9_DST(2, 0, 0xF), 0x3F800000, 0, 0, 0x3F800000,
+        1 | (2 << 24), D3D9_DST(8, 0, 0xF), D3D9_SRC(2, 0, 0xE4),
+        0x0000FFFF
+    };
+    const uint32_t queuedGreen[] = {
+        0xFFFF0300,
+        81 | (5 << 24), D3D9_DST(2, 0, 0xF), 0, 0x3F800000, 0, 0x3F800000,
+        1 | (2 << 24), D3D9_DST(8, 0, 0xF), D3D9_SRC(2, 0, 0xE4),
+        0x0000FFFF
+    };
+    constexpr uint32_t queuedShaderId = 399;
+    TEST_CHECK(svga3_vlkn_context_define_shader(dev, CID1, queuedShaderId, SVGA3D_SHADERTYPE_PS,
+        queuedRed, sizeof(queuedRed) / sizeof(queuedRed[0])) == SVGA3_VLKN_SUCCESS,
+        "Define shader for pending-pipeline regression");
+    svga3_vlkn_context_set_shader(dev, CID1, SVGA3D_SHADERTYPE_PS, queuedShaderId);
+    svga3_vlkn_context_clear(dev, CID1, SVGA3D_CLEAR_COLOR, 0xFF000000, 1.0f, 0, nullptr, 0);
+    TEST_CHECK(svga3_vlkn_context_draw(dev, CID1, SVGA3D_PRIMITIVE_TRIANGLELIST,
+        decls, 2, &range, 1) == SVGA3_VLKN_SUCCESS, "Record draw with the old pipeline");
+    const uint64_t submissionsBeforeRedefine = backend->completedSubmissionSerial();
+    TEST_CHECK(svga3_vlkn_context_define_shader(dev, CID1, queuedShaderId, SVGA3D_SHADERTYPE_PS,
+        queuedGreen, sizeof(queuedGreen) / sizeof(queuedGreen[0])) == SVGA3_VLKN_SUCCESS,
+        "Redefine shader while its pipeline is pending");
+    TEST_CHECK(backend->completedSubmissionSerial() > submissionsBeforeRedefine,
+        "Shader replacement waits before retiring the pending pipeline");
+    TEST_CHECK(svga3_vlkn_surface_dma_download(dev, SID_RT1, 0, &readBox,
+        fb.data(), RT_WIDTH * sizeof(Pixel)) == SVGA3_VLKN_SUCCESS, "Submit and read pending old pipeline");
+    TEST_CHECK(fb[16 * RT_WIDTH + 16].r >= 240 && fb[16 * RT_WIDTH + 16].g <= 15,
+        "The pending draw completes with its original red pipeline");
+    TEST_CHECK(svga3_vlkn_context_draw(dev, CID1, SVGA3D_PRIMITIVE_TRIANGLELIST,
+        decls, 2, &range, 1) == SVGA3_VLKN_SUCCESS, "Draw with the replacement pipeline");
+    TEST_CHECK(svga3_vlkn_surface_dma_download(dev, SID_RT1, 0, &readBox,
+        fb.data(), RT_WIDTH * sizeof(Pixel)) == SVGA3_VLKN_SUCCESS, "Read replacement pipeline output");
+    TEST_CHECK(fb[16 * RT_WIDTH + 16].g >= 240 && fb[16 * RT_WIDTH + 16].r <= 15,
+        "The replacement pipeline renders green");
+    TEST_CHECK(svga3_vlkn_context_draw(dev, CID1, SVGA3D_PRIMITIVE_TRIANGLELIST,
+        decls, 2, &range, 1) == SVGA3_VLKN_SUCCESS, "Record draw before destroying its shader");
+    TEST_CHECK(svga3_vlkn_context_destroy_shader(dev, CID1, queuedShaderId, SVGA3D_SHADERTYPE_PS) == SVGA3_VLKN_SUCCESS,
+        "Destroy shader while its pipeline is pending");
+    TEST_CHECK(svga3_vlkn_surface_dma_download(dev, SID_RT1, 0, &readBox,
+        fb.data(), RT_WIDTH * sizeof(Pixel)) == SVGA3_VLKN_SUCCESS, "Read draw submitted during shader destruction");
+    TEST_CHECK(fb[16 * RT_WIDTH + 16].g >= 240 && fb[16 * RT_WIDTH + 16].r <= 15,
+        "Destroying a shader completes queued draws before pipeline eviction");
+
     /* Cleanup */
     svga3_vlkn_context_destroy(dev, CID1);
     svga3_vlkn_context_destroy(dev, CID2);
