@@ -931,15 +931,20 @@ Svga3VlknStatus VlknContext::defineShader(uint32_t shid, SVGA3dShaderType type, 
     auto &table = (type == SVGA3D_SHADERTYPE_VS) ? m_vertexShaders : m_pixelShaders;
     auto it = table.find(shid);
     if (it != table.end()) {
-        /* Pipelines embed the module handle resolved at creation time and are
-         * keyed by shader id (PipelineKey::boundVS/boundPS). Evict entries
-         * referencing this id before destroying its module: otherwise the
-         * next draw with this id takes a cache hit on a dead module. */
+        /* Pipelines can remain referenced by recorded draw commands. Complete
+         * those commands before evicting their cached pipelines. */
+        endRenderPassIfActive();
+        Svga3VlknStatus flushStatus = m_backend->flushCommandBuffer();
+        if (flushStatus != SVGA3_VLKN_SUCCESS) return flushStatus;
+        /* Evict before destroying the module so a later draw cannot hit a
+         * pipeline cache entry built from the old shader. */
         for (auto pcIt = m_pipelineCache.begin(); pcIt != m_pipelineCache.end(); ) {
             bool usesShader = (type == SVGA3D_SHADERTYPE_VS) ? (pcIt->first.boundVS == shid)
                                                              : (pcIt->first.boundPS == shid);
             if (usesShader) {
-                m_backend->dispatch().vkDestroyPipeline(m_backend->device(), pcIt->second, nullptr);
+                if (pcIt->second) {
+                    m_backend->dispatch().vkDestroyPipeline(m_backend->device(), pcIt->second, nullptr);
+                }
                 pcIt = m_pipelineCache.erase(pcIt);
             } else {
                 ++pcIt;
@@ -1002,13 +1007,17 @@ Svga3VlknStatus VlknContext::destroyShader(uint32_t shid, SVGA3dShaderType type)
     if (it == table.end()) {
         return SVGA3_VLKN_ERROR_NOT_FOUND;
     }
-    /* See defineShader: evict cached pipelines referencing this id before its
-     * module is destroyed. */
+    /* Wait for recorded users before evicting the cached pipeline. */
+    endRenderPassIfActive();
+    Svga3VlknStatus flushStatus = m_backend->flushCommandBuffer();
+    if (flushStatus != SVGA3_VLKN_SUCCESS) return flushStatus;
     for (auto pcIt = m_pipelineCache.begin(); pcIt != m_pipelineCache.end(); ) {
         bool usesShader = (type == SVGA3D_SHADERTYPE_VS) ? (pcIt->first.boundVS == shid)
                                                          : (pcIt->first.boundPS == shid);
         if (usesShader) {
-            m_backend->dispatch().vkDestroyPipeline(m_backend->device(), pcIt->second, nullptr);
+            if (pcIt->second) {
+                m_backend->dispatch().vkDestroyPipeline(m_backend->device(), pcIt->second, nullptr);
+            }
             pcIt = m_pipelineCache.erase(pcIt);
         } else {
             ++pcIt;
