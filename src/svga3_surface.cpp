@@ -384,7 +384,18 @@ Svga3VlknStatus VlknSurface::allocate() {
         return st;
     }
 
-    m_backend->dispatch().vkBindImageMemory(m_backend->device(), m_image, m_memory, 0);
+    VkResult bindRes = m_backend->dispatch().vkBindImageMemory(m_backend->device(), m_image, m_memory, 0);
+    if (bindRes != VK_SUCCESS) {
+        /* Without bound memory the image is unusable: fail the allocation
+         * and release both resources instead of building a view on top of
+         * an unbound image. */
+        log_msg("[libqemu_svga3d] allocate: vkBindImageMemory failed (%d)\n", bindRes);
+        m_backend->dispatch().vkDestroyImage(m_backend->device(), m_image, nullptr);
+        m_image = VK_NULL_HANDLE;
+        m_backend->freeMemory(m_memory);
+        m_memory = VK_NULL_HANDLE;
+        return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+    }
 
     /* Create default ImageView for full resource sampling */
     VkImageViewCreateInfo viewInfo = {};
@@ -416,6 +427,14 @@ Svga3VlknStatus VlknSurface::allocate() {
 
     res = m_backend->dispatch().vkCreateImageView(m_backend->device(), &viewInfo, nullptr, &m_imageView);
     if (res != VK_SUCCESS) {
+        /* Release the image and its memory: returning with them still
+         * attached leaked both on every view-creation failure. */
+        log_msg("[libqemu_svga3d] allocate: vkCreateImageView failed (%d)\n", res);
+        m_imageView = VK_NULL_HANDLE;
+        m_backend->dispatch().vkDestroyImage(m_backend->device(), m_image, nullptr);
+        m_image = VK_NULL_HANDLE;
+        m_backend->freeMemory(m_memory);
+        m_memory = VK_NULL_HANDLE;
         return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
     }
 
@@ -575,7 +594,13 @@ void VlknSurface::ensureViewMipLevels(uint32_t levels) {
     viewInfo.subresourceRange.baseArrayLayer = 0;
     viewInfo.subresourceRange.layerCount = m_arrayLayers;
 
-    m_backend->dispatch().vkCreateImageView(m_backend->device(), &viewInfo, nullptr, &m_imageView);
+    VkResult viewRes = m_backend->dispatch().vkCreateImageView(m_backend->device(), &viewInfo, nullptr, &m_imageView);
+    if (viewRes != VK_SUCCESS) {
+        /* The previous view was already destroyed above; leave m_imageView
+         * null (never a stale handle) and make the failure visible. */
+        log_msg("[libqemu_svga3d] ensureViewMipLevels: vkCreateImageView failed (%d)\n", viewRes);
+        m_imageView = VK_NULL_HANDLE;
+    }
 }
 
 void VlknSurface::destroy() {
@@ -648,7 +673,14 @@ VkImageView VlknSurface::getRenderTargetView(uint32_t mip, uint32_t face) {
     viewInfo.subresourceRange.layerCount = 1;
 
     VkImageView view = VK_NULL_HANDLE;
-    m_backend->dispatch().vkCreateImageView(m_backend->device(), &viewInfo, nullptr, &view);
+    VkResult viewRes = m_backend->dispatch().vkCreateImageView(m_backend->device(), &viewInfo, nullptr, &view);
+    if (viewRes != VK_SUCCESS) {
+        /* Do not cache the failure: a null entry would poison this
+         * (mip, face) pair for the surface's whole lifetime, and callers
+         * already treat a null return as "no view". */
+        log_msg("[libqemu_svga3d] getRenderTargetView: vkCreateImageView failed (%d)\n", viewRes);
+        return VK_NULL_HANDLE;
+    }
     m_rtViews[key] = view;
     return view;
 }
