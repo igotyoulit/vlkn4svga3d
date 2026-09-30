@@ -367,8 +367,11 @@ VlknContext::VlknContext(VlknBackend *backend, VlknSurfaceManager *surfaceMgr, u
      * copies against an image with no bound memory is invalid usage. */
     VkCommandBuffer initCb = m_backend->getActiveCommandBuffer();
     VkImageMemoryBarrier dummyBarrier = {};
+    dummyBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    dummyBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    dummyBarrier.subresourceRange.levelCount = 1;
+    dummyBarrier.subresourceRange.layerCount = 1;
     if (dummyOk) {
-        dummyBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         dummyBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         dummyBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         dummyBarrier.srcAccessMask = 0;
@@ -2085,6 +2088,9 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         } else {
             imageInfos[i].imageView = m_whiteView;
             imageInfos[i].sampler = m_dummySampler;
+        }
+        if (!imageInfos[i].imageView || !imageInfos[i].sampler) {
+            return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
         }
         m_boundImageViews[i] = imageInfos[i].imageView;
         m_boundSamplers[i] = imageInfos[i].sampler;

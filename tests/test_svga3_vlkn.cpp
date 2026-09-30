@@ -1633,6 +1633,14 @@ static void TestDepthVariantCleanup() {
  *    indices (including the wrapped -1, 0xFFFFFFFF) before the driver
  *    call is ever made.
  * -------------------------------------------------------------------------- */
+static PFN_vkCmdPipelineBarrier reviewOriginalBarrier;
+static unsigned reviewInvalidBarriers;
+static void VKAPI_CALL reviewBarrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep, uint32_t mc, const VkMemoryBarrier *mem, uint32_t bc, const VkBufferMemoryBarrier *buf, uint32_t ic, const VkImageMemoryBarrier *img) {
+    for (uint32_t i=0; i<ic; ++i) {
+        if (img[i].sType != VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER || !img[i].subresourceRange.aspectMask || !img[i].subresourceRange.levelCount || !img[i].subresourceRange.layerCount) ++reviewInvalidBarriers;
+    }
+    reviewOriginalBarrier(cb,src,dst,dep,mc,mem,bc,buf,ic,img);
+}
 static void TestMemoryTypeFailureHardening() {
     std::cout << ANSI_CYAN << "[TEST] Memory-Type & Allocation Failure Hardening (issue #10)..." << ANSI_RESET << std::endl;
 
@@ -1702,9 +1710,14 @@ static void TestMemoryTypeFailureHardening() {
         const long ctrlViews  = svga3_mock_live_views();
 
         const long failUsesBefore = svga3_mock_unbound_image_uses();
+        reviewOriginalBarrier = dev->backend->dispatch().vkCmdPipelineBarrier;
+        reviewInvalidBarriers = 0;
+        dev->backend->dispatch().vkCmdPipelineBarrier = reviewBarrier;
         svga3_mock_fail_bind_image_memory(1);
         TEST_CHECK(svga3_vlkn_context_create(dev, 9201) == SVGA3_VLKN_SUCCESS,
                    "Context still creates when the dummy bind fails (fail-soft)");
+        dev->backend->dispatch().vkCmdPipelineBarrier = reviewOriginalBarrier;
+        TEST_CHECK(reviewInvalidBarriers == 0, "Fallback image barriers retain required fields after dummy bind failure");
         TEST_CHECK(svga3_vlkn_context_destroy(dev, 9201) == SVGA3_VLKN_SUCCESS,
                    "Context destroys cleanly after dummy bind failure");
         TEST_CHECK(svga3_mock_unbound_image_uses() == failUsesBefore,
@@ -1712,6 +1725,30 @@ static void TestMemoryTypeFailureHardening() {
         TEST_CHECK(svga3_mock_live_images() == ctrlImages, "Dummy bind failure leaks no image");
         TEST_CHECK(svga3_mock_live_memory() == ctrlMemory, "Dummy bind failure leaks no memory");
         TEST_CHECK(svga3_mock_live_views() == ctrlViews, "Dummy bind failure leaks no view");
+    }
+
+    /* Missing fallback resources must fail a draw before descriptors are written. */
+    {
+        TEST_CHECK(svga3_vlkn_surface_define(dev, 9204, SVGA3D_SURFACE_HINT_RENDERTARGET,
+                       SVGA3D_A8R8G8B8, &size64, 1) == SVGA3_VLKN_SUCCESS,
+                   "Create render target for missing-fallback regression");
+        svga3_mock_fail_bind_image_memory(2);
+        TEST_CHECK(svga3_vlkn_context_create(dev, 9204) == SVGA3_VLKN_SUCCESS,
+                   "Create context with both fallback images unavailable");
+        TEST_CHECK(svga3_vlkn_context_set_render_target(dev, 9204, SVGA3D_RT_COLOR0,
+                       9204, 0, 0) == SVGA3_VLKN_SUCCESS, "Bind fallback regression target");
+        SVGA3dVertexDecl decl{};
+        decl.identity.usage = SVGA3D_DECLUSAGE_POSITION;
+        decl.identity.type = SVGA3D_DECLTYPE_FLOAT3;
+        decl.array.stride = 12;
+        SVGA3dPrimitiveRange range{};
+        range.primType = SVGA3D_PRIMITIVE_TRIANGLELIST;
+        range.primitiveCount = 1;
+        TEST_CHECK(svga3_vlkn_context_draw(dev, 9204, range.primType, &decl, 1, &range, 1)
+                       == SVGA3_VLKN_ERROR_OUT_OF_MEMORY,
+                   "Missing fallback fails draw instead of submitting null descriptors");
+        svga3_vlkn_context_destroy(dev, 9204);
+        svga3_vlkn_surface_destroy(dev, 9204);
     }
 
     /* 5. The central guard inside VlknBackend::allocateMemory. */
