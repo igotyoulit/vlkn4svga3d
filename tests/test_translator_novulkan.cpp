@@ -34,7 +34,11 @@ using namespace svga3_vlkn;
 #define D3DSPR_CONST_VAL 2
 #define D3DSPR_RASTOUT_VAL 4
 #define D3DSPR_OUTPUT_VAL 6
+#define D3DSPR_CONSTINT_VAL 7
 #define D3DSPR_COLOROUT_VAL 8
+#define D3DSPR_LOOP_VAL 15
+#define D3DSPR_MISCTYPE_VAL 17
+#define D3DSPR_PREDICATE_VAL 19
 
 static bool spirv_val_available() {
     return system("which spirv-val >/dev/null 2>&1") == 0;
@@ -85,6 +89,9 @@ struct SpirvFlow {
     std::unordered_map<uint32_t, uint32_t> pointee;  // pointer type id -> pointee type id
     std::unordered_map<uint64_t, uint32_t> memberBuiltin; // (typeId<<32|member) -> builtin
     std::unordered_map<uint32_t, uint32_t> locDecor; // var id -> Location value
+    std::unordered_map<uint32_t, uint32_t> builtinDecor; // var id -> BuiltIn value
+    std::set<uint32_t> allOps;                       // every opcode present
+    std::set<uint32_t> extInstNums;                  // OpExtInst instruction numbers used
     struct Store { uint32_t ptr, val; };
     std::vector<Store> stores;
     struct Access { uint32_t base, indexId; };
@@ -97,6 +104,7 @@ struct SpirvFlow {
             uint32_t word0 = w[i];
             uint32_t wc = word0 >> 16, op = word0 & 0xFFFF;
             if (wc == 0 || i + wc > w.size()) return false;
+            allOps.insert(op);
             auto at = [&](size_t k) -> uint32_t { return w[i + k]; };
             switch (op) {
             case 59: // OpVariable: type, id, storage, [init]
@@ -104,6 +112,7 @@ struct SpirvFlow {
                 break;
             case 71: // OpDecorate: target, decoration, [literals]
                 if (wc >= 4 && at(2) == 30) locDecor[at(1)] = at(3); // Location
+                if (wc >= 4 && at(2) == 11) builtinDecor[at(1)] = at(3); // BuiltIn
                 break;
             case 72: // OpMemberDecorate: target, member, decoration, [literals]
                 if (wc >= 5 && at(3) == 11) // Decoration BuiltIn; literal is the BuiltIn value
@@ -130,10 +139,15 @@ struct SpirvFlow {
             case 127: // OpFNegate
             case 129: // OpFAdd
             case 133: // OpFMul
-            case 124: // OpFSub
+            case 131: // OpFSub (builder header SpvOpFSub; was mislabeled 124)
             case 126: // OpFDiv
             case 148: // OpDot
             case 169: // OpSelect
+            case 180: // OpFOrdEqual
+            case 182: // OpFOrdNotEqual
+            case 184: // OpFOrdLessThan
+            case 186: // OpFOrdGreaterThan
+            case 188: // OpFOrdLessThanEqual
             case 190: // OpFOrdGreaterThanEqual
                 if (wc >= 4) {
                     defOp[at(2)] = op;
@@ -146,6 +160,7 @@ struct SpirvFlow {
                 if (wc >= 6) {
                     defOp[at(2)] = op;
                     defArgs[at(2)] = std::vector<uint32_t>(w.begin() + i + 5, w.begin() + i + wc);
+                    extInstNums.insert(at(4));
                 }
                 break;
             default:
@@ -227,6 +242,53 @@ struct SpirvFlow {
             if (s.ptr == ptr) return s.val;
         return 0;
     }
+
+    bool hasOpcode(uint32_t op) const { return allOps.count(op) != 0; }
+    bool hasExtInst(uint32_t n) const { return extInstNums.count(n) != 0; }
+
+    /* How many variables are decorated with the given BuiltIn value. */
+    int builtinVarCount(uint32_t builtin) const {
+        int n = 0;
+        for (const auto& kv : builtinDecor)
+            if (kv.second == builtin) ++n;
+        return n;
+    }
+
+    /* Does value `id` derive from an instruction with opcode `targetOp`,
+     * following loads/stores through Function-class shadow variables (the
+     * same chain discipline as flowsFromInput)? Used to prove e.g. that the
+     * value reaching oC0 passed through the SETP comparison (through the
+     * predicate variable and the predicated select), not merely that the
+     * opcode exists somewhere in the module. */
+    bool derivesFromOp(uint32_t id, uint32_t targetOp, int depth,
+                       std::set<uint32_t>& seenVars) const {
+        if (depth > 64) return false;
+        auto it = defOp.find(id);
+        if (it == defOp.end()) return false;
+        if (it->second == targetOp) return true;
+        auto ia = defArgs.find(id);
+        if (ia == defArgs.end()) return false;
+        const auto& args = ia->second;
+        if (it->second == 61) { // OpLoad
+            uint32_t ptr = args[0];
+            auto vc = varClass.find(ptr);
+            if (vc != varClass.end() && vc->second == 7) { // Function shadow
+                if (!seenVars.insert(ptr).second) return false;
+                for (const auto& s : stores)
+                    if (s.ptr == ptr && derivesFromOp(s.val, targetOp, depth + 1, seenVars))
+                        return true;
+            }
+            return false;
+        }
+        for (uint32_t a : args)
+            if (derivesFromOp(a, targetOp, depth + 1, seenVars)) return true;
+        return false;
+    }
+
+    bool derivesFromOp(uint32_t id, uint32_t targetOp) const {
+        std::set<uint32_t> seen;
+        return derivesFromOp(id, targetOp, 0, seen);
+    }
 };
 
 /* 1 = value flows from an input, 0 = no flow (misrouted/unwritten), -1 = malformed */
@@ -248,6 +310,35 @@ static int check_location_flow(const std::vector<uint32_t>& spirv, uint32_t loc)
     uint32_t val = g.storedValue(var);
     if (!val) return 0;
     return g.flowsFromInput(val) ? 1 : 0;
+}
+
+/* 1 = value stored at Location `loc` derives from opcode `op`, 0 = no, -1 = malformed */
+static int check_location_derives(const std::vector<uint32_t>& spirv, uint32_t loc, uint32_t op) {
+    SpirvFlow g;
+    if (!g.parse(spirv)) return -1;
+    uint32_t var = g.locationVar(loc);
+    if (!var) return -1;
+    uint32_t val = g.storedValue(var);
+    if (!val) return 0;
+    return g.derivesFromOp(val, op) ? 1 : 0;
+}
+
+static bool module_has_opcode(const std::vector<uint32_t>& spirv, uint32_t op) {
+    SpirvFlow g;
+    if (!g.parse(spirv)) return false;
+    return g.hasOpcode(op);
+}
+
+static bool module_has_extinst(const std::vector<uint32_t>& spirv, uint32_t n) {
+    SpirvFlow g;
+    if (!g.parse(spirv)) return false;
+    return g.hasExtInst(n);
+}
+
+static int module_builtin_count(const std::vector<uint32_t>& spirv, uint32_t builtin) {
+    SpirvFlow g;
+    if (!g.parse(spirv)) return -1;
+    return g.builtinVarCount(builtin);
 }
 
 } // namespace
@@ -411,6 +502,326 @@ int main() {
             return 1;
         }
         std::cout << "  [PASS] oT0 does not flow to color Location 0" << std::endl;
+    }
+
+    /* ------------------------------------------------------------------
+     * MISCTYPE: vPos must reach oC0 through the FragCoord builtin, and the
+     * builtin must be declared only when used (gating). Regression for the
+     * loop-scene FIFO abort: FragCoord-reading PS shaders used to fail
+     * translation outright ("Unsupported register type 17"). */
+    {
+        const uint32_t ps[] = {
+            0xFFFF0300, // ps_3_0
+            (1) | (2 << 24), // MOV
+            D3D9_DST(D3DSPR_TEMP_VAL, 0, 0xF), // r0
+            D3D9_SRC(D3DSPR_MISCTYPE_VAL, 0, 0xE4), // vPos
+            (1) | (2 << 24), // MOV
+            D3D9_DST(D3DSPR_COLOROUT_VAL, 0, 0xF), // oC0
+            D3D9_SRC(D3DSPR_TEMP_VAL, 0, 0xE4), // r0
+            0x0000FFFF
+        };
+        std::vector<uint32_t> spirv;
+        std::string err;
+        auto st = svga3_translate_shader_d3d9(SVGA3D_SHADERTYPE_PS, ps,
+                                              sizeof(ps)/sizeof(uint32_t), spirv, err);
+        TEST_CHECK(st == SVGA3_VLKN_SUCCESS, "vPos PS translates");
+        TEST_CHECK_SPIRV(spirv, "vpos", "vPos PS passes spirv-val");
+        TEST_CHECK_LOCATION_FLOW(spirv, "vpos", 0, "vPos value flows FragCoord->oC0");
+        TEST_CHECK(module_builtin_count(spirv, 15) == 1, "vPos PS declares exactly one FragCoord builtin");
+        TEST_CHECK(module_builtin_count(spirv, 17) == 0, "vPos PS declares no FrontFacing builtin (gated)");
+        /* SVGA vPos is the integer pixel coordinate while Vulkan
+         * FragCoord is the pixel center; this MOV-only shader can only
+         * gain an OpFSub from the vPos bias correction. Without it the
+         * guest's own +0.5 fixup lands on pixel corners and every
+         * FragCoord-driven scene validates wrong. */
+        TEST_CHECK(module_has_opcode(spirv, 131), "vPos delivery subtracts half-texel bias (OpFSub)");
+    }
+
+    /* vFace: +1/-1 select driven by the FrontFacing builtin (value 17 —
+     * the header briefly carried 23 = HelperInvocation; pin the number). */
+    {
+        const uint32_t ps[] = {
+            0xFFFF0300, // ps_3_0
+            (1) | (2 << 24), // MOV
+            D3D9_DST(D3DSPR_TEMP_VAL, 0, 0xF), // r0
+            D3D9_SRC(D3DSPR_MISCTYPE_VAL, 1, 0xE4), // vFace
+            (1) | (2 << 24), // MOV
+            D3D9_DST(D3DSPR_COLOROUT_VAL, 0, 0xF), // oC0
+            D3D9_SRC(D3DSPR_TEMP_VAL, 0, 0xE4), // r0
+            0x0000FFFF
+        };
+        std::vector<uint32_t> spirv;
+        std::string err;
+        auto st = svga3_translate_shader_d3d9(SVGA3D_SHADERTYPE_PS, ps,
+                                              sizeof(ps)/sizeof(uint32_t), spirv, err);
+        TEST_CHECK(st == SVGA3_VLKN_SUCCESS, "vFace PS translates");
+        TEST_CHECK_SPIRV(spirv, "vface", "vFace PS passes spirv-val");
+        TEST_CHECK_LOCATION_FLOW(spirv, "vface", 0, "vFace value flows FrontFacing->oC0");
+        TEST_CHECK(module_builtin_count(spirv, 17) == 1, "vFace PS declares exactly one FrontFacing (17) builtin");
+        TEST_CHECK(module_builtin_count(spirv, 15) == 0, "vFace PS declares no FragCoord builtin (gated)");
+    }
+
+    /* Gating negative control: a PS that reads neither misc register must
+     * declare no fragment builtins at all. */
+    {
+        const uint32_t ps[] = {
+            0xFFFF0300, // ps_3_0
+            (31) | (2 << 24), // DCL
+            0x80000000 | 5,   // TEXCOORD0
+            D3D9_DST(D3DSPR_INPUT_VAL, 0, 0xF), // v0
+            (1) | (2 << 24), // MOV
+            D3D9_DST(D3DSPR_COLOROUT_VAL, 0, 0xF), // oC0
+            D3D9_SRC(D3DSPR_INPUT_VAL, 0, 0xE4), // v0
+            0x0000FFFF
+        };
+        std::vector<uint32_t> spirv;
+        std::string err;
+        auto st = svga3_translate_shader_d3d9(SVGA3D_SHADERTYPE_PS, ps,
+                                              sizeof(ps)/sizeof(uint32_t), spirv, err);
+        TEST_CHECK(st == SVGA3_VLKN_SUCCESS, "plain PS translates");
+        TEST_CHECK(module_builtin_count(spirv, 15) == 0, "plain PS declares no FragCoord builtin");
+        TEST_CHECK(module_builtin_count(spirv, 17) == 0, "plain PS declares no FrontFacing builtin");
+    }
+
+    /* Stage A opcodes: SGE / EXP / POW / SINCOS / DEFI-adjacent float ops.
+     * Asserts translation, spirv-val, the concrete SPIR-V ops emitted, and
+     * that the SGE comparison result actually reaches oC0 (derivation chain
+     * through the adds), not just that the opcode exists in the module. */
+    {
+        const uint32_t ps[] = {
+            0xFFFF0300, // ps_3_0
+            (81) | (5 << 24), // DEF c0 = (0.5, 2.0, 0.25, 1.0)
+            D3D9_DST(D3DSPR_CONST_VAL, 0, 0xF),
+            0x3F000000, 0x40000000, 0x3E800000, 0x3F800000,
+            (81) | (5 << 24), // DEF c1 = (0.25, 0.5, 2.0, 1.0)
+            D3D9_DST(D3DSPR_CONST_VAL, 1, 0xF),
+            0x3E800000, 0x3F000000, 0x40000000, 0x3F800000,
+            (13) | (3 << 24), // SGE r0, c0, c1
+            D3D9_DST(D3DSPR_TEMP_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_CONST_VAL, 0, 0xE4),
+            D3D9_SRC(D3DSPR_CONST_VAL, 1, 0xE4),
+            (14) | (2 << 24), // EXP r1, c0
+            D3D9_DST(D3DSPR_TEMP_VAL, 1, 0xF),
+            D3D9_SRC(D3DSPR_CONST_VAL, 0, 0xE4),
+            (32) | (3 << 24), // POW r2, c0, c1
+            D3D9_DST(D3DSPR_TEMP_VAL, 2, 0xF),
+            D3D9_SRC(D3DSPR_CONST_VAL, 0, 0xE4),
+            D3D9_SRC(D3DSPR_CONST_VAL, 1, 0xE4),
+            (37) | (2 << 24), // SINCOS r3, c0
+            D3D9_DST(D3DSPR_TEMP_VAL, 3, 0xF),
+            D3D9_SRC(D3DSPR_CONST_VAL, 0, 0xE4),
+            (2) | (3 << 24), // ADD r0, r0, r1
+            D3D9_DST(D3DSPR_TEMP_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_TEMP_VAL, 0, 0xE4),
+            D3D9_SRC(D3DSPR_TEMP_VAL, 1, 0xE4),
+            (2) | (3 << 24), // ADD r0, r0, r2
+            D3D9_DST(D3DSPR_TEMP_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_TEMP_VAL, 0, 0xE4),
+            D3D9_SRC(D3DSPR_TEMP_VAL, 2, 0xE4),
+            (2) | (3 << 24), // ADD r0, r0, r3
+            D3D9_DST(D3DSPR_TEMP_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_TEMP_VAL, 0, 0xE4),
+            D3D9_SRC(D3DSPR_TEMP_VAL, 3, 0xE4),
+            (1) | (2 << 24), // MOV oC0, r0
+            D3D9_DST(D3DSPR_COLOROUT_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_TEMP_VAL, 0, 0xE4),
+            0x0000FFFF
+        };
+        std::vector<uint32_t> spirv;
+        std::string err;
+        auto st = svga3_translate_shader_d3d9(SVGA3D_SHADERTYPE_PS, ps,
+                                              sizeof(ps)/sizeof(uint32_t), spirv, err);
+        TEST_CHECK(st == SVGA3_VLKN_SUCCESS, "Stage A (SGE/EXP/POW/SINCOS) PS translates");
+        TEST_CHECK_SPIRV(spirv, "stage_a", "Stage A PS passes spirv-val");
+        TEST_CHECK(module_has_extinst(spirv, 29), "EXP emitted as GLSL Exp2 (29)");
+        TEST_CHECK(module_has_extinst(spirv, 26), "POW emitted as GLSL Pow (26)");
+        TEST_CHECK(module_has_extinst(spirv, 13), "SINCOS emitted GLSL Sin (13)");
+        TEST_CHECK(module_has_extinst(spirv, 14), "SINCOS emitted GLSL Cos (14)");
+        TEST_CHECK(check_location_derives(spirv, 0, 190) == 1,
+                   "oC0 value derives from SGE's OpFOrdGreaterThanEqual");
+    }
+
+    /* Stage B: DEFI + LOOP/ENDLOOP (the glmark2 loop shaders' shape). */
+    {
+        const uint32_t vs[] = {
+            0xFFFE0300, // vs_3_0
+            (31) | (2 << 24), // DCL POSITION v0
+            0x80000000 | 0,
+            D3D9_DST(D3DSPR_INPUT_VAL, 0, 0xF),
+            (31) | (2 << 24), // DCL POSITION oPos
+            0x80000000 | 0,
+            D3D9_DST(D3DSPR_RASTOUT_VAL, 0, 0xF),
+            (48) | (5 << 24), // DEFI i0 = (count 2, start 0, step 1, -)
+            D3D9_DST(D3DSPR_CONSTINT_VAL, 0, 0xF),
+            2, 0, 1, 0,
+            (27) | (2 << 24), // LOOP aL, i0
+            D3D9_DST(D3DSPR_LOOP_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_CONSTINT_VAL, 0, 0xE4),
+            (1) | (2 << 24), // MOV r0, v0
+            D3D9_DST(D3DSPR_TEMP_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_INPUT_VAL, 0, 0xE4),
+            (29), // ENDLOOP
+            (1) | (2 << 24), // MOV oPos, r0
+            D3D9_DST(D3DSPR_RASTOUT_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_TEMP_VAL, 0, 0xE4),
+            0x0000FFFF
+        };
+        std::vector<uint32_t> spirv;
+        std::string err;
+        auto st = svga3_translate_shader_d3d9(SVGA3D_SHADERTYPE_VS, vs,
+                                              sizeof(vs)/sizeof(uint32_t), spirv, err);
+        TEST_CHECK(st == SVGA3_VLKN_SUCCESS, "DEFI+LOOP VS translates");
+        TEST_CHECK_SPIRV(spirv, "loop", "DEFI+LOOP VS passes spirv-val");
+        TEST_CHECK(module_has_opcode(spirv, 246), "LOOP lowered with OpLoopMerge");
+        TEST_CHECK_VALUE_FLOW(spirv, "loop", "LOOP VS value flows v0->Position through the loop body");
+    }
+
+    /* Stage B: IFC + BREAK inside a LOOP (structured selection in a loop). */
+    {
+        const uint32_t vs[] = {
+            0xFFFE0300, // vs_3_0
+            (31) | (2 << 24), // DCL POSITION v0
+            0x80000000 | 0,
+            D3D9_DST(D3DSPR_INPUT_VAL, 0, 0xF),
+            (31) | (2 << 24), // DCL POSITION oPos
+            0x80000000 | 0,
+            D3D9_DST(D3DSPR_RASTOUT_VAL, 0, 0xF),
+            (48) | (5 << 24), // DEFI i0 = (count 255, start 0, step 1, -)
+            D3D9_DST(D3DSPR_CONSTINT_VAL, 0, 0xF),
+            255, 0, 1, 0,
+            (27) | (2 << 24), // LOOP aL, i0
+            D3D9_DST(D3DSPR_LOOP_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_CONSTINT_VAL, 0, 0xE4),
+            (41) | (2 << 24) | (4 << 16), // IFC_LT r0, c0
+            D3D9_SRC(D3DSPR_TEMP_VAL, 0, 0xE4),
+            D3D9_SRC(D3DSPR_CONST_VAL, 0, 0xE4),
+            (44), // BREAK
+            (43), // ENDIF
+            (1) | (2 << 24), // MOV r0, v0
+            D3D9_DST(D3DSPR_TEMP_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_INPUT_VAL, 0, 0xE4),
+            (29), // ENDLOOP
+            (1) | (2 << 24), // MOV oPos, r0
+            D3D9_DST(D3DSPR_RASTOUT_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_TEMP_VAL, 0, 0xE4),
+            0x0000FFFF
+        };
+        std::vector<uint32_t> spirv;
+        std::string err;
+        auto st = svga3_translate_shader_d3d9(SVGA3D_SHADERTYPE_VS, vs,
+                                              sizeof(vs)/sizeof(uint32_t), spirv, err);
+        TEST_CHECK(st == SVGA3_VLKN_SUCCESS, "LOOP+IFC+BREAK VS translates");
+        TEST_CHECK_SPIRV(spirv, "loop_ifc", "LOOP+IFC+BREAK VS passes spirv-val");
+        TEST_CHECK(module_has_opcode(spirv, 246), "IFC-in-loop module has OpLoopMerge");
+        TEST_CHECK(module_has_opcode(spirv, 247), "IFC lowered with OpSelectionMerge");
+        TEST_CHECK_VALUE_FLOW(spirv, "loop_ifc", "LOOP+IFC+BREAK VS value flows v0->Position");
+    }
+
+    /* Stage B: SETP + predicated MOV. The oC0 value must derive from the
+     * SETP float comparison itself (through the predicate variable and the
+     * predicated select), proving the predicate gates the write. */
+    {
+        const uint32_t ps[] = {
+            0xFFFF0300, // ps_3_0
+            (31) | (2 << 24), // DCL TEXCOORD0 v0
+            0x80000000 | 5,
+            D3D9_DST(D3DSPR_INPUT_VAL, 0, 0xF),
+            (81) | (5 << 24), // DEF c0 = (0.5, 0.5, 0.5, 0.5)
+            D3D9_DST(D3DSPR_CONST_VAL, 0, 0xF),
+            0x3F000000, 0x3F000000, 0x3F000000, 0x3F000000,
+            (81) | (5 << 24), // DEF c1 = (1, 1, 1, 1)
+            D3D9_DST(D3DSPR_CONST_VAL, 1, 0xF),
+            0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000,
+            (81) | (5 << 24), // DEF c2 = (2, 2, 2, 2)
+            D3D9_DST(D3DSPR_CONST_VAL, 2, 0xF),
+            0x40000000, 0x40000000, 0x40000000, 0x40000000,
+            (94) | (3 << 24) | (4 << 16), // SETP_LT p0, v0, c0
+            D3D9_DST(D3DSPR_PREDICATE_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_INPUT_VAL, 0, 0xE4),
+            D3D9_SRC(D3DSPR_CONST_VAL, 0, 0xE4),
+            (1) | (2 << 24), // MOV r0, c1
+            D3D9_DST(D3DSPR_TEMP_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_CONST_VAL, 1, 0xE4),
+            (1) | (3 << 24) | (1u << 28), // (p0) MOV r0, c2
+            D3D9_DST(D3DSPR_TEMP_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_PREDICATE_VAL, 0, 0xE4),
+            D3D9_SRC(D3DSPR_CONST_VAL, 2, 0xE4),
+            (1) | (2 << 24), // MOV oC0, r0
+            D3D9_DST(D3DSPR_COLOROUT_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_TEMP_VAL, 0, 0xE4),
+            0x0000FFFF
+        };
+        std::vector<uint32_t> spirv;
+        std::string err;
+        auto st = svga3_translate_shader_d3d9(SVGA3D_SHADERTYPE_PS, ps,
+                                              sizeof(ps)/sizeof(uint32_t), spirv, err);
+        TEST_CHECK(st == SVGA3_VLKN_SUCCESS, "SETP+predicated MOV PS translates");
+        TEST_CHECK_SPIRV(spirv, "setp", "SETP+predicated MOV PS passes spirv-val");
+        TEST_CHECK(module_has_opcode(spirv, 184), "SETP_LT emitted OpFOrdLessThan");
+        TEST_CHECK(check_location_derives(spirv, 0, 169) == 1,
+                   "oC0 value derives from the predicated OpSelect");
+        TEST_CHECK(check_location_derives(spirv, 0, 184) == 1,
+                   "oC0 value derives from the SETP comparison through the predicate");
+    }
+
+    /* Malformed Stage-B programs must fail closed, never emit SPIR-V. */
+    {
+        auto rejected = [](const uint32_t* sh, size_t n, SVGA3dShaderType ty) {
+            std::vector<uint32_t> spv;
+            std::string err;
+            return svga3_translate_shader_d3d9(ty, sh, (uint32_t)n, spv, err) != SVGA3_VLKN_SUCCESS;
+        };
+        const uint32_t breakOutside[] = { 0xFFFF0300, (44), 0x0000FFFF };
+        TEST_CHECK(rejected(breakOutside, 3, SVGA3D_SHADERTYPE_PS),
+                   "BREAK outside any loop is rejected");
+        const uint32_t endloopAlone[] = { 0xFFFE0300, (29), 0x0000FFFF };
+        TEST_CHECK(rejected(endloopAlone, 3, SVGA3D_SHADERTYPE_VS),
+                   "ENDLOOP without LOOP is rejected");
+        const uint32_t elseAlone[] = { 0xFFFF0300, (42), 0x0000FFFF };
+        TEST_CHECK(rejected(elseAlone, 3, SVGA3D_SHADERTYPE_PS),
+                   "ELSE without IF is rejected");
+        const uint32_t loopNoDefi[] = {
+            0xFFFE0300,
+            (27) | (2 << 24), // LOOP aL, i0 (never defined)
+            D3D9_DST(D3DSPR_LOOP_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_CONSTINT_VAL, 0, 0xE4),
+            (29), // ENDLOOP
+            0x0000FFFF
+        };
+        TEST_CHECK(rejected(loopNoDefi, sizeof(loopNoDefi)/sizeof(uint32_t), SVGA3D_SHADERTYPE_VS),
+                   "LOOP over an undefined DEFI register is rejected");
+        const uint32_t loopUnclosed[] = {
+            0xFFFE0300,
+            (48) | (5 << 24), // DEFI i0 = (1, 0, 1, 0)
+            D3D9_DST(D3DSPR_CONSTINT_VAL, 0, 0xF),
+            1, 0, 1, 0,
+            (27) | (2 << 24), // LOOP aL, i0
+            D3D9_DST(D3DSPR_LOOP_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_CONSTINT_VAL, 0, 0xE4),
+            0x0000FFFF // no ENDLOOP
+        };
+        TEST_CHECK(rejected(loopUnclosed, sizeof(loopUnclosed)/sizeof(uint32_t), SVGA3D_SHADERTYPE_VS),
+                   "Unclosed LOOP at END is rejected");
+        const uint32_t setpBadRelop[] = {
+            0xFFFF0300,
+            (94) | (3 << 24) | (9 << 16), // SETP with comparison function 9 (invalid)
+            D3D9_DST(D3DSPR_PREDICATE_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_CONST_VAL, 0, 0xE4),
+            D3D9_SRC(D3DSPR_CONST_VAL, 0, 0xE4),
+            0x0000FFFF
+        };
+        TEST_CHECK(rejected(setpBadRelop, sizeof(setpBadRelop)/sizeof(uint32_t), SVGA3D_SHADERTYPE_PS),
+                   "SETP with an invalid comparison function is rejected");
+        const uint32_t predMovToOutput[] = {
+            0xFFFF0300,
+            (1) | (3 << 24) | (1u << 28), // (p0) MOV oC0, c0 — outputs cannot be read back
+            D3D9_DST(D3DSPR_COLOROUT_VAL, 0, 0xF),
+            D3D9_SRC(D3DSPR_PREDICATE_VAL, 0, 0xE4),
+            D3D9_SRC(D3DSPR_CONST_VAL, 0, 0xE4),
+            0x0000FFFF
+        };
+        TEST_CHECK(rejected(predMovToOutput, sizeof(predMovToOutput)/sizeof(uint32_t), SVGA3D_SHADERTYPE_PS),
+                   "Predicated MOV to a non-temp destination is rejected");
     }
 
     std::cout << "All ICD-free translator tests PASSED!" << std::endl;

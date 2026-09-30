@@ -56,19 +56,28 @@ enum SpvOp {
     SpvOpImageSampleDrefImplicitLod = 89,
     SpvOpCompositeInsert = 82,
     SpvOpFNegate = 127,
+    SpvOpIAdd = 128,
     SpvOpFAdd = 129,
+    SpvOpISub = 130,
     SpvOpFSub = 131,
     SpvOpFMul = 133,
     SpvOpFDiv = 136,
+    SpvOpConvertSToF = 109,
     SpvOpDot = 148,
     SpvOpSelect = 169,
+    SpvOpSLessThan = 177,
     SpvOpFOrdEqual = 180,
     SpvOpFOrdNotEqual = 182,
     SpvOpFOrdLessThan = 184,
     SpvOpFOrdGreaterThan = 186,
     SpvOpFOrdLessThanEqual = 188,
     SpvOpFOrdGreaterThanEqual = 190,
+    SpvOpLogicalNot = 201,
+    SpvOpLoopMerge = 246,
+    SpvOpSelectionMerge = 247,
     SpvOpLabel = 248,
+    SpvOpBranch = 249,
+    SpvOpBranchConditional = 250,
     SpvOpReturn = 253
 };
 
@@ -119,7 +128,9 @@ enum SpvBuiltIn {
     SpvBuiltInPosition = 0,
     SpvBuiltInPointSize = 1,
     SpvBuiltInClipDistance = 3,
-    SpvBuiltInCullDistance = 4
+    SpvBuiltInCullDistance = 4,
+    SpvBuiltInFragCoord = 15,
+    SpvBuiltInFrontFacing = 17
 };
 
 enum SpvDim {
@@ -138,6 +149,8 @@ enum GLSLstd450 {
     GLSLstd450Pow = 26,
     GLSLstd450Exp = 27,
     GLSLstd450Log = 28,
+    GLSLstd450Exp2 = 29,
+    GLSLstd450Log2 = 30,
     GLSLstd450Sqrt = 31,
     GLSLstd450InverseSqrt = 32,
     GLSLstd450FMin = 37,
