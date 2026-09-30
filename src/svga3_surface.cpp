@@ -1315,6 +1315,7 @@ Svga3VlknStatus VlknSurfaceManager::defineSurface(uint32_t sid,
     }
 
     m_surfaces[sid] = std::move(surf);
+    m_presented.erase(sid);
     return SVGA3_VLKN_SUCCESS;
 }
 
@@ -1328,6 +1329,7 @@ Svga3VlknStatus VlknSurfaceManager::destroySurface(uint32_t sid) {
     if (m_contextMgr) m_contextMgr->invalidateSurface(sid);
     m_backend->resourceBudgets().releaseSurfaceBytes(it->second->budgetedBytes());
     m_surfaces.erase(it);
+    m_presented.erase(sid);
     return SVGA3_VLKN_SUCCESS;
 }
 
@@ -1359,6 +1361,7 @@ void VlknSurfaceManager::clear() {
         }
     }
     m_surfaces.clear();
+    m_presented.clear();
 }
 
 size_t VlknSurfaceManager::count() const {
@@ -1452,6 +1455,9 @@ Svga3VlknStatus VlknSurfaceManager::copy(uint32_t srcSid,
         }
     }
 
+    /* The destination's contents changed: invalidate its readback cache
+     * and bump its content version (also re-arms present()). */
+    dst->invalidateReadback();
     m_backend->flushCommandBuffer();
     return SVGA3_VLKN_SUCCESS;
 }
@@ -1486,6 +1492,7 @@ Svga3VlknStatus VlknSurfaceManager::defineSurfaceV2(uint32_t sid,
     }
 
     m_surfaces[sid] = std::move(surf);
+    m_presented.erase(sid);
     return SVGA3_VLKN_SUCCESS;
 }
 
@@ -1542,6 +1549,7 @@ Svga3VlknStatus VlknSurfaceManager::stretchBlt(uint32_t srcSid,
         1, &blit, filter
     );
 
+    dst->invalidateReadback();
     m_backend->flushCommandBuffer();
     return SVGA3_VLKN_SUCCESS;
 }
@@ -1753,6 +1761,7 @@ Svga3VlknStatus VlknSurfaceManager::generateMipmaps(uint32_t sid, SVGA3dTextureF
     }
 
     surf->ensureViewMipLevels(surf->mipLevels());
+    surf->invalidateReadback();
     m_backend->flushCommandBuffer();
     return SVGA3_VLKN_SUCCESS;
 }
@@ -1903,6 +1912,23 @@ Svga3VlknStatus VlknSurfaceManager::present(uint32_t sid,
     VlknSurface *surf = getSurface(sid);
     if (!surf) return SVGA3_VLKN_ERROR_NOT_FOUND;
 
+    /* Duplicate-present suppression: if this exact surface content was
+     * already presented to this exact framebuffer, the download + copy +
+     * display update would reproduce the identical frame. Skip straight
+     * to the flush so command ordering/fence behavior is unchanged.
+     * Any content mutation bumps the surface's content version and
+     * re-arms the full present path. */
+    if (guestMem && guestMem->getFramebuffer().hva) {
+        const auto &fbNow = guestMem->getFramebuffer();
+        auto pit = m_presented.find(sid);
+        if (pit != m_presented.end() && pit->second.full &&
+            pit->second.version == surf->contentVersion() &&
+            pit->second.fbHva == fbNow.hva &&
+            pit->second.fbSize == fbNow.size) {
+            return m_backend->flushCommandBuffer();
+        }
+    }
+
     if (guestMem && guestMem->getFramebuffer().hva) {
         const auto &fb = guestMem->getFramebuffer();
         uint32_t surfW = surf->width();
@@ -1984,6 +2010,19 @@ Svga3VlknStatus VlknSurfaceManager::present(uint32_t sid,
                 }
             }
         }
+
+        /* Record what was presented so an unchanged re-present is
+         * suppressed above. Recorded only on the completed path: a
+         * failed download above returns early and never lands here. */
+        PresentedState ps;
+        ps.version = surf->contentVersion();
+        ps.fbHva = fb.hva;
+        ps.fbSize = fb.size;
+        auto prev = m_presented.find(sid);
+        ps.full = (numRects == 0 || !rects) ||
+                  (prev != m_presented.end() &&
+                   prev->second.version == ps.version && prev->second.full);
+        m_presented[sid] = ps;
     }
 
     m_backend->flushCommandBuffer();

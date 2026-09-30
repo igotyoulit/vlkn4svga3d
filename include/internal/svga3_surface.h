@@ -115,7 +115,12 @@ public:
                                         size_t *outRowPitch,
                                         std::unique_lock<std::mutex> &outLock);
 
-    void invalidateReadback() { m_readbackValid = false; }
+    void invalidateReadback() { m_readbackValid = false; ++m_contentVersion; }
+    /* Monotonic counter bumped by every content mutation that invalidates
+     * the readback cache (DMA upload, clear, draw, surface copy/blit,
+     * mipmap generation). present() uses it to suppress duplicate presents
+     * of unchanged surfaces. */
+    uint64_t contentVersion() const { return m_contentVersion; }
     bool hasReadback(uint32_t w, uint32_t h) const {
         return m_readbackValid && m_readbackW == w && m_readbackH == h && !m_readback.empty();
     }
@@ -152,6 +157,7 @@ private:
     size_t m_bufferSize;
 
     bool m_readbackValid;
+    uint64_t m_contentVersion = 0;
     uint32_t m_readbackW;
     uint32_t m_readbackH;
     size_t m_readbackPitch;
@@ -238,6 +244,19 @@ private:
     VlknBackend *m_backend;
     VlknContextManager *m_contextMgr = nullptr;
     std::unordered_map<uint32_t, std::unique_ptr<VlknSurface>> m_surfaces;
+    /* Duplicate-present suppression: content version + framebuffer identity
+     * of the last completed present per surface. Erased when a surface is
+     * destroyed/redefined so a recycled sid never inherits stale state. */
+    struct PresentedState {
+        uint64_t version = 0;
+        const void *fbHva = nullptr;
+        size_t fbSize = 0;
+        /* True once a full-surface present of this version completed;
+         * only then is the framebuffer known to hold the whole frame
+         * and any later present of the same version can be suppressed. */
+        bool full = false;
+    };
+    std::unordered_map<uint32_t, PresentedState> m_presented;
     mutable std::mutex m_mutex;
 };
 
