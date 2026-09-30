@@ -1667,6 +1667,60 @@ static void TestPendingWindowPresentsOnlyWhenDirty() {
     svga3_vlkn_device_destroy(dev);
 }
 
+static unsigned presentUpdateCount;
+static void countDisplayUpdate(void *, int32_t, int32_t, int32_t, int32_t) {
+    ++presentUpdateCount;
+}
+
+static void TestDuplicatePresentSuppressed() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create duplicate-present regression device");
+    if (!dev) return;
+
+    static std::vector<uint32_t> fb(128 * 128, 0);
+    TEST_CHECK(svga3_vlkn_device_set_framebuffer(dev, fb.data(), 0xE0000000ULL,
+                                                 fb.size() * sizeof(uint32_t),
+                                                 128, 128, 128 * 4, 4) == SVGA3_VLKN_SUCCESS,
+               "Register framebuffer for present suppression");
+    TEST_CHECK(svga3_vlkn_device_set_display_callback(dev, nullptr, countDisplayUpdate) == SVGA3_VLKN_SUCCESS,
+               "Register display update counter");
+    SVGA3dSize size = {128, 128, 1};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 42, 0, SVGA3D_A8R8G8B8, &size, 1) == SVGA3_VLKN_SUCCESS,
+               "Define presentable surface");
+
+    presentUpdateCount = 0;
+    TEST_CHECK(svga3_vlkn_surface_present(dev, 42, nullptr, 0) == SVGA3_VLKN_SUCCESS,
+               "First present succeeds");
+    TEST_CHECK(presentUpdateCount == 1, "First present notifies display once");
+    TEST_CHECK(svga3_vlkn_surface_present(dev, 42, nullptr, 0) == SVGA3_VLKN_SUCCESS,
+               "Duplicate present succeeds");
+    TEST_CHECK(presentUpdateCount == 1, "Duplicate present of unchanged surface is suppressed");
+
+    /* Mutating the surface content re-arms presentation. */
+    std::vector<uint8_t> pixels(128 * 128 * 4, 0x7F);
+    TEST_CHECK(svga3_vlkn_surface_dma_upload(dev, 42, 0, nullptr, pixels.data(), 128 * 4) == SVGA3_VLKN_SUCCESS,
+               "Upload new surface content");
+    TEST_CHECK(svga3_vlkn_surface_present(dev, 42, nullptr, 0) == SVGA3_VLKN_SUCCESS,
+               "Present after upload succeeds");
+    TEST_CHECK(presentUpdateCount == 2, "Present after content change notifies again");
+    TEST_CHECK(svga3_vlkn_surface_present(dev, 42, nullptr, 0) == SVGA3_VLKN_SUCCESS,
+               "Second duplicate present succeeds");
+    TEST_CHECK(presentUpdateCount == 2, "Duplicate present suppressed again after upload");
+
+    /* A recycled sid must not inherit suppression state. */
+    TEST_CHECK(svga3_vlkn_surface_destroy(dev, 42) == SVGA3_VLKN_SUCCESS,
+               "Destroy presentable surface");
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 42, 0, SVGA3D_A8R8G8B8, &size, 1) == SVGA3_VLKN_SUCCESS,
+               "Redefine presentable surface");
+    TEST_CHECK(svga3_vlkn_surface_present(dev, 42, nullptr, 0) == SVGA3_VLKN_SUCCESS,
+               "Present of redefined surface succeeds");
+    TEST_CHECK(presentUpdateCount == 3, "Present of redefined surface is not suppressed");
+
+    svga3_vlkn_device_destroy(dev);
+}
+
 static PFN_vkCreateShaderModule savedCreateShaderModule;
 static PFN_vkDestroyShaderModule savedDestroyShaderModule;
 static VkShaderModule trackedShader;
@@ -1741,6 +1795,68 @@ static void TestDepthVariantCleanup() {
     }
 }
 
+static PFN_vkCreateGraphicsPipelines savedCreatePipelines;
+static uint32_t capturedBlendAttachmentCount;
+static unsigned pipelineCreateCalls;
+static VkResult VKAPI_CALL capturePipelineCreate(VkDevice device, VkPipelineCache cache,
+                                                 uint32_t createInfoCount,
+                                                 const VkGraphicsPipelineCreateInfo *infos,
+                                                 const VkAllocationCallbacks *allocator,
+                                                 VkPipeline *pipelines) {
+    ++pipelineCreateCalls;
+    if (createInfoCount > 0 && infos && infos[0].pColorBlendState) {
+        capturedBlendAttachmentCount = infos[0].pColorBlendState->attachmentCount;
+    }
+    return savedCreatePipelines(device, cache, createInfoCount, infos, allocator, pipelines);
+}
+
+static void TestDepthOnlyPipelineBlendState() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create depth-only pipeline regression device");
+    if (!dev) return;
+    TEST_CHECK(svga3_vlkn_context_create(dev, 1) == SVGA3_VLKN_SUCCESS, "Create depth-only pipeline context");
+    auto *ctx = dev->contextMgr->getContext(1);
+    TEST_CHECK(ctx != nullptr, "Find depth-only pipeline context");
+    if (!ctx) { svga3_vlkn_device_destroy(dev); return; }
+    SVGA3dSize size = {64, 64, 1};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 1, 0, SVGA3D_A8R8G8B8, &size, 1) == SVGA3_VLKN_SUCCESS,
+               "Create color target for pipeline test");
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 2, 0, SVGA3D_Z_D16, &size, 1) == SVGA3_VLKN_SUCCESS,
+               "Create depth target for pipeline test");
+    auto &dispatch = dev->backend->dispatch();
+    savedCreatePipelines = dispatch.vkCreateGraphicsPipelines;
+    dispatch.vkCreateGraphicsPipelines = capturePipelineCreate;
+
+    SVGA3dPrimitiveRange range{};
+    range.primType = SVGA3D_PRIMITIVE_TRIANGLELIST;
+    range.primitiveCount = 1;
+
+    /* Color + depth bound: the pipeline must declare one blend attachment. */
+    ctx->setRenderTarget(SVGA3D_RT_COLOR0, 1, 0, 0);
+    ctx->setRenderTarget(SVGA3D_RT_DEPTH, 2, 0, 0);
+    pipelineCreateCalls = 0;
+    capturedBlendAttachmentCount = 0xFFFFFFFFu;
+    TEST_CHECK(ctx->draw(range.primType, nullptr, 0, &range, 1) == SVGA3_VLKN_SUCCESS,
+               "Draw with color and depth targets");
+    TEST_CHECK(pipelineCreateCalls >= 1, "Pipeline created for color+depth draw");
+    TEST_CHECK(capturedBlendAttachmentCount == 1, "Color pipeline declares one blend attachment");
+
+    /* Depth only: the render pass has no color attachment, so the pipeline
+     * must declare zero blend attachments or creation is invalid. */
+    ctx->setRenderTarget(SVGA3D_RT_COLOR0, SVGA3D_INVALID_ID, 0, 0);
+    pipelineCreateCalls = 0;
+    capturedBlendAttachmentCount = 0xFFFFFFFFu;
+    TEST_CHECK(ctx->draw(range.primType, nullptr, 0, &range, 1) == SVGA3_VLKN_SUCCESS,
+               "Draw with depth target only");
+    TEST_CHECK(pipelineCreateCalls >= 1, "Pipeline created for depth-only draw");
+    TEST_CHECK(capturedBlendAttachmentCount == 0, "Depth-only pipeline declares zero blend attachments");
+
+    dispatch.vkCreateGraphicsPipelines = savedCreatePipelines;
+    svga3_vlkn_device_destroy(dev);
+}
+
 /* --------------------------------------------------------------------------
  * Main Test Runner
  * -------------------------------------------------------------------------- */
@@ -1754,7 +1870,9 @@ int main() {
     TestSurfaceTransfersPropagateFlushFailures();
     TestRenderPassAndGrowthFlushFailuresPropagate();
     TestPendingWindowPresentsOnlyWhenDirty();
+    TestDuplicatePresentSuppressed();
     TestDepthVariantCleanup();
+    TestDepthOnlyPipelineBlendState();
     TestRenderPassEndingBatchesCommands();
     TestSurfaceFormatMappings();
     TestTopologyMappings();

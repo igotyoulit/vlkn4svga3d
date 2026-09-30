@@ -1904,8 +1904,21 @@ VkPipeline VlknContext::getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
 
     VkPipelineColorBlendStateCreateInfo blendInfo = {};
     blendInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    blendInfo.attachmentCount = 1;
-    blendInfo.pAttachments = &cbAttach;
+    /* The blend attachment count must equal the subpass color attachment
+     * count. Depth-only rendering (no color target bound, e.g. shadow /
+     * depth-prepass draws) uses a depth-only render pass, so the pipeline
+     * must declare zero blend attachments; declaring one anyway makes
+     * vkCreateGraphicsPipelines invalid and the draw is lost. When
+     * neither target is bound the render pass falls back to a default
+     * color attachment (see ensureRenderPassActive), hence the depth
+     * check in the fallback arm. */
+    bool hasColorTarget = (m_renderTargets[0].sid != 0 &&
+                           m_renderTargets[0].sid != SVGA3D_INVALID_ID);
+    bool hasDepthTarget = (m_depthStencilTarget.sid != 0 &&
+                           m_depthStencilTarget.sid != SVGA3D_INVALID_ID);
+    bool hasColorAttachment = hasColorTarget || !hasDepthTarget;
+    blendInfo.attachmentCount = hasColorAttachment ? 1 : 0;
+    blendInfo.pAttachments = hasColorAttachment ? &cbAttach : nullptr;
     pipeInfo.pColorBlendState = &blendInfo;
 
     /* Dynamic State */
