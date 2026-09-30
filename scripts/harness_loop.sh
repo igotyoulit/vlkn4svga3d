@@ -29,7 +29,12 @@ FAIL_FAST=0
 SKIP_BUILD=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --iterations) ITERATIONS="$2"; shift 2 ;;
+        --iterations)
+            if [[ $# -lt 2 || ! "$2" =~ ^[1-9][0-9]*$ || ${#2} -gt 9 ]]; then
+                echo "--iterations requires a positive integer (1..999999999)" >&2
+                exit 2
+            fi
+            ITERATIONS="$2"; shift 2 ;;
         --fail-fast)  FAIL_FAST=1; shift ;;
         --skip-build) SKIP_BUILD=1; shift ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
