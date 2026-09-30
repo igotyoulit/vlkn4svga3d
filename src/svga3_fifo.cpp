@@ -107,7 +107,12 @@ void svga3_vlkn_present_client_surfaces(Svga3VlknDevice *dev, const char *reason
 
     /* The readback normally flushed the command buffer. This also completes
      * work submitted on paths that have no window surface to read back. */
-    if (dev->backend) dev->backend->flushCommandBuffer();
+    if (dev->backend) {
+        Svga3VlknStatus fst = dev->backend->flushCommandBuffer();
+        if (fst != SVGA3_VLKN_SUCCESS) {
+            log_msg("[libqemu_svga3d] present_client_surfaces: flush failed (%d)\n", (int)fst);
+        }
+    }
 }
 
 Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
@@ -189,7 +194,9 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
             offset += numBoxes * sizeof(SVGA3dCopyBox);
 
             if (dev->contextMgr) dev->contextMgr->endAllRenderPasses();
-            Svga3VlknStatus st = dev->surfaceMgr->copy(pCmd->src.sid, pCmd->dest.sid, boxes, numBoxes);
+            Svga3VlknStatus st = dev->surfaceMgr->copy(pCmd->src.sid, pCmd->dest.sid, boxes, numBoxes,
+                                                       pCmd->src.mipmap, pCmd->src.face,
+                                                       pCmd->dest.mipmap, pCmd->dest.face);
             *bytesRead = offset;
             return st;
         }
@@ -937,7 +944,10 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
                 return SVGA3_VLKN_ERROR_INVALID_COMMAND_BUFFER;
             }
             if (dev->contextMgr) dev->contextMgr->endAllRenderPasses();
-            if (dev->backend) dev->backend->flushCommandBuffer();
+            if (dev->backend) {
+                Svga3VlknStatus fst = dev->backend->flushCommandBuffer();
+                if (fst != SVGA3_VLKN_SUCCESS) return fst;
+            }
             *bytesRead = sizeof(uint32_t);
             return SVGA3_VLKN_SUCCESS;
         }

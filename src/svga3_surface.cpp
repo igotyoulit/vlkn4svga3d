@@ -506,7 +506,13 @@ Svga3VlknStatus VlknSurface::ensureBufferSize(size_t requiredSize) {
 
     /* The old allocation can be in flight, and its contents must be stable
      * while copied into the replacement buffer. */
-    m_backend->flushCommandBuffer();
+    Svga3VlknStatus flushSt = m_backend->flushCommandBuffer();
+    if (flushSt != SVGA3_VLKN_SUCCESS) {
+        if (growthDelta > 0) {
+            m_backend->resourceBudgets().releaseSurfaceBytes(growthDelta);
+        }
+        return flushSt;
+    }
 
     VkBuffer newBuffer = VK_NULL_HANDLE;
     VkDeviceMemory newMemory = VK_NULL_HANDLE;
@@ -955,12 +961,12 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
     );
 
     m_currentLayout = barrier.newLayout;
-    m_backend->flushCommandBuffer();
+    Svga3VlknStatus flushSt = m_backend->flushCommandBuffer();
 
     if (!usingPersistentStaging) {
         m_backend->destroyBuffer(stagingBuf, stagingMem);
     }
-    return SVGA3_VLKN_SUCCESS;
+    return flushSt;
 }
 
 Svga3VlknStatus VlknSurface::dmaDownloadToStaging(uint32_t mipLevel,
@@ -1217,7 +1223,12 @@ Svga3VlknStatus VlknSurface::dmaDownload(uint32_t mipLevel,
     );
 
     m_currentLayout = barrier.newLayout;
-    m_backend->flushCommandBuffer();
+    Svga3VlknStatus flushSt = m_backend->flushCommandBuffer();
+    if (flushSt != SVGA3_VLKN_SUCCESS) {
+        /* The copy never executed: drop the staging buffer. */
+        m_backend->destroyBuffer(stagingBuf, stagingMem);
+        return flushSt;
+    }
 
     void *mapped = nullptr;
     if (m_backend->dispatch().vkMapMemory(m_backend->device(), stagingMem, 0,
@@ -1315,7 +1326,6 @@ Svga3VlknStatus VlknSurfaceManager::defineSurface(uint32_t sid,
     }
 
     m_surfaces[sid] = std::move(surf);
-    m_presented.erase(sid);
     return SVGA3_VLKN_SUCCESS;
 }
 
@@ -1329,7 +1339,6 @@ Svga3VlknStatus VlknSurfaceManager::destroySurface(uint32_t sid) {
     if (m_contextMgr) m_contextMgr->invalidateSurface(sid);
     m_backend->resourceBudgets().releaseSurfaceBytes(it->second->budgetedBytes());
     m_surfaces.erase(it);
-    m_presented.erase(sid);
     return SVGA3_VLKN_SUCCESS;
 }
 
@@ -1361,7 +1370,6 @@ void VlknSurfaceManager::clear() {
         }
     }
     m_surfaces.clear();
-    m_presented.clear();
 }
 
 size_t VlknSurfaceManager::count() const {
@@ -1372,12 +1380,29 @@ size_t VlknSurfaceManager::count() const {
 Svga3VlknStatus VlknSurfaceManager::copy(uint32_t srcSid,
                                         uint32_t dstSid,
                                         const SVGA3dCopyBox *boxes,
-                                        uint32_t numBoxes)
+                                        uint32_t numBoxes,
+                                        uint32_t srcMip,
+                                        uint32_t srcFace,
+                                        uint32_t dstMip,
+                                        uint32_t dstFace)
 {
     VlknSurface *src = getSurface(srcSid);
     VlknSurface *dst = getSurface(dstSid);
     if (!src || !dst) {
         return SVGA3_VLKN_ERROR_NOT_FOUND;
+    }
+
+    /* The command's image ids select one mip level / face per side.
+     * Mesa's level-restricted sampler views depend on this: a view
+     * surface's level 0 is filled from the texture's level N, and
+     * copying level 0 instead produces visibly wrong sampling. */
+    const SurfaceMipLevel *srcMipInfo = src->getMipInfo(srcMip);
+    const SurfaceMipLevel *dstMipInfo = dst->getMipInfo(dstMip);
+    if (!srcMipInfo || !dstMipInfo ||
+        srcFace >= src->arrayLayers() || dstFace >= dst->arrayLayers()) {
+        log_msg("[libqemu_svga3d] copy error: mip/face out of range (src mip=%u face=%u, dst mip=%u face=%u)\n",
+                srcMip, srcFace, dstMip, dstFace);
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
     }
 
     VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
@@ -1416,27 +1441,27 @@ Svga3VlknStatus VlknSurfaceManager::copy(uint32_t srcSid,
          * VkImageCopy; out-of-extents copies are Vulkan-level OOB. */
         if (src->image() != VK_NULL_HANDLE && dst->image() != VK_NULL_HANDLE) {
             uint32_t bd = b.d ? b.d : 1;
-            if ((uint64_t)b.srcx + b.w > src->width() ||
-                (uint64_t)b.srcy + (b.h ? b.h : 1) > src->height() ||
-                (uint64_t)b.srcz + bd > src->depth() ||
-                (uint64_t)b.x + b.w > dst->width() ||
-                (uint64_t)b.y + (b.h ? b.h : 1) > dst->height() ||
-                (uint64_t)b.z + bd > dst->depth()) {
+            if ((uint64_t)b.srcx + b.w > srcMipInfo->width ||
+                (uint64_t)b.srcy + (b.h ? b.h : 1) > srcMipInfo->height ||
+                (uint64_t)b.srcz + bd > srcMipInfo->depth ||
+                (uint64_t)b.x + b.w > dstMipInfo->width ||
+                (uint64_t)b.y + (b.h ? b.h : 1) > dstMipInfo->height ||
+                (uint64_t)b.z + bd > dstMipInfo->depth) {
                 log_msg("[libqemu_svga3d] copy error: box %u out of image bounds\n", i);
                 return SVGA3_VLKN_ERROR_INVALID_PARAM;
             }
             VkImageCopy copyRegion = {};
             copyRegion.srcSubresource.aspectMask = src->isDepthStencil() ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-            copyRegion.srcSubresource.mipLevel = 0;
-            copyRegion.srcSubresource.baseArrayLayer = 0;
+            copyRegion.srcSubresource.mipLevel = srcMip;
+            copyRegion.srcSubresource.baseArrayLayer = srcFace;
             copyRegion.srcSubresource.layerCount = 1;
             copyRegion.srcOffset.x = (int32_t)b.srcx;
             copyRegion.srcOffset.y = (int32_t)b.srcy;
             copyRegion.srcOffset.z = (int32_t)b.srcz;
 
             copyRegion.dstSubresource.aspectMask = dst->isDepthStencil() ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-            copyRegion.dstSubresource.mipLevel = 0;
-            copyRegion.dstSubresource.baseArrayLayer = 0;
+            copyRegion.dstSubresource.mipLevel = dstMip;
+            copyRegion.dstSubresource.baseArrayLayer = dstFace;
             copyRegion.dstSubresource.layerCount = 1;
             copyRegion.dstOffset.x = (int32_t)b.x;
             copyRegion.dstOffset.y = (int32_t)b.y;
@@ -1455,11 +1480,9 @@ Svga3VlknStatus VlknSurfaceManager::copy(uint32_t srcSid,
         }
     }
 
-    /* The destination's contents changed: invalidate its readback cache
-     * and bump its content version (also re-arms present()). */
+    /* The destination's contents changed: invalidate its readback cache. */
     dst->invalidateReadback();
-    m_backend->flushCommandBuffer();
-    return SVGA3_VLKN_SUCCESS;
+    return m_backend->flushCommandBuffer();
 }
 
 Svga3VlknStatus VlknSurfaceManager::defineSurfaceV2(uint32_t sid,
@@ -1492,7 +1515,6 @@ Svga3VlknStatus VlknSurfaceManager::defineSurfaceV2(uint32_t sid,
     }
 
     m_surfaces[sid] = std::move(surf);
-    m_presented.erase(sid);
     return SVGA3_VLKN_SUCCESS;
 }
 
@@ -1550,8 +1572,7 @@ Svga3VlknStatus VlknSurfaceManager::stretchBlt(uint32_t srcSid,
     );
 
     dst->invalidateReadback();
-    m_backend->flushCommandBuffer();
-    return SVGA3_VLKN_SUCCESS;
+    return m_backend->flushCommandBuffer();
 }
 
 Svga3VlknStatus VlknSurfaceManager::surfaceDMA(const SVGA3dGuestImage &guest,
@@ -1762,8 +1783,7 @@ Svga3VlknStatus VlknSurfaceManager::generateMipmaps(uint32_t sid, SVGA3dTextureF
 
     surf->ensureViewMipLevels(surf->mipLevels());
     surf->invalidateReadback();
-    m_backend->flushCommandBuffer();
-    return SVGA3_VLKN_SUCCESS;
+    return m_backend->flushCommandBuffer();
 }
 
 Svga3VlknStatus VlknSurfaceManager::blitSurfaceToScreen(const SVGA3dSurfaceImageId &srcImage,
@@ -1866,8 +1886,7 @@ Svga3VlknStatus VlknSurfaceManager::blitSurfaceToScreen(const SVGA3dSurfaceImage
         }
     }
 
-    m_backend->flushCommandBuffer();
-    return SVGA3_VLKN_SUCCESS;
+    return m_backend->flushCommandBuffer();
 }
 
 bool is_buffer_all_zero(const void *data, uint32_t w, uint32_t h, size_t rowPitch, size_t bpp) {
@@ -1911,23 +1930,6 @@ Svga3VlknStatus VlknSurfaceManager::present(uint32_t sid,
 {
     VlknSurface *surf = getSurface(sid);
     if (!surf) return SVGA3_VLKN_ERROR_NOT_FOUND;
-
-    /* Duplicate-present suppression: if this exact surface content was
-     * already presented to this exact framebuffer, the download + copy +
-     * display update would reproduce the identical frame. Skip straight
-     * to the flush so command ordering/fence behavior is unchanged.
-     * Any content mutation bumps the surface's content version and
-     * re-arms the full present path. */
-    if (guestMem && guestMem->getFramebuffer().hva) {
-        const auto &fbNow = guestMem->getFramebuffer();
-        auto pit = m_presented.find(sid);
-        if (pit != m_presented.end() && pit->second.full &&
-            pit->second.version == surf->contentVersion() &&
-            pit->second.fbHva == fbNow.hva &&
-            pit->second.fbSize == fbNow.size) {
-            return m_backend->flushCommandBuffer();
-        }
-    }
 
     if (guestMem && guestMem->getFramebuffer().hva) {
         const auto &fb = guestMem->getFramebuffer();
@@ -2010,23 +2012,9 @@ Svga3VlknStatus VlknSurfaceManager::present(uint32_t sid,
                 }
             }
         }
-
-        /* Record what was presented so an unchanged re-present is
-         * suppressed above. Recorded only on the completed path: a
-         * failed download above returns early and never lands here. */
-        PresentedState ps;
-        ps.version = surf->contentVersion();
-        ps.fbHva = fb.hva;
-        ps.fbSize = fb.size;
-        auto prev = m_presented.find(sid);
-        ps.full = (numRects == 0 || !rects) ||
-                  (prev != m_presented.end() &&
-                   prev->second.version == ps.version && prev->second.full);
-        m_presented[sid] = ps;
     }
 
-    m_backend->flushCommandBuffer();
-    return SVGA3_VLKN_SUCCESS;
+    return m_backend->flushCommandBuffer();
 }
 
 Svga3VlknStatus VlknSurfaceManager::setSurfaceActive(uint32_t sid, bool active) {

@@ -1303,12 +1303,14 @@ VkSampler VlknContext::getOrCreateSampler(uint32_t stage) {
     info.anisotropyEnable = (s.maxAnisotropy > 1) ? VK_TRUE : VK_FALSE;
     info.maxAnisotropy = (float)std::max(1u, s.maxAnisotropy);
     info.minLod = 0.0f;
-    /* FIX: Clamp maxLod = 0.0f when mipmapping is disabled or surface has <= 1 mip */
+    /* Clamp maxLod to the image's own level count when mipmapping is in
+     * use; the sampled view's current level count is timing-dependent
+     * (it expands as levels are produced) and must not pin LOD to 0. */
     VlknSurface *surf = m_surfaceMgr ? m_surfaceMgr->getSurface(s.sid) : nullptr;
-    if (s.mipFilter == SVGA3D_TEX_FILTER_NONE || (surf && surf->viewMipLevels() <= 1)) {
+    if (s.mipFilter == SVGA3D_TEX_FILTER_NONE || (surf && surf->mipLevels() <= 1)) {
         info.maxLod = 0.0f;
-    } else if (surf && surf->viewMipLevels() > 1) {
-        info.maxLod = (float)(surf->viewMipLevels() - 1);
+    } else if (surf && surf->mipLevels() > 1) {
+        info.maxLod = (float)(surf->mipLevels() - 1);
     } else {
         info.maxLod = 16.0f;
     }
@@ -1348,11 +1350,24 @@ Svga3VlknStatus VlknContext::ensureRenderPassActive() {
     uint32_t fbWidth = 800;
     uint32_t fbHeight = 600;
     if (colorSurf) {
-        fbWidth = colorSurf->width();
-        fbHeight = colorSurf->height();
+        /* The framebuffer extent must match the attached mip level, not
+         * the base level: an oversized framebuffer/render area against a
+         * smaller mip view misregisters rendering into that level. */
+        if (const SurfaceMipLevel *mi = colorSurf->getMipInfo(m_renderTargets[0].mipmap)) {
+            fbWidth = mi->width;
+            fbHeight = mi->height;
+        } else {
+            fbWidth = colorSurf->width();
+            fbHeight = colorSurf->height();
+        }
     } else if (depthSurf) {
-        fbWidth = depthSurf->width();
-        fbHeight = depthSurf->height();
+        if (const SurfaceMipLevel *mi = depthSurf->getMipInfo(m_depthStencilTarget.mipmap)) {
+            fbWidth = mi->width;
+            fbHeight = mi->height;
+        } else {
+            fbWidth = depthSurf->width();
+            fbHeight = depthSurf->height();
+        }
     }
 
     VkImageView colorView = colorSurf ? colorSurf->getRenderTargetView(m_renderTargets[0].mipmap, m_renderTargets[0].face) : VK_NULL_HANDLE;
@@ -1372,7 +1387,8 @@ Svga3VlknStatus VlknContext::ensureRenderPassActive() {
 
     if (fbNeedsRebuild) {
         if (m_activeFramebuffer != VK_NULL_HANDLE) {
-            m_backend->flushCommandBuffer();
+            Svga3VlknStatus fst = m_backend->flushCommandBuffer();
+            if (fst != SVGA3_VLKN_SUCCESS) return fst;
             m_backend->dispatch().vkDestroyFramebuffer(m_backend->device(), m_activeFramebuffer, nullptr);
             m_activeFramebuffer = VK_NULL_HANDLE;
         }
@@ -1561,7 +1577,8 @@ Svga3VlknStatus VlknContext::clear(SVGA3dClearFlag flags,
     if (wantDepth && !haveDepth) flags = (SVGA3dClearFlag)(flags & ~(SVGA3D_CLEAR_DEPTH | SVGA3D_CLEAR_STENCIL));
     if (flags == 0) return SVGA3_VLKN_SUCCESS;
 
-    ensureRenderPassActive();
+    Svga3VlknStatus rpStatus = ensureRenderPassActive();
+    if (rpStatus != SVGA3_VLKN_SUCCESS) return rpStatus;
     VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
 
     VkClearAttachment attachments[2];
@@ -1868,10 +1885,11 @@ VkPipeline VlknContext::getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
     pipeInfo.pInputAssemblyState = &iaInfo;
 
     /* Viewport / Scissor */
+    VkViewport pipelineViewport = rasterViewport();
     VkPipelineViewportStateCreateInfo vpInfo = {};
     vpInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     vpInfo.viewportCount = 1;
-    vpInfo.pViewports = &m_viewport;
+    vpInfo.pViewports = &pipelineViewport;
     vpInfo.scissorCount = 1;
     vpInfo.pScissors = &m_scissor;
     pipeInfo.pViewportState = &vpInfo;
@@ -2035,8 +2053,15 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         }
     }
 
-    /* 1. Update Constant Buffers (UBOs) */
-    if (m_constantsDirty) {
+    /* 1. Update Constant Buffers (UBOs)
+     * Upload on EVERY draw, not only when the guest resent constants.
+     * A draw that skips the upload binds the previous draw's ring slot;
+     * when the epoch later resets (any submission completes), the next
+     * upload rewrites that slot while the skipping draw may still be
+     * recorded-but-unsubmitted, so it executes with another draw's
+     * constants. A private slot per draw removes the aliasing; the
+     * ring-full path below already submits+waits before any reuse. */
+    {
         if (m_constantRingMapped && m_constantRingBuffer) {
             const uint64_t submissionSerial = m_backend->completedSubmissionSerial();
             if (submissionSerial != m_constantRingSubmissionSerial) {
@@ -2047,7 +2072,8 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
             if (m_constantRingCursor + slotSize > m_constantRingSize) {
                 /* The ring is full. Submit and wait before reusing any slice. */
                 endRenderPassIfActive();
-                m_backend->flushCommandBuffer();
+                Svga3VlknStatus fst = m_backend->flushCommandBuffer();
+                if (fst != SVGA3_VLKN_SUCCESS) return fst;
                 m_constantRingCursor = 0;
                 m_constantRingSubmissionSerial = m_backend->completedSubmissionSerial();
             }
@@ -2071,13 +2097,6 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
                 m_vsConstsUploadedForFf = false;
             }
             memcpy(mapped + psOffset, m_psConsts.floatConsts, sizeof(m_psConsts.floatConsts));
-            if (getenv("SVGA3_VLKN_TRACE_FIFO")) {
-                fprintf(stderr, "[const-upload] vs c0=[%g %g %g %g] c1=[%g %g %g %g]\n",
-                        m_vsConsts.floatConsts[0][0], m_vsConsts.floatConsts[0][1],
-                        m_vsConsts.floatConsts[0][2], m_vsConsts.floatConsts[0][3],
-                        m_vsConsts.floatConsts[1][0], m_vsConsts.floatConsts[1][1],
-                        m_vsConsts.floatConsts[1][2], m_vsConsts.floatConsts[1][3]);
-            }
             m_vsConstDynamicOffset = static_cast<uint32_t>(vsOffset);
             m_psConstDynamicOffset = static_cast<uint32_t>(psOffset);
             m_constantRingCursor += slotSize;
@@ -2096,6 +2115,14 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         bool stageBound = (m_stages[i].sid != SVGA3D_INVALID_ID && m_stages[i].sid != 0);
         VlknSurface *surf = stageBound ? m_surfaceMgr->getSurface(m_stages[i].sid) : nullptr;
         if (surf && surf->imageView()) {
+            /* A surface whose mip chain was produced by rendering (the
+             * guest's GenerateMipmap path) starts with a sampled view of
+             * level 0 only; uploads and the autogen blit are the other
+             * expansion triggers and neither fires for that path. Expand
+             * the view here so mip-filtered sampling can reach the chain. */
+            if (m_stages[i].mipFilter != SVGA3D_TEX_FILTER_NONE) {
+                surf->ensureViewMipLevels(surf->mipLevels());
+            }
             imageInfos[i].imageView = surf->imageView();
             imageInfos[i].sampler = getOrCreateSampler(i);
         } else {
@@ -2269,7 +2296,8 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         }
     }
 
-    ensureRenderPassActive();
+    Svga3VlknStatus rpStatus = ensureRenderPassActive();
+    if (rpStatus != SVGA3_VLKN_SUCCESS) return rpStatus;
     VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
 
     /* Draw tracing inspects and maps vertex buffers. Keep it opt-in so normal
@@ -2374,7 +2402,8 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         );
     }
 
-    m_backend->dispatch().vkCmdSetViewport(cb, 0, 1, &m_viewport);
+    VkViewport drawViewport = rasterViewport();
+    m_backend->dispatch().vkCmdSetViewport(cb, 0, 1, &drawViewport);
     VkRect2D activeScissor = m_scissor;
     if (!m_renderStates[SVGA3D_RS_SCISSORTESTENABLE]) {
         activeScissor.offset.x = (int32_t)m_viewport.x;
@@ -2500,7 +2529,8 @@ Svga3VlknStatus VlknContext::endQuery(SVGA3dQueryType type) {
     if (m_queryPool != VK_NULL_HANDLE) {
         VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
         m_backend->dispatch().vkCmdEndQuery(cb, m_queryPool, 0);
-        m_backend->flushCommandBuffer();
+        Svga3VlknStatus fst = m_backend->flushCommandBuffer();
+        if (fst != SVGA3_VLKN_SUCCESS) return fst;
     }
     m_queryActive = false;
     m_queryEnded = true;
