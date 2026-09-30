@@ -194,7 +194,9 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
             offset += numBoxes * sizeof(SVGA3dCopyBox);
 
             if (dev->contextMgr) dev->contextMgr->endAllRenderPasses();
-            Svga3VlknStatus st = dev->surfaceMgr->copy(pCmd->src.sid, pCmd->dest.sid, boxes, numBoxes);
+            Svga3VlknStatus st = dev->surfaceMgr->copy(pCmd->src.sid, pCmd->dest.sid, boxes, numBoxes,
+                                                       pCmd->src.mipmap, pCmd->src.face,
+                                                       pCmd->dest.mipmap, pCmd->dest.face);
             *bytesRead = offset;
             return st;
         }
