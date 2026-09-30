@@ -1524,7 +1524,8 @@ Svga3VlknStatus VlknContext::clear(SVGA3dClearFlag flags,
     if (wantDepth && !haveDepth) flags = (SVGA3dClearFlag)(flags & ~(SVGA3D_CLEAR_DEPTH | SVGA3D_CLEAR_STENCIL));
     if (flags == 0) return SVGA3_VLKN_SUCCESS;
 
-    ensureRenderPassActive();
+    Svga3VlknStatus rpStatus = ensureRenderPassActive();
+    if (rpStatus != SVGA3_VLKN_SUCCESS) return rpStatus;
     VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
 
     VkClearAttachment attachments[2];
@@ -2217,7 +2218,8 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         }
     }
 
-    ensureRenderPassActive();
+    Svga3VlknStatus rpStatus = ensureRenderPassActive();
+    if (rpStatus != SVGA3_VLKN_SUCCESS) return rpStatus;
     VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
 
     /* Draw tracing inspects and maps vertex buffers. Keep it opt-in so normal

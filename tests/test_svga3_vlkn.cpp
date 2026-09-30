@@ -1557,6 +1557,90 @@ static void TestSurfaceTransfersPropagateFlushFailures() {
     svga3_vlkn_device_destroy(dev);
 }
 
+static VkResult VKAPI_CALL failCreateFramebuffer(VkDevice device,
+                                                 const VkFramebufferCreateInfo *info,
+                                                 const VkAllocationCallbacks *alloc,
+                                                 VkFramebuffer *framebuffer) {
+    (void)device; (void)info; (void)alloc; (void)framebuffer;
+    return VK_ERROR_DEVICE_LOST;
+}
+
+/* Review findings (PR #16): clear()/draw() discarded the
+ * ensureRenderPassActive() status and recorded commands with no render
+ * pass active when framebuffer creation failed, and ensureBufferSize()
+ * leaked its growth budget reservation when the pre-growth flush failed.
+ * Both failures must propagate and leave no residue. */
+static void TestRenderPassAndGrowthFlushFailuresPropagate() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create review-findings regression device");
+    if (!dev) return;
+
+    SVGA3dSize size = {64, 64, 1};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 9301, SVGA3D_SURFACE_HINT_RENDERTARGET,
+                                         SVGA3D_A8R8G8B8, &size, 1) == SVGA3_VLKN_SUCCESS,
+               "Define review-findings render target");
+    TEST_CHECK(svga3_vlkn_context_create(dev, 9301) == SVGA3_VLKN_SUCCESS,
+               "Create review-findings context");
+    TEST_CHECK(svga3_vlkn_context_set_render_target(dev, 9301, SVGA3D_RT_COLOR0, 9301, 0, 0) ==
+                   SVGA3_VLKN_SUCCESS,
+               "Bind review-findings render target");
+
+    auto &dispatch = dev->backend->dispatch();
+    PFN_vkCreateFramebuffer savedCreateFb = dispatch.vkCreateFramebuffer;
+    dispatch.vkCreateFramebuffer = failCreateFramebuffer;
+
+    TEST_CHECK(svga3_vlkn_context_clear(dev, 9301, SVGA3D_CLEAR_COLOR, 0xff336699, 1.0f, 0,
+                                        nullptr, 0) != SVGA3_VLKN_SUCCESS,
+               "clear propagates render-pass activation failure");
+
+    SVGA3dVertexDecl decls[2];
+    memset(decls, 0, sizeof(decls));
+    decls[0].identity.usage = SVGA3D_DECLUSAGE_POSITION;
+    decls[0].identity.type = SVGA3D_DECLTYPE_FLOAT3;
+    decls[0].array.stride = 24;
+    decls[1].identity.usage = SVGA3D_DECLUSAGE_COLOR;
+    decls[1].identity.type = SVGA3D_DECLTYPE_D3DCOLOR;
+    decls[1].array.stride = 24;
+    decls[1].array.offset = 12;
+    SVGA3dPrimitiveRange range;
+    memset(&range, 0, sizeof(range));
+    range.primType = SVGA3D_PRIMITIVE_TRIANGLELIST;
+    range.primitiveCount = 1;
+    TEST_CHECK(svga3_vlkn_context_draw(dev, 9301, SVGA3D_PRIMITIVE_TRIANGLELIST,
+                                       decls, 2, &range, 1) != SVGA3_VLKN_SUCCESS,
+               "draw propagates render-pass activation failure");
+
+    dispatch.vkCreateFramebuffer = savedCreateFb;
+    TEST_CHECK(svga3_vlkn_context_clear(dev, 9301, SVGA3D_CLEAR_COLOR, 0xff336699, 1.0f, 0,
+                                        nullptr, 0) == SVGA3_VLKN_SUCCESS,
+               "Clear recovers once framebuffer creation succeeds again");
+
+    /* ensureBufferSize: a failed pre-growth flush must release the
+     * growth budget reservation it took before flushing. */
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 9302, 0, SVGA3D_X8R8G8B8, &size, 1) ==
+                   SVGA3_VLKN_SUCCESS,
+               "Define growth-budget surface");
+    svga3_vlkn::VlknSurface *surf = dev->surfaceMgr->getSurface(9302);
+    TEST_CHECK(surf != nullptr, "Growth-budget surface resolves");
+    if (surf) {
+        uint64_t budgetBefore = dev->backend->resourceBudgets().surfaceBytes();
+        dev->backend->getActiveCommandBuffer(); /* make the flush submit */
+        PFN_vkQueueSubmit savedSubmit = dispatch.vkQueueSubmit;
+        dispatch.vkQueueSubmit = failAllSubmits;
+        TEST_CHECK(surf->ensureBufferSize(1u << 20) != SVGA3_VLKN_SUCCESS,
+                   "Buffer growth propagates flush failure");
+        TEST_CHECK(dev->backend->resourceBudgets().surfaceBytes() == budgetBefore,
+                   "Failed growth flush releases the reserved growth budget");
+        dispatch.vkQueueSubmit = savedSubmit;
+        TEST_CHECK(surf->ensureBufferSize(1u << 20) == SVGA3_VLKN_SUCCESS,
+                   "Buffer growth succeeds once the flush recovers");
+    }
+
+    svga3_vlkn_device_destroy(dev);
+}
+
 static void TestPendingWindowPresentsOnlyWhenDirty() {
     Svga3VlknConfig cfg{};
     cfg.forceMockBackend = true;
@@ -1668,6 +1752,7 @@ int main() {
     TestFenceWithoutWindow();
     TestFlushPropagatesWaitFailures();
     TestSurfaceTransfersPropagateFlushFailures();
+    TestRenderPassAndGrowthFlushFailuresPropagate();
     TestPendingWindowPresentsOnlyWhenDirty();
     TestDepthVariantCleanup();
     TestRenderPassEndingBatchesCommands();

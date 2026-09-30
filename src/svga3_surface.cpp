@@ -488,7 +488,12 @@ Svga3VlknStatus VlknSurface::ensureBufferSize(size_t requiredSize) {
     /* The old allocation can be in flight, and its contents must be stable
      * while copied into the replacement buffer. */
     Svga3VlknStatus flushSt = m_backend->flushCommandBuffer();
-    if (flushSt != SVGA3_VLKN_SUCCESS) return flushSt;
+    if (flushSt != SVGA3_VLKN_SUCCESS) {
+        if (growthDelta > 0) {
+            m_backend->resourceBudgets().releaseSurfaceBytes(growthDelta);
+        }
+        return flushSt;
+    }
 
     VkBuffer newBuffer = VK_NULL_HANDLE;
     VkDeviceMemory newMemory = VK_NULL_HANDLE;
