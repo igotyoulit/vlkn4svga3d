@@ -66,7 +66,7 @@ PRESENTATION_TEST_TARGET = $(BIN_DIR)/test_presentation
 QEMU_TEST_TARGET = $(BIN_DIR)/test_qemu_integration
 LIB_QEMU_SVGA3D = $(LIB_DIR)/libqemu_svga3d.so
 
-.PHONY: all clean test test-oracle test-vlkn test-real-vulkan test-shader-translation test-shader test-guest-mem test-verified-rendering test-presentation test-qemu acceptance dump
+.PHONY: all clean test test-oracle test-vlkn test-real-vulkan test-shader-translation test-shader test-guest-mem test-verified-rendering test-presentation test-qemu harness-loop acceptance dump
 
 all: $(ORACLE_TARGET) $(VLKN_LIB) $(LIB_QEMU_SVGA3D) $(VLKN_TEST_TARGET) $(REAL_VULKAN_TEST_TARGET) $(SHADER_TRANSLATION_TEST_TARGET) $(TRANSLATOR_NOVULKAN_TEST_TARGET) $(SHADER_TEST_TARGET) $(GUEST_MEM_TEST_TARGET) $(VERIFIED_RENDERING_TEST_TARGET) $(PRESENTATION_TEST_TARGET) $(QEMU_TEST_TARGET) $(MALFORMED_INPUT_TEST_TARGET)
 
@@ -174,6 +174,15 @@ test-presentation: $(PRESENTATION_TEST_TARGET)
 
 test-qemu: $(QEMU_TEST_TARGET)
 	./$(QEMU_TEST_TARGET)
+
+# Tight feedback loop: build -> ICD-free translator suite -> lavapipe suites ->
+# per-iteration summary. Stops on NEW regressions vs the previous iteration.
+# Env: HARNESS_ICD (Vulkan ICD JSON), SPIRV_TOOLS_DIR (spirv-val/spirv-dis),
+# HARNESS_TIMEOUT (per-suite seconds). Extra args via HARNESS_LOOP_ARGS, e.g.
+#   make harness-loop HARNESS_LOOP_ARGS="--iterations 5 --fail-fast"
+harness-loop:
+	@chmod +x scripts/harness_loop.sh
+	./scripts/harness_loop.sh $(HARNESS_LOOP_ARGS)
 
 acceptance: all
 	@chmod +x scripts/run_acceptance_suite.sh

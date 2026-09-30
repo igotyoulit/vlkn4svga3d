@@ -193,6 +193,11 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     std::map<uint32_t, ShaderDefConst> defConstants;
     std::vector<uint32_t> dclPositions; /* true DCL instruction boundaries */
     std::unordered_map<uint32_t, bool> explicitVsOutputRegs;
+    /* DCL-less SM 3.0 VS: o0/oT0 (regtype 6) is ambiguous — it is the implicit
+     * position output only when the shader does NOT explicitly write oPos
+     * (RASTOUT). If oPos is written, regtype-6 outputs are real texcoords and
+     * TEMP r0/r1 are genuine temporaries. Computed in the pre-pass below. */
+    bool writesExplicitPosition = false;
     uint32_t pc = 1;
     bool foundEnd = false;
 
@@ -352,8 +357,13 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
          * below does not steal same-numbered temporaries used for calculations. */
         if (isVS && major >= 3 && op != D3DSIO_DCL && advance > 1) {
             ParsedDest dst;
-            if (parseDest(tokens[pc + 1], dst) && dst.regType == D3DSPR_OUTPUT) {
-                explicitVsOutputRegs[dst.regNum] = true;
+            if (parseDest(tokens[pc + 1], dst)) {
+                if (dst.regType == D3DSPR_OUTPUT) {
+                    explicitVsOutputRegs[dst.regNum] = true;
+                }
+                if (dst.regType == D3DSPR_RASTOUT) {
+                    writesExplicitPosition = true;
+                }
             }
         }
         pc += advance;
@@ -853,8 +863,11 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                             explicitVsOutputRegs.find(dst.regNum) == explicitVsOutputRegs.end());
         /* SM 3.0 VS without output DCLs: implicit outputs o0=position, o1=color.
          * Mesa encodes these as TEMP in MOV dst tokens. Treat reg 0 as
-         * position, reg 1 as color. */
+         * position, reg 1 as color — but only when the shader does not write
+         * oPos explicitly (otherwise r0/r1 are genuine temporaries and o0 is
+         * a real texcoord; see writesExplicitPosition). */
         bool isImplicitVsOutput = (isVS && major >= 3 && outputRegToSemantic.empty() &&
+                                   !writesExplicitPosition &&
                                    dst.regType == D3DSPR_TEMP &&
                                    (dst.regNum == 0 || dst.regNum == 1) &&
                                    explicitVsOutputRegs.find(dst.regNum) == explicitVsOutputRegs.end());
@@ -888,6 +901,16 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                     } else {
                         dstVar = (dst.regNum == 0) ? outPosVar : (dst.regNum == 1 ? outColorVar[0] : outTexCoordVar[(dst.regNum >= 2 && dst.regNum - 2 < 8) ? (dst.regNum - 2) : 0]);
                     }
+                } else if (isVS && major >= 3 && !writesExplicitPosition && dst.regNum <= 1) {
+                    /* DCL-less SM 3.0 VS without an explicit oPos write:
+                     * o0=position, o1=color (Mesa convention), whether encoded
+                     * as TEMP (implicit outputs) or OUTPUT. If oPos IS written
+                     * elsewhere, regtype-6 outputs are real texcoords (e.g.
+                     * oT0) and keep the texcoord routing below.
+                     * The old code routed these to texcoord shadows, so the
+                     * Position/color outputs kept only their decorations while
+                     * the actual values went to Location 2/3. */
+                    dstVar = (dst.regNum == 0) ? outPosVar : outColorVar[0];
                 } else {
                     dstVar = outTexCoordVar[dst.regNum < 8 ? dst.regNum : 0];
                 }

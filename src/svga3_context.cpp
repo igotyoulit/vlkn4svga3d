@@ -1334,7 +1334,8 @@ Svga3VlknStatus VlknContext::ensureRenderPassActive() {
 
     if (fbNeedsRebuild) {
         if (m_activeFramebuffer != VK_NULL_HANDLE) {
-            m_backend->flushCommandBuffer();
+            Svga3VlknStatus fst = m_backend->flushCommandBuffer();
+            if (fst != SVGA3_VLKN_SUCCESS) return fst;
             m_backend->dispatch().vkDestroyFramebuffer(m_backend->device(), m_activeFramebuffer, nullptr);
             m_activeFramebuffer = VK_NULL_HANDLE;
         }
@@ -1996,7 +1997,8 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
             if (m_constantRingCursor + slotSize > m_constantRingSize) {
                 /* The ring is full. Submit and wait before reusing any slice. */
                 endRenderPassIfActive();
-                m_backend->flushCommandBuffer();
+                Svga3VlknStatus fst = m_backend->flushCommandBuffer();
+                if (fst != SVGA3_VLKN_SUCCESS) return fst;
                 m_constantRingCursor = 0;
                 m_constantRingSubmissionSerial = m_backend->completedSubmissionSerial();
             }
@@ -2446,7 +2448,8 @@ Svga3VlknStatus VlknContext::endQuery(SVGA3dQueryType type) {
     if (m_queryPool != VK_NULL_HANDLE) {
         VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
         m_backend->dispatch().vkCmdEndQuery(cb, m_queryPool, 0);
-        m_backend->flushCommandBuffer();
+        Svga3VlknStatus fst = m_backend->flushCommandBuffer();
+        if (fst != SVGA3_VLKN_SUCCESS) return fst;
     }
     m_queryActive = false;
     m_queryEnded = true;

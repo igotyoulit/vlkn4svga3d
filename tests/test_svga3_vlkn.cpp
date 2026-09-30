@@ -1513,6 +1513,50 @@ static void TestFlushPropagatesWaitFailures() {
     svga3_vlkn_device_destroy(dev);
 }
 
+static VkResult VKAPI_CALL failAllSubmits(VkQueue queue, uint32_t count,
+                                         const VkSubmitInfo *info, VkFence fence) {
+    (void)queue; (void)count; (void)info; (void)fence;
+    return VK_ERROR_DEVICE_LOST;
+}
+
+/* Failure-injection (issue #12): a failed flush must propagate out of the
+ * surface transfer paths instead of being silently discarded as SUCCESS. */
+static void TestSurfaceTransfersPropagateFlushFailures() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create flush-propagation regression device");
+    if (!dev) return;
+
+    SVGA3dSize size = {64, 64, 1};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 9201, 0, SVGA3D_X8R8G8B8, &size, 1) ==
+                   SVGA3_VLKN_SUCCESS,
+               "Define flush-propagation surface A");
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 9202, 0, SVGA3D_X8R8G8B8, &size, 1) ==
+                   SVGA3_VLKN_SUCCESS,
+               "Define flush-propagation surface B");
+
+    auto &dispatch = dev->backend->dispatch();
+    PFN_vkQueueSubmit saved = dispatch.vkQueueSubmit;
+    dispatch.vkQueueSubmit = failAllSubmits;
+
+    std::vector<uint32_t> pixels(64 * 64, 0x11223344u);
+    SVGA3dBox box = { 0, 0, 0, 64, 64, 1 };
+    TEST_CHECK(svga3_vlkn_surface_dma_upload(dev, 9201, 0, &box, pixels.data(),
+                                            64 * sizeof(uint32_t)) != SVGA3_VLKN_SUCCESS,
+               "dma_upload propagates flush/submit failure");
+
+    SVGA3dCopyBox cbox;
+    cbox.x = 0; cbox.y = 0; cbox.z = 0;
+    cbox.w = 64; cbox.h = 64; cbox.d = 1;
+    cbox.srcx = 0; cbox.srcy = 0; cbox.srcz = 0;
+    TEST_CHECK(svga3_vlkn_surface_copy(dev, 9201, 9202, &cbox, 1) != SVGA3_VLKN_SUCCESS,
+               "surface_copy propagates flush/submit failure");
+
+    dispatch.vkQueueSubmit = saved;
+    svga3_vlkn_device_destroy(dev);
+}
+
 static void TestPendingWindowPresentsOnlyWhenDirty() {
     Svga3VlknConfig cfg{};
     cfg.forceMockBackend = true;
@@ -1623,6 +1667,7 @@ int main() {
 
     TestFenceWithoutWindow();
     TestFlushPropagatesWaitFailures();
+    TestSurfaceTransfersPropagateFlushFailures();
     TestPendingWindowPresentsOnlyWhenDirty();
     TestDepthVariantCleanup();
     TestRenderPassEndingBatchesCommands();

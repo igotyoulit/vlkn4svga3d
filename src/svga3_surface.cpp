@@ -487,7 +487,8 @@ Svga3VlknStatus VlknSurface::ensureBufferSize(size_t requiredSize) {
 
     /* The old allocation can be in flight, and its contents must be stable
      * while copied into the replacement buffer. */
-    m_backend->flushCommandBuffer();
+    Svga3VlknStatus flushSt = m_backend->flushCommandBuffer();
+    if (flushSt != SVGA3_VLKN_SUCCESS) return flushSt;
 
     VkBuffer newBuffer = VK_NULL_HANDLE;
     VkDeviceMemory newMemory = VK_NULL_HANDLE;
@@ -923,12 +924,12 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
     );
 
     m_currentLayout = barrier.newLayout;
-    m_backend->flushCommandBuffer();
+    Svga3VlknStatus flushSt = m_backend->flushCommandBuffer();
 
     if (!usingPersistentStaging) {
         m_backend->destroyBuffer(stagingBuf, stagingMem);
     }
-    return SVGA3_VLKN_SUCCESS;
+    return flushSt;
 }
 
 Svga3VlknStatus VlknSurface::dmaDownloadToStaging(uint32_t mipLevel,
@@ -1185,7 +1186,12 @@ Svga3VlknStatus VlknSurface::dmaDownload(uint32_t mipLevel,
     );
 
     m_currentLayout = barrier.newLayout;
-    m_backend->flushCommandBuffer();
+    Svga3VlknStatus flushSt = m_backend->flushCommandBuffer();
+    if (flushSt != SVGA3_VLKN_SUCCESS) {
+        /* The copy never executed: drop the staging buffer. */
+        m_backend->destroyBuffer(stagingBuf, stagingMem);
+        return flushSt;
+    }
 
     void *mapped = nullptr;
     if (m_backend->dispatch().vkMapMemory(m_backend->device(), stagingMem, 0,
@@ -1420,8 +1426,7 @@ Svga3VlknStatus VlknSurfaceManager::copy(uint32_t srcSid,
         }
     }
 
-    m_backend->flushCommandBuffer();
-    return SVGA3_VLKN_SUCCESS;
+    return m_backend->flushCommandBuffer();
 }
 
 Svga3VlknStatus VlknSurfaceManager::defineSurfaceV2(uint32_t sid,
@@ -1510,8 +1515,7 @@ Svga3VlknStatus VlknSurfaceManager::stretchBlt(uint32_t srcSid,
         1, &blit, filter
     );
 
-    m_backend->flushCommandBuffer();
-    return SVGA3_VLKN_SUCCESS;
+    return m_backend->flushCommandBuffer();
 }
 
 Svga3VlknStatus VlknSurfaceManager::surfaceDMA(const SVGA3dGuestImage &guest,
@@ -1721,8 +1725,7 @@ Svga3VlknStatus VlknSurfaceManager::generateMipmaps(uint32_t sid, SVGA3dTextureF
     }
 
     surf->ensureViewMipLevels(surf->mipLevels());
-    m_backend->flushCommandBuffer();
-    return SVGA3_VLKN_SUCCESS;
+    return m_backend->flushCommandBuffer();
 }
 
 Svga3VlknStatus VlknSurfaceManager::blitSurfaceToScreen(const SVGA3dSurfaceImageId &srcImage,
@@ -1825,8 +1828,7 @@ Svga3VlknStatus VlknSurfaceManager::blitSurfaceToScreen(const SVGA3dSurfaceImage
         }
     }
 
-    m_backend->flushCommandBuffer();
-    return SVGA3_VLKN_SUCCESS;
+    return m_backend->flushCommandBuffer();
 }
 
 bool is_buffer_all_zero(const void *data, uint32_t w, uint32_t h, size_t rowPitch, size_t bpp) {
@@ -1954,8 +1956,7 @@ Svga3VlknStatus VlknSurfaceManager::present(uint32_t sid,
         }
     }
 
-    m_backend->flushCommandBuffer();
-    return SVGA3_VLKN_SUCCESS;
+    return m_backend->flushCommandBuffer();
 }
 
 Svga3VlknStatus VlknSurfaceManager::setSurfaceActive(uint32_t sid, bool active) {

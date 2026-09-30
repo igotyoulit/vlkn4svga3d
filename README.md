@@ -86,6 +86,35 @@ Individual targets:
 
 **`test-qemu` does not boot an actual QEMU guest.** Passing it is not proof of working Linux, Windows, or QNX graphics. Test names and success banners inherited from development should not be read as completeness claims.
 
+## Harness loop
+
+`make harness-loop` runs the tight build/test loop used for iterative translator and driver work:
+
+```sh
+make harness-loop                      # one full build + all suites
+make harness-loop HARNESS_ICD=/path/to/icd.json
+SPIRV_TOOLS_DIR=/path/to/spirv-tools/build/tools make harness-loop
+scripts/harness_loop.sh --iterations 5 # repeat; stops on pass->fail regressions
+scripts/harness_loop.sh --fail-fast --skip-build
+```
+
+The loop requires a real Vulkan ICD (`HARNESS_ICD`, else a hard failure — never a silent skip), enables `spirv-val` when `SPIRV_TOOLS_DIR` provides it, builds everything, then runs the ICD-free translator suite followed by all lavapipe-backed suites. Logs and a `results.tsv` are written per iteration under `.harness-loop/`. Iteration stops on the first pass→fail regression between runs.
+
+What each suite proves:
+
+| Suite | Proves |
+| --- | --- |
+| `test_translator_novulkan` | D3D9→SPIR-V translation without a Vulkan ICD; optional `spirv-val` (prints SKIP, not PASS, when unavailable); SPIR-V value-flow assertions that shader inputs actually reach the declared outputs (not just decorations) |
+| `test_shader_translation` | Translation plus real Vulkan shader-module creation; malformed/unsupported bytecode rejected; `_SAT` handling |
+| `test_real_vulkan` | Real device init and bit-exact buffer upload/download; no mock fallback |
+| `test_svga3_vlkn` | Engine/unit suite incl. failure-injection of Vulkan dispatch (flush-error propagation) |
+| `test_shader_execution` | Translated shaders execute under real Vulkan |
+| `test_guest_memory` | Guest memory, GMR/translation, transfer paths |
+| `test_malformed_inputs` | Malformed FIFO/input and resource-accounting rejection |
+| `test_verified_rendering` | Analytical pixel/rendering scenes (repository-local; does not prove external GLES rendering) |
+| `test_presentation` | Presentation/framebuffer paths |
+| `test_qemu_integration` | Host-side integration only; no QEMU guest boots |
+
 ## QEMU integration limitations
 
 `src/qemu_svga3d_preload.cpp` is an experimental, build-specific hook with guest-specific workarounds. Do not install it globally or preload it into an arbitrary QEMU build. It requires separate review of binary offsets, device layouts, capabilities, and guest-memory handling. This repository does not provide a supported Proxmox deployment procedure. Use disposable, isolated VMs for integration work.
