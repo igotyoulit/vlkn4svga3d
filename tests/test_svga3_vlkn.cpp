@@ -2238,6 +2238,46 @@ static void TestMipSampledViewAndSamplerLod() {
     svga3_vlkn_device_destroy(dev);
 }
 
+static VkResult VKAPI_CALL failCreateImageView(VkDevice, const VkImageViewCreateInfo *,
+                                               const VkAllocationCallbacks *, VkImageView *view) {
+    if (view) *view = VK_NULL_HANDLE;
+    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+}
+
+/* Review follow-up: view expansion used to destroy the old view before
+ * creating the wider one and ignored the creation result, so a failed
+ * vkCreateImageView left the surface with a dead view and a level count
+ * claiming levels it did not cover. Expansion must now fail atomically:
+ * status reported, previous view and level count preserved. */
+static void TestMipViewExpansionFailureKeepsOldView() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create mip expansion failure device");
+    if (!dev) return;
+    SVGA3dSize sizes[4] = {{64, 64, 1}, {32, 32, 1}, {16, 16, 1}, {8, 8, 1}};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 5, 0, SVGA3D_A8R8G8B8, sizes, 4) == SVGA3_VLKN_SUCCESS,
+               "Define four-level texture for expansion failure");
+    auto *texSurf = dev->surfaceMgr->getSurface(5);
+    TEST_CHECK(texSurf && texSurf->viewMipLevels() == 1, "View starts at one level");
+    VkImageView originalView = texSurf ? texSurf->imageView() : VK_NULL_HANDLE;
+    TEST_CHECK(originalView != VK_NULL_HANDLE, "Original sampled view exists");
+
+    auto &dispatch = dev->backend->dispatch();
+    savedCreateImageView = dispatch.vkCreateImageView;
+    dispatch.vkCreateImageView = failCreateImageView;
+    bool expanded = texSurf->ensureViewMipLevels(4);
+    dispatch.vkCreateImageView = savedCreateImageView;
+    TEST_CHECK(!expanded, "Failed view creation reports expansion failure");
+    TEST_CHECK(texSurf->imageView() == originalView,
+               "Failed expansion keeps the previous view");
+    TEST_CHECK(texSurf->viewMipLevels() == 1,
+               "Failed expansion keeps the previous level count");
+    TEST_CHECK(texSurf->ensureViewMipLevels(4), "Expansion succeeds once creation recovers");
+    TEST_CHECK(texSurf->viewMipLevels() == 4, "Recovered expansion reaches all four levels");
+    svga3_vlkn_device_destroy(dev);
+}
+
 /* --------------------------------------------------------------------------
  * Main Test Runner
  * -------------------------------------------------------------------------- */
@@ -2260,6 +2300,7 @@ int main() {
     TestMipLevelCopy();
     TestConstantRingPerDrawSlot();
     TestMipSampledViewAndSamplerLod();
+    TestMipViewExpansionFailureKeepsOldView();
     TestRenderPassEndingBatchesCommands();
     TestSurfaceFormatMappings();
     TestTopologyMappings();

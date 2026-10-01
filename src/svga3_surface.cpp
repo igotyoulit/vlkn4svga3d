@@ -545,16 +545,14 @@ Svga3VlknStatus VlknSurface::ensureBufferSize(size_t requiredSize) {
     return SVGA3_VLKN_SUCCESS;
 }
 
-void VlknSurface::ensureViewMipLevels(uint32_t levels) {
+bool VlknSurface::ensureViewMipLevels(uint32_t levels) {
     uint32_t targetLevels = std::min(levels, m_mipLevels);
-    if (targetLevels <= m_viewMipLevels || m_image == VK_NULL_HANDLE) {
-        return;
+    if (m_image == VK_NULL_HANDLE) {
+        return false;
     }
-    if (m_imageView != VK_NULL_HANDLE) {
-        m_backend->dispatch().vkDestroyImageView(m_backend->device(), m_imageView, nullptr);
-        m_imageView = VK_NULL_HANDLE;
+    if (targetLevels <= m_viewMipLevels) {
+        return true;
     }
-    m_viewMipLevels = targetLevels;
     VkImageViewCreateInfo viewInfo = {};
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     viewInfo.image = m_image;
@@ -577,11 +575,28 @@ void VlknSurface::ensureViewMipLevels(uint32_t levels) {
             (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) :
             VK_IMAGE_ASPECT_DEPTH_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
     viewInfo.subresourceRange.baseMipLevel = 0;
-    viewInfo.subresourceRange.levelCount = m_viewMipLevels;
+    viewInfo.subresourceRange.levelCount = targetLevels;
     viewInfo.subresourceRange.baseArrayLayer = 0;
     viewInfo.subresourceRange.layerCount = m_arrayLayers;
 
-    m_backend->dispatch().vkCreateImageView(m_backend->device(), &viewInfo, nullptr, &m_imageView);
+    /* Create the wider view before dropping the old one: on failure the
+     * surface keeps its previous view and level count, so a mip-filtered
+     * draw degrades to the levels that view covers instead of binding a
+     * destroyed or null view. */
+    VkImageView newView = VK_NULL_HANDLE;
+    VkResult result = m_backend->dispatch().vkCreateImageView(
+        m_backend->device(), &viewInfo, nullptr, &newView);
+    if (result != VK_SUCCESS || newView == VK_NULL_HANDLE) {
+        log_msg("[libqemu_svga3d] ensureViewMipLevels: vkCreateImageView failed (%d) for sid=%u; keeping %u-level view\n",
+                result, m_sid, m_viewMipLevels);
+        return false;
+    }
+    if (m_imageView != VK_NULL_HANDLE) {
+        m_backend->dispatch().vkDestroyImageView(m_backend->device(), m_imageView, nullptr);
+    }
+    m_imageView = newView;
+    m_viewMipLevels = targetLevels;
+    return true;
 }
 
 void VlknSurface::destroy() {

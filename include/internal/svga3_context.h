@@ -147,7 +147,13 @@ public:
      * varying (and coverage edge) is sampled at the wrong point.
      * Translating the viewport by (+0.5,+0.5) framebuffer px moves
      * geometry by the complementary amount, putting evaluation back
-     * on the guest's grid. m_viewport itself keeps guest values:
+     * on the guest's grid. The shift is expressed in Vulkan's Y-down
+     * framebuffer coordinates: the guest's GL-orientation -0.5 Y offset
+     * appears as +0.5 here because this viewport keeps a positive
+     * height (no negative-height Y-flip). If a Y-flip is ever
+     * introduced, this shift and the translator's vPos subtract must
+     * change together or the correction double-applies. m_viewport
+     * itself keeps guest values:
      * scissor fallbacks and clear rects are integer pixel regions
      * in guest surface space and must not shift. */
     VkViewport rasterViewport() const {
