@@ -1271,7 +1271,7 @@ static PVMSVGA3DSHAREDSURFACE vmsvga3dSurfaceGetSharedCopy(PVMSVGA3DCONTEXT pCon
  */
 static int vmsvga3dSurfaceTrackUsage(PVMSVGA3DSTATE pState, PVMSVGA3DCONTEXT pContext, PVMSVGA3DSURFACE pSurface)
 {
-    RT_NOREF(pState);
+    RT_NOREF(pState); RT_NOREF(pContext); RT_NOREF(pSurface);
 #ifndef VBOX_VMSVGA3D_WITH_WINE_OPENGL
     Assert(pSurface->id != SVGA3D_INVALID_ID);
 
@@ -1317,7 +1317,7 @@ static int vmsvga3dSurfaceTrackUsageById(PVMSVGA3DSTATE pState, PVMSVGA3DCONTEXT
 /* Wait for all drawing, that uses this surface, to finish. */
 int vmsvga3dSurfaceFlush(PVGASTATE pThis, PVMSVGA3DSURFACE pSurface)
 {
-    RT_NOREF(pThis);
+    RT_NOREF(pThis); RT_NOREF(pSurface);
 #ifndef VBOX_VMSVGA3D_WITH_WINE_OPENGL
     HRESULT hr;
 
@@ -3015,6 +3015,7 @@ int vmsvga3dContextDestroy(PVGASTATE pThis, uint32_t cid)
 
 static int vmsvga3dContextTrackUsage(PVGASTATE pThis, PVMSVGA3DCONTEXT pContext)
 {
+    RT_NOREF(pThis); RT_NOREF(pContext);
 #ifndef VBOX_VMSVGA3D_WITH_WINE_OPENGL
     PVMSVGA3DSTATE pState = pThis->svga.p3dState;
     AssertReturn(pState, VERR_NO_MEMORY);

@@ -2527,7 +2527,7 @@ int main() {
 
     std::cout << ANSI_YELLOW << "\n==================================================================" << ANSI_RESET << std::endl;
     if (g_testsFailed == 0) {
-        std::cout << ANSI_GREEN << " ALL " << g_testsPassed << " TESTS PASSED SUCCESSFULLY! (100% PASS RATE)" << ANSI_RESET << std::endl;
+        std::cout << ANSI_GREEN << " ALL " << g_testsPassed << " TESTS PASSED" << ANSI_RESET << std::endl;
         std::cout << ANSI_YELLOW << "==================================================================" << ANSI_RESET << std::endl;
         return 0;
     } else {

@@ -677,6 +677,10 @@ Svga3VlknStatus VlknBackend::flushCommandBuffer() {
     }
     if (!m_cmdBufferRecording) return SVGA3_VLKN_SUCCESS;
 
+    /* Hook runs without the flush holding any backend lock, but transfer
+     * callers may hold m_stagingMutex (non-recursive) across this whole
+     * function — see the threading contract in vlkn_backend.h. The hook
+     * must not call transfer APIs. */
     if (m_preFlushHook) {
         auto hook = m_preFlushHook;
         m_preFlushHook = nullptr;

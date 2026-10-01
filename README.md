@@ -72,6 +72,12 @@ make acceptance
 
 The acceptance runner stops on the first failure and writes evidence under `artifacts/`. Missing Vulkan drivers or validation layers may prevent these tests from running. Read the actual logs; successful assertions do not establish full protocol coverage.
 
+Required packages for `make acceptance` (Debian/Ubuntu names; other distros equivalent):
+- a Vulkan ICD — e.g. `mesa-vulkan-drivers` (provides lavapipe for headless runs) plus `libvulkan1`
+- `vulkan-validationlayers` — needed by the suites that enable `VK_LAYER_KHRONOS_validation`
+- `spirv-tools` — optional; enables the `spirv-val` step in shader-translation suites (they report SKIP, not PASS, when it is absent)
+- `vulkan-tools` — optional; provides `vulkaninfo` for the pre-flight check above
+
 Individual targets:
 
 | Command | Purpose |
