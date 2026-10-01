@@ -73,6 +73,7 @@ HARNESS_TIMEOUT="${HARNESS_TIMEOUT:-900}"
 # suite is ICD-free but harmless to run with the ICD exported).
 ICD_FREE_SUITES=( test_translator_novulkan )
 LAVAPIPE_SUITES=(
+    test_buffer_ordering
     test_shader_translation
     test_real_vulkan
     test_svga3_vlkn
