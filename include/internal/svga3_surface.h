@@ -70,7 +70,10 @@ public:
     uint32_t depth() const { return m_depth; }
     uint32_t mipLevels() const { return m_mipLevels; }
     uint32_t viewMipLevels() const { return m_viewMipLevels; }
-    void ensureViewMipLevels(uint32_t levels);
+    /* Expand the sampled view to cover `levels` mip levels. Returns false
+     * if the wider view could not be created; the previous view is then
+     * kept untouched, so callers may safely keep sampling through it. */
+    bool ensureViewMipLevels(uint32_t levels);
     uint32_t arrayLayers() const { return m_arrayLayers; }
     uint32_t multisampleCount() const { return m_multisampleCount; }
     SVGA3dTextureFilter autogenFilter() const { return m_autogenFilter; }

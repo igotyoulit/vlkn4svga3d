@@ -2133,7 +2133,11 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
              * expansion triggers and neither fires for that path. Expand
              * the view here so mip-filtered sampling can reach the chain. */
             if (m_stages[i].mipFilter != SVGA3D_TEX_FILTER_NONE) {
-                surf->ensureViewMipLevels(surf->mipLevels());
+                if (!surf->ensureViewMipLevels(surf->mipLevels())) {
+                    /* The helper logged the failure and the surface kept
+                     * its previous view, so this stage samples the levels
+                     * that view covers instead of a destroyed/null view. */
+                }
             }
             imageInfos[i].imageView = surf->imageView();
             imageInfos[i].sampler = getOrCreateSampler(i);
