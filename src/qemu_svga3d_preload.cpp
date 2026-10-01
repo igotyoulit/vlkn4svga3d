@@ -428,9 +428,15 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
     uint32_t *fifo = *(uint32_t **)((char *)s+OFFSET_FIFO);
     uint32_t allocated = *(uint32_t *)((char *)s+OFFSET_FIFO_SIZE);
     if (!fifo || allocated < 16 || allocated > EXPANDED_FIFO_SIZE) return;
-    uint32_t min=fifo[0], max=fifo[1], next=fifo[2], stop=fifo[3];
-    if ((min|max|next|stop)&3 || min<16 || min>=max || max>allocated ||
-        stop<min || stop>=max || next<min || next>=max) return;
+    uint32_t min=fifo[0], max=fifo[1];
+    if ((min|max)&3 || min<16 || min>=max || max>allocated) return;
+    // Acknowledge this doorbell before sampling NEXT. A producer publishing
+    // after this point must send another SYNC; do not erase its pending BUSY
+    // flag at exit. This closes the lost-notification window at batch end.
+    if (min > SVGA_FIFO_BUSY * 4)
+        __atomic_store_n(&fifo[SVGA_FIFO_BUSY], 0u, __ATOMIC_SEQ_CST);
+    uint32_t next=__atomic_load_n(&fifo[SVGA_FIFO_NEXT], __ATOMIC_ACQUIRE), stop=fifo[3];
+    if ((next|stop)&3 || stop<min || stop>=max || next<min || next>=max) return;
     uint32_t available = (next>=stop ? next-stop : max-stop+next-min)/4;
 
     uint32_t cur_w = reg_value(s, SVGA_REG_WIDTH);
@@ -451,7 +457,10 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
         log_msg("[libqemu_svga3d] Display mode synchronized: w=%u h=%u pitch=%u bpp=%u\n", cur_w, cur_h, cur_p, bpp);
     }
 
-    for (unsigned count=0; available && count<8192; count++) {
+    // The validated entry snapshot is bounded by the FIFO allocation. Every
+    // command consumes words; draining it cannot wait on a producer. A fixed
+    // command cutoff stranded valid packets/fences without a continuation.
+    while (available) {
         uint32_t cmd=peek_word(fifo,stop,min,max,0);
         uint64_t words=0;
 #define P(i) peek_word(fifo,stop,min,max,(i))
@@ -716,7 +725,6 @@ unsupported:
     }
 
 done:
-    if (min > SVGA_FIFO_BUSY * 4) fifo[SVGA_FIFO_BUSY] = (stop != next);
     *(int *)((char *)s + OFFSET_SYNCING) = 0;
     if (orig_update_rect_flush) orig_update_rect_flush(s);
 }
@@ -1061,7 +1069,11 @@ static int phdr_callback(struct dl_phdr_info *info, size_t size, void *data) {
     return 0;
 }
 
+#ifdef SVGA3_PRELOAD_TEST
+[[maybe_unused]]
+#else
 __attribute__((constructor))
+#endif
 static void svga3d_init(void) {
     if (program_invocation_name == NULL || strstr(program_invocation_name, "qemu-system") == NULL) {
         return;
