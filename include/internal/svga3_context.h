@@ -57,6 +57,7 @@ struct Svga3Shader {
     std::vector<uint32_t> bytecode;
     VkShaderModule module;
     uint32_t inputLocationMask;
+    bool hasFragmentSideEffects = true;
     /* Pixel shaders are recompiled per depth-sampler mask. Bit N means stage N
      * was a depth texture when that variant was built. */
     std::unordered_map<uint32_t, VkShaderModule> depthVariants;
@@ -298,6 +299,7 @@ private:
     VkDescriptorSetLayout m_descriptorSetLayout;
     VkDescriptorSet m_descriptorSet;
     std::map<std::array<uint64_t, SVGA3_MAX_TEXTURE_STAGES * 2>, VkDescriptorSet> m_descriptorSetCache;
+    std::map<std::array<uint32_t, 9>, VkSampler> m_samplerCache;
     bool m_descriptorSetInitialized;
     bool m_descriptorSetDirty;
     bool m_constantsDirty;

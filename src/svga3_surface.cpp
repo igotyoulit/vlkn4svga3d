@@ -443,27 +443,54 @@ Svga3VlknStatus VlknSurface::allocate() {
 
     m_currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    /* Also create backing VkBuffer for vertex/index buffer / linear surface operations */
-    size_t mip0Bytes = m_mips.empty() ? 4096 : m_mips[0].totalBytes;
-    m_bufferSize = std::max((size_t)262144, mip0Bytes);
-    m_backend->createBuffer(
-        m_bufferSize,
-        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        &m_buffer,
-        &m_bufferMemory
-    );
+    /* Images only need a second buffer when used as vertex/index data.
+     * Linear DMA can allocate it lazily through ensureBufferSize(). */
+    if (m_flags & (SVGA3D_SURFACE_HINT_VERTEXBUFFER | SVGA3D_SURFACE_HINT_INDEXBUFFER)) {
+        size_t mip0Bytes = m_mips.empty() ? 4096 : m_mips[0].totalBytes;
+        m_bufferSize = std::max((size_t)262144, mip0Bytes);
+        Svga3VlknStatus bufferSt = m_backend->createBuffer(
+            m_bufferSize,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &m_buffer,
+            &m_bufferMemory
+        );
+        if (bufferSt != SVGA3_VLKN_SUCCESS) return bufferSt;
 
-    if (m_bufferMemory) {
-        void *p = nullptr;
-        if (m_backend->dispatch().vkMapMemory(m_backend->device(), m_bufferMemory, 0, m_bufferSize, 0, &p) == VK_SUCCESS) {
-            memset(p, 0, m_bufferSize);
-            m_backend->dispatch().vkUnmapMemory(m_backend->device(), m_bufferMemory);
+        if (m_bufferMemory) {
+            void *p = nullptr;
+            if (m_backend->dispatch().vkMapMemory(m_backend->device(), m_bufferMemory, 0, m_bufferSize, 0, &p) == VK_SUCCESS) {
+                memset(p, 0, m_bufferSize);
+                m_backend->dispatch().vkUnmapMemory(m_backend->device(), m_bufferMemory);
+            }
         }
-    }
 
+    }
     return SVGA3_VLKN_SUCCESS;
+}
+
+/* The tracker describes the entire image, so every transition covers every
+ * mip and face. Transfer regions still select the requested subresource. */
+void VlknSurface::transitionLayout(VkCommandBuffer cb, VkImageLayout layout) {
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = m_currentLayout;
+    barrier.newLayout = layout;
+    barrier.srcAccessMask = m_currentLayout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 :
+        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = m_image;
+    barrier.subresourceRange.aspectMask = m_isDepthStencil ?
+        (VK_IMAGE_ASPECT_DEPTH_BIT | (svga3_format_has_stencil(m_svgaFormat) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) :
+        VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = m_mipLevels;
+    barrier.subresourceRange.layerCount = m_arrayLayers;
+    m_backend->dispatch().vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    m_currentLayout = layout;
 }
 
 Svga3VlknStatus VlknSurface::ensureBufferSize(size_t requiredSize) {
@@ -838,20 +865,21 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
 
     VkImageMemoryBarrier barrier = {};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.srcAccessMask = 0;
+    barrier.srcAccessMask = m_currentLayout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.oldLayout = m_currentLayout;
     barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barrier.image = m_image;
-    barrier.subresourceRange.aspectMask = m_isDepthStencil ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = mipLevel;
-    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.aspectMask = m_isDepthStencil ?
+        (VK_IMAGE_ASPECT_DEPTH_BIT | (svga3_format_has_stencil(m_svgaFormat) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = m_mipLevels;
     barrier.subresourceRange.baseArrayLayer = 0;
     barrier.subresourceRange.layerCount = m_arrayLayers;
 
     m_backend->dispatch().vkCmdPipelineBarrier(
         cb,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &barrier
     );
@@ -901,7 +929,7 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
     }
 
     /* Also copy into vertex/index backing VkBuffer */
-    if (mipLevel == 0 && !compressed) {
+    if (mipLevel == 0 && m_buffer && m_bufferMemory && !compressed) {
         /* 64-bit: (bx+bw) wrapped in 32-bit, undersizing the buffer. */
         uint64_t bxw = (uint64_t)bx + bw;
         uint64_t bzw = (uint64_t)bz + bd;
@@ -976,8 +1004,7 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
 
     /* Transition back to SHADER_READ_ONLY_OPTIMAL or COLOR_ATTACHMENT_OPTIMAL */
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.newLayout = m_isDepthStencil ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL :
-                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
@@ -1046,16 +1073,17 @@ Svga3VlknStatus VlknSurface::dmaDownloadToStaging(uint32_t mipLevel,
     /* Transition image to TRANSFER_SRC_OPTIMAL */
     VkImageMemoryBarrier barrier = {};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     barrier.oldLayout = m_currentLayout;
     barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     barrier.image = m_image;
-    barrier.subresourceRange.aspectMask = m_isDepthStencil ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = mipLevel;
-    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.aspectMask = m_isDepthStencil ?
+        (VK_IMAGE_ASPECT_DEPTH_BIT | (svga3_format_has_stencil(m_svgaFormat) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = m_mipLevels;
     barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
+    barrier.subresourceRange.layerCount = m_arrayLayers;
 
     m_backend->dispatch().vkCmdPipelineBarrier(
         cb,
@@ -1085,8 +1113,7 @@ Svga3VlknStatus VlknSurface::dmaDownloadToStaging(uint32_t mipLevel,
 
     /* Transition back */
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    barrier.newLayout = m_isDepthStencil ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL :
-                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
@@ -1224,16 +1251,17 @@ Svga3VlknStatus VlknSurface::dmaDownload(uint32_t mipLevel,
     /* Transition image to TRANSFER_SRC_OPTIMAL */
     VkImageMemoryBarrier barrier = {};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     barrier.oldLayout = m_currentLayout;
     barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     barrier.image = m_image;
-    barrier.subresourceRange.aspectMask = m_isDepthStencil ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = mipLevel;
-    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.aspectMask = m_isDepthStencil ?
+        (VK_IMAGE_ASPECT_DEPTH_BIT | (svga3_format_has_stencil(m_svgaFormat) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = m_mipLevels;
     barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
+    barrier.subresourceRange.layerCount = m_arrayLayers;
 
     m_backend->dispatch().vkCmdPipelineBarrier(
         cb,
@@ -1263,8 +1291,7 @@ Svga3VlknStatus VlknSurface::dmaDownload(uint32_t mipLevel,
 
     /* Transition back */
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    barrier.newLayout = m_isDepthStencil ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL :
-                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
@@ -1458,7 +1485,12 @@ Svga3VlknStatus VlknSurfaceManager::copy(uint32_t srcSid,
         return SVGA3_VLKN_ERROR_INVALID_PARAM;
     }
 
+    if (m_contextMgr) m_contextMgr->endAllRenderPasses();
     VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
+    const VkImageLayout srcLayout = src == dst ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    const VkImageLayout dstLayout = src == dst ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    if (src->image()) src->transitionLayout(cb, srcLayout);
+    if (dst->image() && dst != src) dst->transitionLayout(cb, dstLayout);
 
     for (uint32_t i = 0; i < numBoxes; ++i) {
         const SVGA3dCopyBox &b = boxes[i];
@@ -1526,8 +1558,8 @@ Svga3VlknStatus VlknSurfaceManager::copy(uint32_t srcSid,
 
             m_backend->dispatch().vkCmdCopyImage(
                 cb,
-                src->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                dst->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                src->image(), srcLayout,
+                dst->image(), dstLayout,
                 1, &copyRegion
             );
         }
@@ -1598,7 +1630,12 @@ Svga3VlknStatus VlknSurfaceManager::stretchBlt(uint32_t srcSid,
         return SVGA3_VLKN_ERROR_INVALID_PARAM;
     }
 
+    if (m_contextMgr) m_contextMgr->endAllRenderPasses();
     VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
+    const VkImageLayout srcLayout = src == dst ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    const VkImageLayout dstLayout = src == dst ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    if (src->image()) src->transitionLayout(cb, srcLayout);
+    if (dst->image() && dst != src) dst->transitionLayout(cb, dstLayout);
 
     VkImageBlit blit = {};
     blit.srcSubresource.aspectMask = src->isDepthStencil() ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1619,8 +1656,8 @@ Svga3VlknStatus VlknSurfaceManager::stretchBlt(uint32_t srcSid,
 
     m_backend->dispatch().vkCmdBlitImage(
         cb,
-        src->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        dst->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        src->image(), srcLayout,
+        dst->image(), dstLayout,
         1, &blit, filter
     );
 
@@ -1803,10 +1840,13 @@ Svga3VlknStatus VlknSurfaceManager::generateMipmaps(uint32_t sid, SVGA3dTextureF
     /* Buffer surfaces have no VkImage; blitting would null-deref. */
     if (surf->image() == VK_NULL_HANDLE) return SVGA3_VLKN_ERROR_INVALID_PARAM;
 
+    if (m_contextMgr) m_contextMgr->endAllRenderPasses();
     VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
+    surf->transitionLayout(cb, VK_IMAGE_LAYOUT_GENERAL);
     VkFilter vkFilt = (filter == SVGA3D_TEX_FILTER_NEAREST) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
 
     for (uint32_t i = 1; i < surf->mipLevels(); ++i) {
+        if (i > 1) surf->transitionLayout(cb, VK_IMAGE_LAYOUT_GENERAL);
         const SurfaceMipLevel *prevMip = surf->getMipInfo(i - 1);
         const SurfaceMipLevel *curMip = surf->getMipInfo(i);
         if (!prevMip || !curMip) break;
@@ -1828,12 +1868,13 @@ Svga3VlknStatus VlknSurfaceManager::generateMipmaps(uint32_t sid, SVGA3dTextureF
 
         m_backend->dispatch().vkCmdBlitImage(
             cb,
-            surf->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            surf->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            surf->image(), VK_IMAGE_LAYOUT_GENERAL,
+            surf->image(), VK_IMAGE_LAYOUT_GENERAL,
             1, &blit, vkFilt
         );
     }
 
+    surf->transitionLayout(cb, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     surf->ensureViewMipLevels(surf->mipLevels());
     surf->invalidateReadback();
     return m_backend->flushCommandBuffer();

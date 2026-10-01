@@ -72,12 +72,14 @@ enum SpvOp {
     SpvOpFOrdGreaterThan = 186,
     SpvOpFOrdLessThanEqual = 188,
     SpvOpFOrdGreaterThanEqual = 190,
-    SpvOpLogicalNot = 201,
+    SpvOpLogicalOr = 166,
+    SpvOpLogicalNot = 168,
     SpvOpLoopMerge = 246,
     SpvOpSelectionMerge = 247,
     SpvOpLabel = 248,
     SpvOpBranch = 249,
     SpvOpBranchConditional = 250,
+    SpvOpKill = 252,
     SpvOpReturn = 253
 };
 

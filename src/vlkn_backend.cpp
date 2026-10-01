@@ -407,7 +407,7 @@ Svga3VlknStatus VlknBackend::initDevice(const Svga3VlknConfig *config) {
     VkDescriptorPoolSize poolSizes[] = {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1024 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2048 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2048 }
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024 * 8 }
     };
     VkDescriptorPoolCreateInfo descPoolInfo = {};
     descPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;

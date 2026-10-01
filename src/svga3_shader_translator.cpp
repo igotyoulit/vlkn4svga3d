@@ -318,7 +318,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             case D3DSIO_ELSE: case D3DSIO_ENDIF:
             case D3DSIO_ENDLOOP: case D3DSIO_BREAK:
                 requiredParams = 0; break;
-            case D3DSIO_IF: requiredParams = 1; break;
+            case D3DSIO_TEXKILL: case D3DSIO_IF: requiredParams = 1; break;
             case D3DSIO_MOV: case D3DSIO_RCP: case D3DSIO_RSQ: case D3DSIO_ABS:
             case D3DSIO_FRC: case D3DSIO_EXP: case D3DSIO_SINCOS:
             case D3DSIO_LOOP: case D3DSIO_IFC:
@@ -326,7 +326,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 requiredParams = 2; break;
             case D3DSIO_ADD: case D3DSIO_SUB: case D3DSIO_MUL: case D3DSIO_DP3:
             case D3DSIO_DP4: case D3DSIO_MIN: case D3DSIO_MAX: case D3DSIO_M4x4:
-            case D3DSIO_SGE: case D3DSIO_SETP:
+            case D3DSIO_SLT: case D3DSIO_SGE: case D3DSIO_SETP:
             case D3DSIO_TEX: case D3DSIO_POW:
                 requiredParams = 3; break;
             case D3DSIO_MAD: case D3DSIO_LRP: case D3DSIO_CMP:
@@ -396,7 +396,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             case D3DSIO_RSQ:
             case D3DSIO_MIN:
             case D3DSIO_MAX:
-            case D3DSIO_SGE:
+            case D3DSIO_SLT: case D3DSIO_SGE:
             case D3DSIO_EXP:
             case D3DSIO_POW:
             case D3DSIO_SINCOS:
@@ -412,6 +412,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             case D3DSIO_ELSE:
             case D3DSIO_ENDIF:
             case D3DSIO_BREAK:
+            case D3DSIO_TEXKILL:
             case D3DSIO_TEX:
             case D3DSIO_DCL:
                 break;
@@ -496,7 +497,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 case D3DSIO_DP4:
                 case D3DSIO_MIN:
                 case D3DSIO_MAX:
-                case D3DSIO_SGE:
+                case D3DSIO_SLT: case D3DSIO_SGE:
                 case D3DSIO_POW:
                 case D3DSIO_M4x4: advance = 4; break;
                 case D3DSIO_TEX:
@@ -509,7 +510,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 case D3DSIO_SETP: advance = 4; break;
                 case D3DSIO_LOOP:
                 case D3DSIO_IFC: advance = 3; break;
-                case D3DSIO_IF: advance = 2; break;
+                case D3DSIO_TEXKILL: case D3DSIO_IF: advance = 2; break;
                 case D3DSIO_DCL: advance = 3; break;
                 default: advance = 1; break;
             }
@@ -1234,7 +1235,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     };
 
     /* Helper: store vec4 value into destination register with write mask */
-    auto emitStoreDest = [&](const ParsedDest &dst, uint32_t val) {
+    auto emitStoreDest = [&](const ParsedDest &dst, uint32_t val, uint32_t predicate = 0) {
         uint32_t dstVar = 0;
         /* Mesa's SVGA backend can encode a DCL-declared output destination as
          * TEMP. Only apply this compatibility fallback if the shader never
@@ -1308,6 +1309,14 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             uint32_t satVal = b.allocId();
             b.emitInst(b.functionDefinitions, SpvOpExtInst, { typeV4Float, satVal, glslSetId, GLSLstd450FClamp, val, const0_v4, const1_v4 });
             finalVal = satVal;
+        }
+
+        if (predicate) {
+            uint32_t oldVal = b.allocId(), selected = b.allocId();
+            b.emitInst(b.functionDefinitions, SpvOpLoad, {typeV4Float, oldVal, dstVar});
+            b.emitInst(b.functionDefinitions, SpvOpSelect,
+                {typeV4Float, selected, predicate, finalVal, oldVal});
+            finalVal = selected;
         }
 
         if (dst.writeMask != 0x0F) {
@@ -1396,7 +1405,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 case D3DSIO_NOP:
                 case D3DSIO_ELSE: case D3DSIO_ENDIF:
                 case D3DSIO_ENDLOOP: case D3DSIO_BREAK: paramCount = 0; break;
-                case D3DSIO_IF: paramCount = 1; break;
+                case D3DSIO_TEXKILL: case D3DSIO_IF: paramCount = 1; break;
                 case D3DSIO_MOV:
                 case D3DSIO_RCP:
                 case D3DSIO_RSQ:
@@ -1413,7 +1422,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 case D3DSIO_DP4:
                 case D3DSIO_MIN:
                 case D3DSIO_MAX:
-                case D3DSIO_SGE:
+                case D3DSIO_SLT: case D3DSIO_SGE:
                 case D3DSIO_SETP:
                 case D3DSIO_POW:
                 case D3DSIO_M4x4: paramCount = 3; break;
@@ -1437,7 +1446,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             case D3DSIO_NOP:
             case D3DSIO_ELSE: case D3DSIO_ENDIF:
             case D3DSIO_ENDLOOP: case D3DSIO_BREAK: naturalCount = 0; break;
-            case D3DSIO_IF: naturalCount = 1; break;
+            case D3DSIO_TEXKILL: case D3DSIO_IF: naturalCount = 1; break;
             case D3DSIO_MOV:
             case D3DSIO_RCP:
             case D3DSIO_RSQ:
@@ -1454,7 +1463,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             case D3DSIO_DP4:
             case D3DSIO_MIN:
             case D3DSIO_MAX:
-            case D3DSIO_SGE:
+            case D3DSIO_SLT: case D3DSIO_SGE:
             case D3DSIO_SETP:
             case D3DSIO_POW:
             case D3DSIO_M4x4: naturalCount = 3; break;
@@ -1488,18 +1497,21 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             case D3DSIO_MOV: {
                 ParsedDest dst;
                 parseDest(tokens[pc + 1], dst);
-                uint32_t val;
+                uint32_t val, predicate = 0;
                 if (instToken & (1u << 28)) {
                     /* Predicated MOV: operands are [dst, predicate, src].
                      * Pass 1 verified the predicate token names p0..p3.
                      * The destination keeps its old value in every component
-                     * whose predicate component is false. Only TEMP
-                     * destinations can be read back for the select. */
+                     * whose predicate component is false. Output shadow
+                     * registers preserve their previous values as well. */
                     ParsedSrc pred, src;
                     parseSrc(tokens[pc + 2], pred);
                     parseSrc(tokens[pc + 3], src);
-                    if (dst.regType != D3DSPR_TEMP) {
-                        outError = "Predicated MOV to a non-temporary destination is not supported";
+                    const bool writable = dst.regType == D3DSPR_TEMP ||
+                        (isVS && (dst.regType == D3DSPR_OUTPUT || dst.regType == D3DSPR_RASTOUT || dst.regType == D3DSPR_ATTROUT)) ||
+                        (!isVS && dst.regType == D3DSPR_COLOROUT && dst.regNum == 0);
+                    if (!writable) {
+                        outError = "Invalid predicated MOV destination";
                         return SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
                     }
                     uint32_t predVec = b.allocId();
@@ -1517,22 +1529,14 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                         b.emitInst(b.functionDefinitions, SpvOpLogicalNot, { typeV4Bool, neg, predVec });
                         predVec = neg;
                     }
-                    uint32_t newVal = emitLoadSrc(src);
-                    ParsedSrc dstAsSrc;
-                    dstAsSrc.regNum = dst.regNum;
-                    dstAsSrc.regType = D3DSPR_TEMP;
-                    dstAsSrc.swizzle[0] = 0; dstAsSrc.swizzle[1] = 1;
-                    dstAsSrc.swizzle[2] = 2; dstAsSrc.swizzle[3] = 3;
-                    dstAsSrc.srcMod = 0;
-                    uint32_t oldVal = emitLoadSrc(dstAsSrc);
-                    val = b.allocId();
-                    b.emitInst(b.functionDefinitions, SpvOpSelect, { typeV4Float, val, predVec, newVal, oldVal });
+                    val = emitLoadSrc(src);
+                    predicate = predVec;
                 } else {
                     ParsedSrc src;
                     parseSrc(tokens[pc + 2], src);
                     val = emitLoadSrc(src);
                 }
-                emitStoreDest(dst, val);
+                emitStoreDest(dst, val, predicate);
                 break;
             }
             case D3DSIO_SETP: {
@@ -1647,6 +1651,46 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 b.emitInst(b.functionDefinitions, SpvOpStore, { fr.idxVar, idxNext });
                 b.emitInst(b.functionDefinitions, SpvOpBranch, { fr.headerLabel });
                 b.emitInst(b.functionDefinitions, SpvOpLabel, { fr.mergeLabel });
+                break;
+            }
+            case D3DSIO_TEXKILL: {
+                ParsedDest dst;
+                parseDest(tokens[pc + 1], dst);
+                if (isVS || major < 2 ||
+                    (dst.regType != D3DSPR_TEMP && dst.regType != D3DSPR_TEXTURE)) {
+                    outError = "TEXKILL requires a pixel shader temporary or texture register";
+                    return SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
+                }
+                ParsedSrc src{};
+                src.regType = dst.regType;
+                src.regNum = dst.regNum;
+                for (uint32_t i = 0; i < 4; ++i) src.swizzle[i] = i;
+                uint32_t value = emitLoadSrc(src);
+                uint32_t negatives = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpFOrdLessThan,
+                    {typeV4Bool, negatives, value, const0_v4});
+                // texkill tests the first three components, not the write mask.
+                // https://learn.microsoft.com/windows/win32/direct3dhlsl/texkill---ps
+                uint32_t cond = 0;
+                for (uint32_t i = 0; i < 3; ++i) {
+                    uint32_t component = b.allocId();
+                    b.emitInst(b.functionDefinitions, SpvOpCompositeExtract,
+                        {typeBool, component, negatives, i});
+                    if (!cond) cond = component;
+                    else {
+                        uint32_t combined = b.allocId();
+                        b.emitInst(b.functionDefinitions, SpvOpLogicalOr,
+                            {typeBool, combined, cond, component});
+                        cond = combined;
+                    }
+                }
+                uint32_t killLabel = b.allocId(), mergeLabel = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpSelectionMerge, {mergeLabel, 0});
+                b.emitInst(b.functionDefinitions, SpvOpBranchConditional,
+                    {cond, killLabel, mergeLabel});
+                b.emitInst(b.functionDefinitions, SpvOpLabel, {killLabel});
+                b.emitInst(b.functionDefinitions, SpvOpKill, {});
+                b.emitInst(b.functionDefinitions, SpvOpLabel, {mergeLabel});
                 break;
             }
             case D3DSIO_IFC: {
@@ -1966,7 +2010,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 emitStoreDest(dst, res);
                 break;
             }
-            case D3DSIO_SGE: {
+            case D3DSIO_SLT: case D3DSIO_SGE: {
                 ParsedDest dst;
                 ParsedSrc s0, s1;
                 parseDest(tokens[pc + 1], dst);
@@ -1974,9 +2018,9 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 parseSrc(tokens[pc + 3], s1);
                 uint32_t v0 = emitLoadSrc(s0);
                 uint32_t v1 = emitLoadSrc(s1);
-                /* dest = (src0 >= src1) ? 1.0 : 0.0, per component */
+                /* Ordered component comparisons produce 1.0 or 0.0. */
                 uint32_t cmp = b.allocId();
-                b.emitInst(b.functionDefinitions, SpvOpFOrdGreaterThanEqual, { typeV4Bool, cmp, v0, v1 });
+                b.emitInst(b.functionDefinitions, op == D3DSIO_SLT ? SpvOpFOrdLessThan : SpvOpFOrdGreaterThanEqual, { typeV4Bool, cmp, v0, v1 });
                 uint32_t res = b.allocId();
                 b.emitInst(b.functionDefinitions, SpvOpSelect, { typeV4Float, res, cmp, const1_v4, const0_v4 });
                 emitStoreDest(dst, res);
@@ -2076,10 +2120,14 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
 
                 uint32_t sampled = b.allocId();
                 if (depthStage) {
-                    /* D3D tex of a depth map returns the fetched depth in every channel. */
-                    uint32_t drefResult = b.allocId();
+                    /* Non-comparison sampling returns a vector even for a
+                     * depth image. Extract red before replicating D3D depth. */
+                    uint32_t depthSample = b.allocId();
                     b.emitInst(b.functionDefinitions, SpvOpImageSampleImplicitLod,
-                               { typeFloat, drefResult, sampledImage, uv });
+                               { typeV4Float, depthSample, sampledImage, uv });
+                    uint32_t drefResult = b.allocId();
+                    b.emitInst(b.functionDefinitions, SpvOpCompositeExtract,
+                               { typeFloat, drefResult, depthSample, 0 });
                     b.emitInst(b.functionDefinitions, SpvOpCompositeConstruct,
                                { typeV4Float, sampled, drefResult, drefResult, drefResult, const1_f });
                 } else {
@@ -2107,7 +2155,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 case D3DSIO_SETP: advance = 4; break;
                 case D3DSIO_LOOP:
                 case D3DSIO_IFC: advance = 3; break;
-                case D3DSIO_IF: advance = 2; break;
+                case D3DSIO_TEXKILL: case D3DSIO_IF: advance = 2; break;
                 case D3DSIO_MOV:
                 case D3DSIO_RCP:
                 case D3DSIO_RSQ:
@@ -2122,7 +2170,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 case D3DSIO_DP4:
                 case D3DSIO_MIN:
                 case D3DSIO_MAX:
-                case D3DSIO_SGE:
+                case D3DSIO_SLT: case D3DSIO_SGE:
                 case D3DSIO_POW:
                 case D3DSIO_M4x4: advance = 4; break;
                 case D3DSIO_TEX:
