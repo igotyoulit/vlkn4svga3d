@@ -30,7 +30,20 @@ int main(){
  std::vector<uint32_t> pixels(64*64);svga3_vlkn_surface_dma_download(d,1,0,nullptr,pixels.data(),64*4);
  unsigned left=0,right=0;for(int y=0;y<64;y++)for(int x=0;x<64;x++)if(pixels[y*64+x]&0x00ff0000)(x<32?left:right)++;
  printf("red pixels left=%u right=%u (expected left>0 right=0)\n",left,right);
- const bool correct = left > 0 && right == 0;
+ bool correct = left > 0 && right == 0;
+ SVGA3dSize compressedSize{4,4,1};
+ correct &= svga3_vlkn_surface_define(d,3,SVGA3D_SURFACE_HINT_TEXTURE,SVGA3D_DXT1,&compressedSize,1)==SVGA3_VLKN_SUCCESS;
+ const uint8_t block[8]={0,0xf8,0xe0,7,0x55,0xaa,0x33,0xcc};
+ uint8_t output[8]={};
+ correct &= svga3_vlkn_surface_dma_upload(d,3,0,nullptr,block,8)==SVGA3_VLKN_SUCCESS;
+ correct &= svga3_vlkn_surface_dma_download(d,3,0,nullptr,output,8)==SVGA3_VLKN_SUCCESS;
+ correct &= memcmp(block,output,sizeof(block))==0;
+ correct &= svga3_vlkn_surface_define(d,4,SVGA3D_SURFACE_HINT_RENDERTARGET,SVGA3D_DXT1,&compressedSize,1)==SVGA3_VLKN_ERROR_UNSUPPORTED_FORMAT;
+ printf("compressed texture block roundtrip and attachment rejection: %s\n",correct ? "PASS" : "FAIL");
+ d->contextMgr->clear();d->surfaceMgr->clear();
+ correct &= d->backend->waitIdle()==SVGA3_VLKN_SUCCESS;
+ d->backend->shutdown();
+ correct &= d->backend->validationErrors()==0 && d->backend->validationWarnings()==0;
  svga3_vlkn_device_destroy(d);
  return correct ? 0 : 1;
 }

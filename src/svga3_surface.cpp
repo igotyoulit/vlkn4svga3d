@@ -290,6 +290,9 @@ size_t VlknSurface::estimatedBytes() const {
 }
 
 Svga3VlknStatus VlknSurface::allocate() {
+    const bool compressed = svga3_format_is_compressed(m_svgaFormat);
+    if (compressed && (m_flags & SVGA3D_SURFACE_HINT_RENDERTARGET))
+        return SVGA3_VLKN_ERROR_UNSUPPORTED_FORMAT;
     if (m_allocFailed) {
         return SVGA3_VLKN_ERROR_INVALID_PARAM;
     }
@@ -355,7 +358,7 @@ Svga3VlknStatus VlknSurface::allocate() {
 
     if (m_isDepthStencil) {
         imgInfo.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    } else {
+    } else if (!compressed) {
         imgInfo.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     }
 
@@ -770,9 +773,22 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
         return SVGA3_VLKN_SUCCESS;
     }
 
-    size_t bpp = svga3_format_bytes_per_pixel(m_svgaFormat);
-    size_t copyRowBytes = bw * bpp;
-    size_t totalBytes = copyRowBytes * bh * bd;
+    const bool compressed = svga3_format_is_compressed(m_svgaFormat);
+    const size_t block = compressed ? 4 : 1;
+    const size_t bpp = svga3_format_bytes_per_pixel(m_svgaFormat);
+    if (!bw || !bh || !bd || !bpp || uint64_t(bx) + bw > mip.width ||
+        uint64_t(by) + bh > mip.height || uint64_t(bz) + bd > mip.depth ||
+        (compressed && ((bx % block) || (by % block) ||
+         ((bw % block) && uint64_t(bx) + bw != mip.width) ||
+         ((bh % block) && uint64_t(by) + bh != mip.height))))
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    const size_t copyRowBytes = ((size_t(bw) + block - 1) / block) * bpp;
+    const size_t copyRows = (size_t(bh) + block - 1) / block;
+    if (copyRowBytes > SIZE_MAX / copyRows / bd)
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    const size_t totalBytes = copyRowBytes * copyRows * bd;
+    if (guestStride && guestStride < copyRowBytes)
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
 
     /* 64-bit comparisons: the 32-bit sums wrapped for large boxes,
      * letting out-of-image boxes pass and driving negative Vulkan extents. */
@@ -850,7 +866,7 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
         uint8_t *dst = (uint8_t*)mapped;
         const uint8_t *src = (const uint8_t*)guestData;
         for (uint32_t z = 0; z < bd; ++z) {
-            for (uint32_t y = 0; y < bh; ++y) {
+            for (size_t y = 0; y < copyRows; ++y) {
                 memcpy(dst, src, copyRowBytes);
                 dst += copyRowBytes;
                 src += guestStride;
@@ -859,7 +875,7 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
     }
 
     /* Also copy into vertex/index backing VkBuffer */
-    if (mipLevel == 0) {
+    if (mipLevel == 0 && !compressed) {
         /* 64-bit: (bx+bw) wrapped in 32-bit, undersizing the buffer. */
         uint64_t bxw = (uint64_t)bx + bw;
         uint64_t bzw = (uint64_t)bz + bd;
@@ -881,7 +897,7 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
             uint8_t *dstBuf = static_cast<uint8_t*>(bufMapped);
             const uint8_t *srcBuf = static_cast<const uint8_t*>(mapped);
             for (uint32_t z = 0; z < bd; ++z) {
-                for (uint32_t y = 0; y < bh; ++y) {
+                for (size_t y = 0; y < copyRows; ++y) {
                     size_t dstOffset = (static_cast<size_t>(bz + z) * mip.height + (by + y)) * mip.rowPitch + static_cast<size_t>(bx) * bpp;
                     if (dstOffset < m_bufferSize) {
                         size_t copyLen = std::min(copyRowBytes, m_bufferSize - dstOffset);
@@ -915,8 +931,8 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
     /* Record buffer to image copy */
     VkBufferImageCopy region = {};
     region.bufferOffset = 0;
-    region.bufferRowLength = bw;
-    region.bufferImageHeight = bh;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
     region.imageSubresource.aspectMask = m_isDepthStencil ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.mipLevel = mipLevel;
     region.imageSubresource.baseArrayLayer = 0;
@@ -977,9 +993,21 @@ Svga3VlknStatus VlknSurface::dmaDownloadToStaging(uint32_t mipLevel,
     uint32_t by = box ? box->y : 0;
     uint32_t bz = box ? box->z : 0;
 
-    size_t bpp = svga3_format_bytes_per_pixel(m_svgaFormat);
-    size_t copyRowBytes = bw * bpp;
-    size_t totalBytes = copyRowBytes * bh * bd;
+    const bool compressed = svga3_format_is_compressed(m_svgaFormat);
+    const size_t block = compressed ? 4 : 1;
+    const size_t bpp = svga3_format_bytes_per_pixel(m_svgaFormat);
+    if (!bw || !bh || !bd || !bpp || uint64_t(bx) + bw > mip.width ||
+        uint64_t(by) + bh > mip.height || uint64_t(bz) + bd > mip.depth ||
+        (compressed && ((bx % block) || (by % block) ||
+         ((bw % block) && uint64_t(bx) + bw != mip.width) ||
+         ((bh % block) && uint64_t(by) + bh != mip.height))))
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    const size_t copyRowBytes = ((size_t(bw) + block - 1) / block) * bpp;
+    const size_t copyRows = (size_t(bh) + block - 1) / block;
+    if (copyRowBytes > SIZE_MAX / copyRows / bd)
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    const size_t totalBytes = copyRowBytes * copyRows * bd;
+
 
     if (totalBytes > m_backend->stagingSize() || !m_backend->stagingBuffer() || !m_backend->stagingMapped()) {
         return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
@@ -1012,8 +1040,8 @@ Svga3VlknStatus VlknSurface::dmaDownloadToStaging(uint32_t mipLevel,
 
     VkBufferImageCopy region = {};
     region.bufferOffset = 0;
-    region.bufferRowLength = bw;
-    region.bufferImageHeight = bh;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
     region.imageSubresource.aspectMask = m_isDepthStencil ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.mipLevel = mipLevel;
     region.imageSubresource.baseArrayLayer = 0;
@@ -1094,9 +1122,22 @@ Svga3VlknStatus VlknSurface::dmaDownload(uint32_t mipLevel,
         return SVGA3_VLKN_SUCCESS;
     }
 
-    size_t bpp = svga3_format_bytes_per_pixel(m_svgaFormat);
-    size_t copyRowBytes = bw * bpp;
-    size_t totalBytes = copyRowBytes * bh * bd;
+    const bool compressed = svga3_format_is_compressed(m_svgaFormat);
+    const size_t block = compressed ? 4 : 1;
+    const size_t bpp = svga3_format_bytes_per_pixel(m_svgaFormat);
+    if (!bw || !bh || !bd || !bpp || uint64_t(bx) + bw > mip.width ||
+        uint64_t(by) + bh > mip.height || uint64_t(bz) + bd > mip.depth ||
+        (compressed && ((bx % block) || (by % block) ||
+         ((bw % block) && uint64_t(bx) + bw != mip.width) ||
+         ((bh % block) && uint64_t(by) + bh != mip.height))))
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    const size_t copyRowBytes = ((size_t(bw) + block - 1) / block) * bpp;
+    const size_t copyRows = (size_t(bh) + block - 1) / block;
+    if (copyRowBytes > SIZE_MAX / copyRows / bd)
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    const size_t totalBytes = copyRowBytes * copyRows * bd;
+    if (guestStride && guestStride < copyRowBytes)
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
 
     /* 64-bit comparisons: the 32-bit sums wrapped for large boxes,
      * letting out-of-image boxes pass and driving negative Vulkan extents. */
@@ -1126,7 +1167,7 @@ Svga3VlknStatus VlknSurface::dmaDownload(uint32_t mipLevel,
             const uint8_t *src = (const uint8_t*)mapped;
             uint8_t *dst = (uint8_t*)outGuestData;
             for (uint32_t z = 0; z < bd; ++z) {
-                for (uint32_t y = 0; y < bh; ++y) {
+                for (size_t y = 0; y < copyRows; ++y) {
                     memcpy(dst, src, copyRowBytes);
                     src += copyRowBytes;
                     dst += guestStride;
@@ -1135,7 +1176,7 @@ Svga3VlknStatus VlknSurface::dmaDownload(uint32_t mipLevel,
         }
         bool fullMip = bx == 0 && by == 0 && bz == 0 &&
                        bw == mip.width && bh == mip.height && bd == 1;
-        if (mipLevel == 0 && !m_isDepthStencil && fullMip) {
+        if (mipLevel == 0 && !m_isDepthStencil && !compressed && fullMip) {
             storeReadback(bw, bh, rowPitch, mapped);
         }
         return SVGA3_VLKN_SUCCESS;
@@ -1177,8 +1218,8 @@ Svga3VlknStatus VlknSurface::dmaDownload(uint32_t mipLevel,
 
     VkBufferImageCopy region = {};
     region.bufferOffset = 0;
-    region.bufferRowLength = bw;
-    region.bufferImageHeight = bh;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
     region.imageSubresource.aspectMask = m_isDepthStencil ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.mipLevel = mipLevel;
     region.imageSubresource.baseArrayLayer = 0;
@@ -1230,7 +1271,7 @@ Svga3VlknStatus VlknSurface::dmaDownload(uint32_t mipLevel,
         const uint8_t *src = (const uint8_t*)mapped;
         uint8_t *dst = (uint8_t*)outGuestData;
         for (uint32_t z = 0; z < bd; ++z) {
-            for (uint32_t y = 0; y < bh; ++y) {
+            for (size_t y = 0; y < copyRows; ++y) {
                 memcpy(dst, src, copyRowBytes);
                 src += copyRowBytes;
                 dst += guestStride;
@@ -1240,7 +1281,7 @@ Svga3VlknStatus VlknSurface::dmaDownload(uint32_t mipLevel,
 
     bool fullMip = bx == 0 && by == 0 && bz == 0 &&
                    bw == mip.width && bh == mip.height && bd == 1;
-    if (mipLevel == 0 && !m_isDepthStencil && fullMip) {
+    if (mipLevel == 0 && !m_isDepthStencil && !compressed && fullMip) {
         storeReadback(bw, bh, copyRowBytes, mapped);
     }
 
