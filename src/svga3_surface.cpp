@@ -1673,12 +1673,38 @@ Svga3VlknStatus VlknSurfaceManager::surfaceDMA(const SVGA3dGuestImage &guest,
             surf->addFlags(SVGA3D_SURFACE_HINT_VERTEXBUFFER);
         }
 
-        size_t bpp = isLinearBuffer ? 1 : baseBpp;
-        size_t rowBytes = isLinearBuffer ? bw : (bw * bpp);
-        size_t guestStride = (guest.pitch != 0) ? guest.pitch : rowBytes;
-        if (guest.pitch != 0 && guest.pitch < rowBytes) {
+        const bool compressed = !isLinearBuffer && svga3_format_is_compressed(surf->svgaFormat());
+        const uint32_t blockSize = compressed ? 4 : 1;
+        if (compressed && (box.x % 4 || box.y % 4 || box.srcx % 4 || box.srcy % 4))
             return SVGA3_VLKN_ERROR_INVALID_PARAM;
-        }
+        const size_t bpp = isLinearBuffer ? 1 : baseBpp;
+        const size_t columns = (uint64_t(bw) + blockSize - 1) / blockSize;
+        const uint32_t rows = static_cast<uint32_t>((uint64_t(bh) + blockSize - 1) / blockSize);
+        size_t rowBytes = 0;
+        if (!bpp || __builtin_mul_overflow(columns, bpp, &rowBytes))
+            return SVGA3_VLKN_ERROR_INVALID_PARAM;
+        const size_t guestStride = guest.pitch ? guest.pitch : rowBytes;
+        if (guestStride < rowBytes) return SVGA3_VLKN_ERROR_INVALID_PARAM;
+
+        // A guest pitch addresses block rows for BC images. Validate the last
+        // byte touched, including source coordinates and partial final rows.
+        uint64_t guestSlicePitch = 0, guestOffset = 0, yOffset = 0, xOffset = 0;
+        uint64_t xferBytes = 0, tailRows = 0, endOffset = 0;
+        if (__builtin_mul_overflow(uint64_t(guestStride), uint64_t(rows), &guestSlicePitch) ||
+            __builtin_mul_overflow(uint64_t(box.srcz), guestSlicePitch, &guestOffset) ||
+            __builtin_mul_overflow(uint64_t(box.srcy / blockSize), uint64_t(guestStride), &yOffset) ||
+            __builtin_mul_overflow(uint64_t(box.srcx / blockSize), uint64_t(bpp), &xOffset) ||
+            __builtin_add_overflow(guestOffset, uint64_t(guest.ptr.offset), &guestOffset) ||
+            __builtin_add_overflow(guestOffset, yOffset, &guestOffset) ||
+            __builtin_add_overflow(guestOffset, xOffset, &guestOffset) ||
+            __builtin_mul_overflow(uint64_t(bd - 1), guestSlicePitch, &xferBytes) ||
+            __builtin_mul_overflow(uint64_t(rows - 1), uint64_t(guestStride), &tailRows) ||
+            __builtin_add_overflow(xferBytes, tailRows, &xferBytes) ||
+            __builtin_add_overflow(xferBytes, uint64_t(rowBytes), &xferBytes) ||
+            __builtin_add_overflow(guestOffset, xferBytes, &endOffset))
+            return SVGA3_VLKN_ERROR_INVALID_PARAM;
+        if (transfer != SVGA3D_WRITE_HOST_VRAM && transfer != SVGA3D_READ_HOST_VRAM)
+            return SVGA3_VLKN_ERROR_INVALID_PARAM;
 
         SVGA3dBox sBox;
         sBox.x = box.x;
@@ -1693,7 +1719,7 @@ Svga3VlknStatus VlknSurfaceManager::surfaceDMA(const SVGA3dGuestImage &guest,
              * product would undersize `staging`, overflowing the heap in the
              * row loops below. */
             size_t totalBytes = 0;
-            if (__builtin_mul_overflow(rowBytes, static_cast<size_t>(bh), &totalBytes) ||
+            if (__builtin_mul_overflow(rowBytes, static_cast<size_t>(rows), &totalBytes) ||
                 __builtin_mul_overflow(totalBytes, static_cast<size_t>(bd), &totalBytes)) {
                 return SVGA3_VLKN_ERROR_INVALID_PARAM;
             }
@@ -1708,14 +1734,11 @@ Svga3VlknStatus VlknSurfaceManager::surfaceDMA(const SVGA3dGuestImage &guest,
 
             if (transfer == SVGA3D_WRITE_HOST_VRAM) {
                 for (uint32_t z = 0; z < bd; ++z) {
-                    for (uint32_t y = 0; y < bh; ++y) {
-                        uint64_t rowGuestOffset = static_cast<uint64_t>(guest.ptr.offset) +
-                            static_cast<uint64_t>(box.srcz + z) * (guestStride * bh) +
-                            static_cast<uint64_t>(box.srcy + y) * guestStride +
-                            (isLinearBuffer ? static_cast<uint64_t>(box.srcx) : static_cast<uint64_t>(box.srcx) * bpp);
+                    for (uint32_t y = 0; y < rows; ++y) {
+                        uint64_t rowGuestOffset = guestOffset + uint64_t(z) * guestSlicePitch + uint64_t(y) * guestStride;
                         if (rowGuestOffset > UINT32_MAX) return SVGA3_VLKN_ERROR_INVALID_PARAM;
                         SVGAGuestPtr rowPtr = { guest.ptr.gmrId, static_cast<uint32_t>(rowGuestOffset) };
-                        uint8_t *dstRow = staging.data() + (z * bh + y) * rowBytes;
+                        uint8_t *dstRow = staging.data() + (size_t(z) * rows + y) * rowBytes;
                         Svga3VlknStatus st = guestMem->readGuest(rowPtr, dstRow, rowBytes);
                         if (st != SVGA3_VLKN_SUCCESS) {
                             static uint32_t dma_read_err_cnt = 0;
@@ -1748,14 +1771,11 @@ Svga3VlknStatus VlknSurfaceManager::surfaceDMA(const SVGA3dGuestImage &guest,
                 }
 
                 for (uint32_t z = 0; z < bd; ++z) {
-                    for (uint32_t y = 0; y < bh; ++y) {
-                        uint64_t rowGuestOffset = static_cast<uint64_t>(guest.ptr.offset) +
-                            static_cast<uint64_t>(box.srcz + z) * (guestStride * bh) +
-                            static_cast<uint64_t>(box.srcy + y) * guestStride +
-                            (isLinearBuffer ? static_cast<uint64_t>(box.srcx) : static_cast<uint64_t>(box.srcx) * bpp);
+                    for (uint32_t y = 0; y < rows; ++y) {
+                        uint64_t rowGuestOffset = guestOffset + uint64_t(z) * guestSlicePitch + uint64_t(y) * guestStride;
                         if (rowGuestOffset > UINT32_MAX) return SVGA3_VLKN_ERROR_INVALID_PARAM;
                         SVGAGuestPtr rowPtr = { guest.ptr.gmrId, static_cast<uint32_t>(rowGuestOffset) };
-                        const uint8_t *srcRow = staging.data() + (z * bh + y) * rowBytes;
+                        const uint8_t *srcRow = staging.data() + (size_t(z) * rows + y) * rowBytes;
                         st = guestMem->writeGuest(rowPtr, srcRow, rowBytes);
                         if (st != SVGA3_VLKN_SUCCESS) {
                             static uint32_t dma_write_err_cnt = 0;
@@ -1769,38 +1789,14 @@ Svga3VlknStatus VlknSurfaceManager::surfaceDMA(const SVGA3dGuestImage &guest,
                 }
             }
         } else if (guestBuffer) {
-            uint64_t guestOffset = static_cast<uint64_t>(guest.ptr.offset) +
-                (isLinearBuffer ? static_cast<uint64_t>(box.srcx) : static_cast<uint64_t>(box.srcx) * bpp);
-            /* Upper bound: the transfer touches (bh*bd) rows of guestStride
-             * bytes starting at guestOffset. The old code only checked the
-             * lower bound, allowing a host-side OOB read/write past
-             * guestBuffer. All arithmetic is overflow-checked. */
-            uint64_t xferBytes = 0;
-            bool rangeOk = !__builtin_mul_overflow(static_cast<uint64_t>(bh),
-                                                   static_cast<uint64_t>(bd),
-                                                   &xferBytes) &&
-                           !__builtin_mul_overflow(xferBytes,
-                                                   static_cast<uint64_t>(guestStride),
-                                                   &xferBytes) &&
-                           guestOffset <= guestBufferSize &&
-                           xferBytes <= guestBufferSize - guestOffset;
-            if (transfer == SVGA3D_WRITE_HOST_VRAM) {
-                const uint8_t *srcData = nullptr;
-                if (rangeOk) {
-                    srcData = reinterpret_cast<const uint8_t*>(guestBuffer) + guestOffset;
-                }
-                if (srcData) {
-                    surf->dmaUpload(host.mipmap, &sBox, srcData, guestStride, isLinearBuffer);
-                }
-            } else if (transfer == SVGA3D_READ_HOST_VRAM) {
-                uint8_t *dstData = nullptr;
-                if (rangeOk) {
-                    dstData = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(guestBuffer) + guestOffset);
-                }
-                if (dstData) {
-                    surf->dmaDownload(host.mipmap, &sBox, dstData, guestStride, isLinearBuffer);
-                }
-            }
+            if (endOffset > guestBufferSize) return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            auto *data = reinterpret_cast<const uint8_t*>(guestBuffer) + guestOffset;
+            Svga3VlknStatus st = transfer == SVGA3D_WRITE_HOST_VRAM
+                ? surf->dmaUpload(host.mipmap, &sBox, data, guestStride, isLinearBuffer)
+                : surf->dmaDownload(host.mipmap, &sBox, const_cast<uint8_t*>(data), guestStride, isLinearBuffer);
+            if (st != SVGA3_VLKN_SUCCESS) return st;
+        } else {
+            return SVGA3_VLKN_ERROR_INVALID_PARAM;
         }
     }
 
