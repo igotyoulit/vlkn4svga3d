@@ -2622,6 +2622,9 @@ Svga3VlknStatus VlknContextManager::createContext(uint32_t cid) {
         return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
     }
 
+    // A new context initializes fallback textures on the shared command
+    // buffer, so finish any other context's pass before those transfers.
+    endAllRenderPasses();
     m_contexts[cid] = std::make_unique<VlknContext>(m_backend, m_surfaceMgr, cid);
     return SVGA3_VLKN_SUCCESS;
 }

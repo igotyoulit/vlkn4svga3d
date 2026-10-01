@@ -71,7 +71,7 @@ HARNESS_TIMEOUT="${HARNESS_TIMEOUT:-900}"
 
 # Suites: name -> needs-Vulkan-ICD (all lavapipe suites do; the translator
 # suite is ICD-free but harmless to run with the ICD exported).
-ICD_FREE_SUITES=( test_translator_novulkan )
+ICD_FREE_SUITES=( test_translator_novulkan test_preload_fifo )
 LAVAPIPE_SUITES=(
     test_buffer_ordering
     test_shader_translation

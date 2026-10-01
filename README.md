@@ -100,13 +100,15 @@ scripts/harness_loop.sh --iterations 5 # repeat; stops on pass->fail regressions
 scripts/harness_loop.sh --fail-fast --skip-build
 ```
 
-The loop requires a real Vulkan ICD (`HARNESS_ICD`, else a hard failure — never a silent skip), enables `spirv-val` when `SPIRV_TOOLS_DIR` provides it, builds everything, then runs the ICD-free translator suite followed by all lavapipe-backed suites. Logs and a `results.tsv` are written per iteration under `.harness-loop/`. Iteration stops on the first pass→fail regression between runs.
+The loop requires a real Vulkan ICD (`HARNESS_ICD`, else a hard failure — never a silent skip), enables `spirv-val` when `SPIRV_TOOLS_DIR` provides it, builds everything, then runs the ICD-free translator and preload FIFO suites followed by all lavapipe-backed suites. Logs and a `results.tsv` are written per iteration under `.harness-loop/`. Iteration stops on the first pass→fail regression between runs.
 
 What each suite proves:
 
 | Suite | Proves |
 | --- | --- |
 | `test_translator_novulkan` | D3D9→SPIR-V translation without a Vulkan ICD; optional `spirv-val` (prints SKIP, not PASS, when unavailable); SPIR-V value-flow assertions that shader inputs actually reach the declared outputs (not just decorations) |
+| `test_preload_fifo` | Actual preload FIFO walker on a synthetic QEMU state, without patching a process: batches exceeding 8192 commands, ring wrap, producer notification races, incomplete packets and final fences |
+| `test_buffer_ordering` | Strict Vulkan validation through teardown; queued buffers/constants, compressed FIFO/GMR transfers, sampler retirement, mip/image ordering, depth sampling and shader pixel regressions |
 | `test_shader_translation` | Translation plus real Vulkan shader-module creation; malformed/unsupported bytecode rejected; `_SAT` handling |
 | `test_real_vulkan` | Real device init and bit-exact buffer upload/download; no mock fallback |
 | `test_svga3_vlkn` | Engine/unit suite incl. failure-injection of Vulkan dispatch (flush-error propagation) |
