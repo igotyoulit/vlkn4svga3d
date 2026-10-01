@@ -103,11 +103,17 @@ int main() {
   bcBox.w = 8;
   bcBox.h = 8;
   bcBox.d = 1;
+  // FIFO DMA must end a recorded draw before transfer commands.
+  correct &= svga3_vlkn_context_draw(d, 1, SVGA3D_PRIMITIVE_TRIANGLELIST,
+                                      &decl, 1, &r, 1) == SVGA3_VLKN_SUCCESS;
   correct &= d->surfaceMgr->surfaceDMA(guest, image, SVGA3D_WRITE_HOST_VRAM,
                                        &bcBox, 1, nullptr, blocks,
                                        sizeof(blocks)) == SVGA3_VLKN_SUCCESS;
-  correct &= svga3_vlkn_surface_dma_download(d, 20, 0, nullptr, bcRead, 16) ==
-             SVGA3_VLKN_SUCCESS;
+  correct &= svga3_vlkn_context_draw(d, 1, SVGA3D_PRIMITIVE_TRIANGLELIST,
+                                      &decl, 1, &r, 1) == SVGA3_VLKN_SUCCESS;
+  correct &= d->surfaceMgr->surfaceDMA(guest, image, SVGA3D_READ_HOST_VRAM,
+                                       &bcBox, 1, nullptr, bcRead,
+                                       sizeof(bcRead)) == SVGA3_VLKN_SUCCESS;
   correct &= memcmp(blocks, bcRead, 32) == 0;
   correct &= d->surfaceMgr->surfaceDMA(guest, image, SVGA3D_WRITE_HOST_VRAM,
                                        &bcBox, 1, nullptr, blocks,

@@ -1683,6 +1683,10 @@ Svga3VlknStatus VlknSurfaceManager::surfaceDMA(const SVGA3dGuestImage &guest,
         return SVGA3_VLKN_SUCCESS;
     }
 
+    // FIFO/GMR DMA bypasses the public API wrapper. End any active
+    // render pass before recording image transfer barriers or copies.
+    if (m_contextMgr) m_contextMgr->endAllRenderPasses();
+
     size_t baseBpp = svga3_format_bytes_per_pixel(surf->svgaFormat());
     for (uint32_t i = 0; i < numBoxes; ++i) {
         const SVGA3dCopyBox &box = boxes[i];
