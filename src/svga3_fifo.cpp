@@ -660,7 +660,7 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
 
             uint32_t result = 0;
             Svga3VlknStatus st = ctx->waitForQuery(pCmd->type, &result);
-            if (dev->guestMem && pCmd->guestResult.gmrId != SVGA_GMR_NULL) {
+            if (st == SVGA3_VLKN_SUCCESS && dev->guestMem && pCmd->guestResult.gmrId != SVGA_GMR_NULL) {
                 SVGA3dQueryResult res = {};
                 res.totalSize = sizeof(SVGA3dQueryResult);
                 res.state = SVGA3D_QUERYSTATE_SUCCEEDED;

@@ -2516,7 +2516,8 @@ Svga3VlknStatus VlknContext::waitForQuery(SVGA3dQueryType type, uint32_t *outRes
     if (type >= SVGA3D_QUERYTYPE_MAX) return SVGA3_VLKN_ERROR_INVALID_PARAM;
     if (!m_queryEnded && !m_queryActive) return SVGA3_VLKN_ERROR_INVALID_PARAM;
 
-    m_backend->waitIdle();
+    const Svga3VlknStatus completed = m_backend->waitIdle();
+    if (completed != SVGA3_VLKN_SUCCESS) return completed;
     uint64_t pixels = 0;
     if (m_queryPool != VK_NULL_HANDLE) {
         VkResult res = m_backend->dispatch().vkGetQueryPoolResults(
@@ -2531,7 +2532,7 @@ Svga3VlknStatus VlknContext::waitForQuery(SVGA3dQueryType type, uint32_t *outRes
         if (res == VK_SUCCESS) {
             m_lastQueryResult = (uint32_t)pixels;
         } else {
-            m_lastQueryResult = (uint32_t)(m_vertexCount > 0 ? (m_drawCount * 1920) : 0);
+            return SVGA3_VLKN_ERROR_DEVICE_LOST;
         }
     } else {
         m_lastQueryResult = (uint32_t)(m_vertexCount > 0 ? (m_drawCount * 1920) : 0);

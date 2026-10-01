@@ -53,7 +53,7 @@ make -j4 all
 
 Outputs include `lib/libsvga3_vlkn.a`, `lib/libqemu_svga3d.so`, and test executables under `bin/`. Public interfaces are in `include/svga3_vlkn.h` and `include/qemu_vmsvga.h`. Link consumers with the static library, `-ldl`, and `-pthread`.
 
-Use `make clean` before rebuilding after header changes: the current Makefile does not generate complete header dependencies.
+Make generates header dependency files for compiled objects, so header edits rebuild affected objects.
 
 ## Tests
 

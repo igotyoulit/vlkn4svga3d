@@ -706,6 +706,9 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
                           (m_height <= 1 && m_depth <= 1 && (bw > mip.width || (bx + bw) > mip.width));
 
     if (isLinearBuffer) {
+        /* Recorded draws reference this memory until submitted and completed. */
+        Svga3VlknStatus pending = m_backend->flushCommandBuffer();
+        if (pending != SVGA3_VLKN_SUCCESS) return pending;
         /* 64-bit: bx + bw wrapped in 32-bit for huge boxes, bypassing the
          * ensureBufferSize growth and making copyLen read past guestData. */
         uint64_t offset64 = bx;

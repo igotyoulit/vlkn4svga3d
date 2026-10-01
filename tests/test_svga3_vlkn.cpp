@@ -1554,6 +1554,20 @@ static void TestSurfaceTransfersPropagateFlushFailures() {
                "surface_copy propagates flush/submit failure");
 
     dispatch.vkQueueSubmit = saved;
+    TEST_CHECK(svga3_vlkn_context_create(dev, 9201) == SVGA3_VLKN_SUCCESS,
+               "Create query failure regression context");
+    TEST_CHECK(svga3_vlkn_context_begin_query(dev, 9201, SVGA3D_QUERYTYPE_OCCLUSION) == SVGA3_VLKN_SUCCESS &&
+               svga3_vlkn_context_end_query(dev, 9201, SVGA3D_QUERYTYPE_OCCLUSION) == SVGA3_VLKN_SUCCESS,
+               "Complete query before injected device wait failure");
+    auto savedDeviceWait = dispatch.vkDeviceWaitIdle;
+    g_savedErrorDeviceWait = savedDeviceWait;
+    dispatch.vkDeviceWaitIdle = injectDeviceWaitResult;
+    g_injectedDeviceWaitResult = VK_ERROR_DEVICE_LOST;
+    uint32_t result = 0x12345678;
+    TEST_CHECK(svga3_vlkn_context_wait_for_query(dev, 9201, SVGA3D_QUERYTYPE_OCCLUSION, &result) == SVGA3_VLKN_ERROR_DEVICE_LOST && result == 0x12345678,
+               "Query wait propagates device loss without writing a successful result");
+    g_injectedDeviceWaitResult = VK_SUCCESS;
+    dispatch.vkDeviceWaitIdle = savedDeviceWait;
     svga3_vlkn_device_destroy(dev);
 }
 

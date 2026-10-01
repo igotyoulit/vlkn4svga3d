@@ -33,6 +33,7 @@ REQUIRED_BINARIES=(
     "bin/test_real_vulkan"
     "bin/test_shader_translation"
     "bin/test_shader_execution"
+    "bin/test_buffer_ordering"
     "bin/test_guest_memory"
     "bin/test_verified_rendering"
     "bin/test_presentation"
@@ -91,6 +92,7 @@ echo "[RUN] ./bin/test_shader_translation"
 echo ""
 echo "[RUN] ./bin/test_shader_execution"
 ./bin/test_shader_execution
+./bin/test_buffer_ordering
 
 # ------------------------------------------------------------------------------
 # SECTION 3: REAL GUEST MEMORY ACCESS & BOUNDARY SAFETY (Deliverable 3)
