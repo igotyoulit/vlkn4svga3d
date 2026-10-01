@@ -516,6 +516,10 @@ int main() {
          * R = round(200 * 0.50196 + 80 * (1 - 0.50196)) = round(100.39 + 39.84) = 140
          * G = round(100 * 0.50196 + 80 * (1 - 0.50196)) = round( 50.20 + 39.84) = 90
          * B = round( 50 * 0.50196 + 80 * (1 - 0.50196)) = round( 25.10 + 39.84) = 65
+         * A: separate alpha blending is off, so per D3D9 the alpha
+         *    channel blends with the color factors against the cleared
+         *    dst alpha 255: round(128 * 0.50196 + 255 * (1 - 0.50196))
+         *    = round(64.25 + 127.0) = 191
          */
         float srcColor[4] = { 200.0f / 255.0f, 100.0f / 255.0f, 50.0f / 255.0f, 128.0f / 255.0f };
         uint32_t scVal[4];
@@ -545,11 +549,11 @@ int main() {
         svga3_vlkn_surface_dma_download(dev, SID_RT, 0, nullptr, fb.data(), RT_W * 4);
 
         Pixel blended = fb[(RT_H / 2) * RT_W + (RT_W / 2)];
-        TEST_CHECK(pixelMatches(blended, 140, 90, 65, 128),
+        TEST_CHECK(pixelMatches(blended, 140, 90, 65, 191),
                    "Scene 3: Alpha blending analytically matches round(Src*A + Dst*(1-A)) = (140, 90, 65)");
 
         /* Generate Analytical Reference Image for Scene 3 */
-        std::vector<Pixel> refFb3(RT_W * RT_H, { 65, 90, 140, 128 }); // (B=65, G=90, R=140, A=128)
+        std::vector<Pixel> refFb3(RT_W * RT_H, { 65, 90, 140, 191 }); // (B=65, G=90, R=140, A=191)
         savePPM("artifacts/scene3_alpha_rendered.ppm", fb.data(), RT_W, RT_H);
         savePPM("artifacts/scene3_alpha_reference.ppm", refFb3.data(), RT_W, RT_H);
         saveDiffPPM("artifacts/scene3_alpha_diff.ppm", fb.data(), refFb3.data(), RT_W, RT_H);

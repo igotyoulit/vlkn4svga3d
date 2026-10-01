@@ -1870,10 +1870,12 @@ static void TestDepthOnlyPipelineBlendState() {
  *  - raster grid: guest D3D positions assume evaluation half a pixel off
  *    Vulkan's grid; the draw viewport must carry the (+0.5,+0.5) shift
  *    while the stored guest viewport stays unshifted.
- *  - blend: the ALPHA render states are the alpha contract in both
- *    separate and non-separate modes (verified-rendering Scene 3 pins
- *    out-alpha = srcA under the ONE/ZERO defaults; a color-factor
- *    mirror was tried and reverted as unnecessary for the gate).
+ *  - blend: D3D9 alpha selection — with SEPARATEALPHABLENDENABLE off,
+ *    alpha blends with the COLOR factors/equation and the *ALPHA states
+ *    are ignored; with it on, the *ALPHA states rule. Guests driving
+ *    non-separate blending only emit the *ALPHA states in separate
+ *    mode, so honoring them unconditionally blended alpha with stale
+ *    ONE/ZERO defaults (glmark2 desktop blur/shadow pixel failures).
  *  - mip render target: the framebuffer/render area must use the bound
  *    mip level's dimensions, not the base level's.
  *  - mip copy: surface copies must honor the command's mip/face selection.
@@ -1963,11 +1965,10 @@ static void TestSeparateAlphaBlendFactors() {
     ctx->setRenderState(SVGA3D_RS_SRCBLEND, SVGA3D_BLENDOP_SRCALPHA);
     ctx->setRenderState(SVGA3D_RS_DSTBLEND, SVGA3D_BLENDOP_INVSRCALPHA);
     ctx->setRenderState(SVGA3D_RS_BLENDEQUATION, SVGA3D_BLENDEQ_ADD);
-    /* Distinct alpha states: the *ALPHA render states are the alpha
-     * blend contract in both modes — verified-rendering Scene 3 pins
-     * out-alpha = srcA with the ONE/ZERO defaults, and the glmark2 gate
-     * passes with these semantics (a color-mirror experiment failed
-     * Scene 3 and was reverted as unnecessary). */
+    /* Distinct alpha states, deliberately different from the color
+     * states: with separate alpha blending disabled, D3D9 selects the
+     * COLOR factors/equation for the alpha channel and the *ALPHA
+     * states are ignored. */
     ctx->setRenderState(SVGA3D_RS_SRCBLENDALPHA, SVGA3D_BLENDOP_ONE);
     ctx->setRenderState(SVGA3D_RS_DSTBLENDALPHA, SVGA3D_BLENDOP_ZERO);
     ctx->setRenderState(SVGA3D_RS_BLENDEQUATIONALPHA, SVGA3D_BLENDEQ_SUBTRACT);
@@ -1988,24 +1989,23 @@ static void TestSeparateAlphaBlendFactors() {
                capturedBlendAttach.dstColorBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA &&
                capturedBlendAttach.colorBlendOp == VK_BLEND_OP_ADD,
                "Color blend factors as set");
-    TEST_CHECK(capturedBlendAttach.srcAlphaBlendFactor == VK_BLEND_FACTOR_ONE &&
-               capturedBlendAttach.dstAlphaBlendFactor == VK_BLEND_FACTOR_ZERO &&
-               capturedBlendAttach.alphaBlendOp == VK_BLEND_OP_SUBTRACT,
-               "Alpha uses the ALPHA states when separate alpha is disabled");
+    TEST_CHECK(capturedBlendAttach.srcAlphaBlendFactor == VK_BLEND_FACTOR_SRC_ALPHA &&
+               capturedBlendAttach.dstAlphaBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA &&
+               capturedBlendAttach.alphaBlendOp == VK_BLEND_OP_ADD,
+               "Alpha mirrors the color factors when separate alpha is disabled");
 
-    /* Change the alpha states so the pipeline key differs (both modes
-     * draw from the same ALPHA states, so identical state correctly
-     * hits the pipeline cache and creates nothing new). */
-    ctx->setRenderState(SVGA3D_RS_SRCBLENDALPHA, SVGA3D_BLENDOP_SRCALPHA);
-    ctx->setRenderState(SVGA3D_RS_DSTBLENDALPHA, SVGA3D_BLENDOP_INVSRCALPHA);
+    /* Enable separate alpha blending: now the *ALPHA states rule, so
+     * the pipeline key changes and a new pipeline is created. */
+    ctx->setRenderState(SVGA3D_RS_SRCBLENDALPHA, SVGA3D_BLENDOP_ONE);
+    ctx->setRenderState(SVGA3D_RS_DSTBLENDALPHA, SVGA3D_BLENDOP_ZERO);
     ctx->setRenderState(SVGA3D_RS_BLENDEQUATIONALPHA, SVGA3D_BLENDEQ_ADD);
     ctx->setRenderState(SVGA3D_RS_SEPARATEALPHABLENDENABLE, 1);
     capturedBlendValid = false;
     TEST_CHECK(ctx->draw(range.primType, nullptr, 0, &range, 1) == SVGA3_VLKN_SUCCESS,
                "Draw with separate alpha enabled");
     TEST_CHECK(capturedBlendValid, "Pipeline captured for separate-alpha-on draw");
-    TEST_CHECK(capturedBlendAttach.srcAlphaBlendFactor == VK_BLEND_FACTOR_SRC_ALPHA &&
-               capturedBlendAttach.dstAlphaBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA &&
+    TEST_CHECK(capturedBlendAttach.srcAlphaBlendFactor == VK_BLEND_FACTOR_ONE &&
+               capturedBlendAttach.dstAlphaBlendFactor == VK_BLEND_FACTOR_ZERO &&
                capturedBlendAttach.alphaBlendOp == VK_BLEND_OP_ADD,
                "Alpha uses its own factors when separate alpha is enabled");
     dispatch.vkCreateGraphicsPipelines = savedCreatePipelinesBlend;

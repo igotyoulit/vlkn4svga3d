@@ -1633,9 +1633,21 @@ VkPipeline VlknContext::getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
     key.srcColorBlend = m_renderStates[SVGA3D_RS_SRCBLEND];
     key.dstColorBlend = m_renderStates[SVGA3D_RS_DSTBLEND];
     key.colorBlendEq = m_renderStates[SVGA3D_RS_BLENDEQUATION];
-    key.srcAlphaBlend = m_renderStates[SVGA3D_RS_SRCBLENDALPHA];
-    key.dstAlphaBlend = m_renderStates[SVGA3D_RS_DSTBLENDALPHA];
-    key.alphaBlendEq = m_renderStates[SVGA3D_RS_BLENDEQUATIONALPHA];
+    /* D3D9 semantics: when SEPARATEALPHABLENDENABLE is off, the alpha
+     * blend uses the color factors/equation and the *ALPHA states are
+     * ignored. Guests that drive non-separate blending (e.g. Mesa's
+     * SVGA backend) only emit the *ALPHA states when separate blending
+     * is on, so reading them unconditionally would blend alpha with
+     * stale or default factors. */
+    if (m_renderStates[SVGA3D_RS_SEPARATEALPHABLENDENABLE]) {
+        key.srcAlphaBlend = m_renderStates[SVGA3D_RS_SRCBLENDALPHA];
+        key.dstAlphaBlend = m_renderStates[SVGA3D_RS_DSTBLENDALPHA];
+        key.alphaBlendEq = m_renderStates[SVGA3D_RS_BLENDEQUATIONALPHA];
+    } else {
+        key.srcAlphaBlend = key.srcColorBlend;
+        key.dstAlphaBlend = key.dstColorBlend;
+        key.alphaBlendEq = key.colorBlendEq;
+    }
     key.stencilEnable = hasDepthAttachment ? m_renderStates[SVGA3D_RS_STENCILENABLE] : 0;
     key.stencilFunc = m_renderStates[SVGA3D_RS_STENCILFUNC];
     key.colorWriteMask = m_renderStates[SVGA3D_RS_COLORWRITEENABLE];
