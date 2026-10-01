@@ -7,6 +7,7 @@
 
 #include "svga3_vlkn.h"
 #include "svga3_device.h"
+#include "vlkn_dispatch.h"
 #include "svga3d_reference.h"
 #include "svga3d_tables.h"
 #include <iostream>
@@ -1879,6 +1880,165 @@ static void TestDepthOnlyPipelineBlendState() {
 }
 
 /* --------------------------------------------------------------------------
+ * Issue #10: findMemoryType(-1) passed as a Vk memory type index, plus the
+ * unchecked create/allocate/bind/view results around it.
+ *
+ * Drives the mock backend's failure-injection hooks to prove:
+ *  - a surface whose memory requirements match no memory type fails
+ *    without ever calling vkAllocateMemory and without leaking its image;
+ *  - a vkBindImageMemory failure fails surface allocation (it used to be
+ *    ignored, so an image with no bound memory was reported ready);
+ *  - a vkCreateImageView failure leaves the surface object holding no
+ *    live image/memory (cleanup used to depend entirely on the
+ *    destructor running, so allocate() did not leave a clean slate);
+ *  - context creation with a failing dummy-image bind stays fail-soft,
+ *    records no barriers/copies against the unbound image, and leaks
+ *    nothing relative to a healthy context cycle;
+ *  - VlknBackend::allocateMemory itself rejects out-of-range type
+ *    indices (including the wrapped -1, 0xFFFFFFFF) before the driver
+ *    call is ever made.
+ * -------------------------------------------------------------------------- */
+static PFN_vkCmdPipelineBarrier reviewOriginalBarrier;
+static unsigned reviewInvalidBarriers;
+static void VKAPI_CALL reviewBarrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep, uint32_t mc, const VkMemoryBarrier *mem, uint32_t bc, const VkBufferMemoryBarrier *buf, uint32_t ic, const VkImageMemoryBarrier *img) {
+    for (uint32_t i=0; i<ic; ++i) {
+        if (img[i].sType != VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER || !img[i].subresourceRange.aspectMask || !img[i].subresourceRange.levelCount || !img[i].subresourceRange.layerCount) ++reviewInvalidBarriers;
+    }
+    reviewOriginalBarrier(cb,src,dst,dep,mc,mem,bc,buf,ic,img);
+}
+static void TestMemoryTypeFailureHardening() {
+    std::cout << ANSI_CYAN << "[TEST] Memory-Type & Allocation Failure Hardening (issue #10)..." << ANSI_RESET << std::endl;
+
+    svga3_mock_reset_hooks();
+
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create hardening-test device");
+    if (!dev) return;
+
+    const long baseImages = svga3_mock_live_images();
+    const long baseMemory = svga3_mock_live_memory();
+    const long baseViews  = svga3_mock_live_views();
+    const SVGA3dSize size64 = { 64, 64, 1 };
+
+    /* 1. No memory type matches the image's requirements (bits == 0). */
+    {
+        const long allocsBefore = svga3_mock_allocate_calls();
+        svga3_mock_set_image_memory_type_bits(0);
+        Svga3VlknStatus st = svga3_vlkn_surface_define(dev, 9201, 0, SVGA3D_A8R8G8B8, &size64, 1);
+        svga3_mock_clear_image_memory_type_bits();
+        TEST_CHECK(st != SVGA3_VLKN_SUCCESS, "Define fails when no memory type matches");
+        TEST_CHECK(!svga3_vlkn_surface_exists(dev, 9201), "Unallocatable surface is not registered");
+        TEST_CHECK(svga3_mock_allocate_calls() == allocsBefore,
+                   "findMemoryType failure never reaches vkAllocateMemory");
+        TEST_CHECK(svga3_mock_live_images() == baseImages, "No image leaked on the no-memory-type path");
+    }
+
+    /* 2. vkBindImageMemory failure, on a directly-owned surface so the
+     * state is inspected while the object is still alive. */
+    {
+        svga3_vlkn::VlknSurface surf(dev->backend.get(), 9202, 0, SVGA3D_A8R8G8B8, &size64, 1);
+        svga3_mock_fail_bind_image_memory(1);
+        Svga3VlknStatus st = surf.allocate();
+        TEST_CHECK(st != SVGA3_VLKN_SUCCESS, "allocate() fails when vkBindImageMemory fails");
+        TEST_CHECK(surf.image() == VK_NULL_HANDLE, "Bind failure clears the image handle");
+        TEST_CHECK(svga3_mock_live_images() == baseImages, "Bind failure releases the image immediately");
+        TEST_CHECK(svga3_mock_live_memory() == baseMemory, "Bind failure releases the memory immediately");
+        TEST_CHECK(svga3_mock_live_views() == baseViews, "Bind failure creates no view");
+    }
+
+    /* 3. vkCreateImageView failure, same direct-ownership inspection. */
+    {
+        svga3_vlkn::VlknSurface surf(dev->backend.get(), 9203, 0, SVGA3D_A8R8G8B8, &size64, 1);
+        svga3_mock_fail_create_image_view(1);
+        Svga3VlknStatus st = surf.allocate();
+        TEST_CHECK(st != SVGA3_VLKN_SUCCESS, "allocate() fails when vkCreateImageView fails");
+        TEST_CHECK(surf.image() == VK_NULL_HANDLE, "View failure clears the image handle");
+        TEST_CHECK(surf.imageView() == VK_NULL_HANDLE, "View failure leaves no view handle");
+        TEST_CHECK(svga3_mock_live_images() == baseImages, "View failure releases the image immediately");
+        TEST_CHECK(svga3_mock_live_memory() == baseMemory, "View failure releases the memory immediately");
+        TEST_CHECK(svga3_mock_live_views() == baseViews, "View failure leaves no live view");
+    }
+
+    /* 4. Context creation with the dummy image's bind failing. */
+    {
+        /* Healthy control cycle: establishes the teardown baseline and
+         * proves the instrumentation sees no unbound-image use normally. */
+        const long usesBefore = svga3_mock_unbound_image_uses();
+        TEST_CHECK(svga3_vlkn_context_create(dev, 9200) == SVGA3_VLKN_SUCCESS, "Control context creates");
+        TEST_CHECK(svga3_vlkn_context_destroy(dev, 9200) == SVGA3_VLKN_SUCCESS, "Control context destroys");
+        TEST_CHECK(svga3_mock_unbound_image_uses() == usesBefore,
+                   "Healthy context init never touches an unbound image");
+        const long ctrlImages = svga3_mock_live_images();
+        const long ctrlMemory = svga3_mock_live_memory();
+        const long ctrlViews  = svga3_mock_live_views();
+
+        const long failUsesBefore = svga3_mock_unbound_image_uses();
+        reviewOriginalBarrier = dev->backend->dispatch().vkCmdPipelineBarrier;
+        reviewInvalidBarriers = 0;
+        dev->backend->dispatch().vkCmdPipelineBarrier = reviewBarrier;
+        svga3_mock_fail_bind_image_memory(1);
+        TEST_CHECK(svga3_vlkn_context_create(dev, 9201) == SVGA3_VLKN_SUCCESS,
+                   "Context still creates when the dummy bind fails (fail-soft)");
+        dev->backend->dispatch().vkCmdPipelineBarrier = reviewOriginalBarrier;
+        TEST_CHECK(reviewInvalidBarriers == 0, "Fallback image barriers retain required fields after dummy bind failure");
+        TEST_CHECK(svga3_vlkn_context_destroy(dev, 9201) == SVGA3_VLKN_SUCCESS,
+                   "Context destroys cleanly after dummy bind failure");
+        TEST_CHECK(svga3_mock_unbound_image_uses() == failUsesBefore,
+                   "No barriers/copies recorded against the unbound dummy image");
+        TEST_CHECK(svga3_mock_live_images() == ctrlImages, "Dummy bind failure leaks no image");
+        TEST_CHECK(svga3_mock_live_memory() == ctrlMemory, "Dummy bind failure leaks no memory");
+        TEST_CHECK(svga3_mock_live_views() == ctrlViews, "Dummy bind failure leaks no view");
+    }
+
+    /* Missing fallback resources must fail a draw before descriptors are written. */
+    {
+        TEST_CHECK(svga3_vlkn_surface_define(dev, 9204, SVGA3D_SURFACE_HINT_RENDERTARGET,
+                       SVGA3D_A8R8G8B8, &size64, 1) == SVGA3_VLKN_SUCCESS,
+                   "Create render target for missing-fallback regression");
+        svga3_mock_fail_bind_image_memory(2);
+        TEST_CHECK(svga3_vlkn_context_create(dev, 9204) == SVGA3_VLKN_SUCCESS,
+                   "Create context with both fallback images unavailable");
+        TEST_CHECK(svga3_vlkn_context_set_render_target(dev, 9204, SVGA3D_RT_COLOR0,
+                       9204, 0, 0) == SVGA3_VLKN_SUCCESS, "Bind fallback regression target");
+        SVGA3dVertexDecl decl{};
+        decl.identity.usage = SVGA3D_DECLUSAGE_POSITION;
+        decl.identity.type = SVGA3D_DECLTYPE_FLOAT3;
+        decl.array.stride = 12;
+        SVGA3dPrimitiveRange range{};
+        range.primType = SVGA3D_PRIMITIVE_TRIANGLELIST;
+        range.primitiveCount = 1;
+        TEST_CHECK(svga3_vlkn_context_draw(dev, 9204, range.primType, &decl, 1, &range, 1)
+                       == SVGA3_VLKN_ERROR_OUT_OF_MEMORY,
+                   "Missing fallback fails draw instead of submitting null descriptors");
+        svga3_vlkn_context_destroy(dev, 9204);
+        svga3_vlkn_surface_destroy(dev, 9204);
+    }
+
+    /* 5. The central guard inside VlknBackend::allocateMemory. */
+    {
+        const long allocsBefore = svga3_mock_allocate_calls();
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        Svga3VlknStatus st = dev->backend->allocateMemory(4096, 0xFFFFFFFFu, &mem);
+        TEST_CHECK(st != SVGA3_VLKN_SUCCESS, "allocateMemory rejects the wrapped -1 index (0xFFFFFFFF)");
+        TEST_CHECK(mem == VK_NULL_HANDLE, "Rejected allocation leaves the output handle null");
+        if (mem) { dev->backend->freeMemory(mem); mem = VK_NULL_HANDLE; }
+        st = dev->backend->allocateMemory(4096, 3, &mem); /* == mock memoryTypeCount */
+        TEST_CHECK(st != SVGA3_VLKN_SUCCESS, "allocateMemory rejects index == memoryTypeCount");
+        if (mem) { dev->backend->freeMemory(mem); mem = VK_NULL_HANDLE; }
+        TEST_CHECK(svga3_mock_allocate_calls() == allocsBefore,
+                   "Rejected indices never reach vkAllocateMemory");
+    }
+
+    /* 6. Global invariant over everything this test allocated. */
+    TEST_CHECK(svga3_mock_saw_invalid_alloc_type() == 0,
+               "No vkAllocateMemory call ever carried an out-of-range memory type index");
+
+    svga3_vlkn_device_destroy(dev);
+}
+
+/* --------------------------------------------------------------------------
  * Rendering-correctness regressions for the glmark2 validation gate.
  * Each test pins one proven root cause:
  *  - raster grid: guest D3D positions assume evaluation half a pixel off
@@ -2308,6 +2468,7 @@ int main() {
     TestPresentAlwaysCopies();
     TestDepthVariantCleanup();
     TestDepthOnlyPipelineBlendState();
+    TestMemoryTypeFailureHardening();
     TestRasterViewportCompensation();
     TestSeparateAlphaBlendFactors();
     TestNonzeroMipRenderTarget();

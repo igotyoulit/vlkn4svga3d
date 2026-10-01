@@ -439,6 +439,17 @@ int VlknBackend::findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags prope
 }
 
 Svga3VlknStatus VlknBackend::allocateMemory(VkDeviceSize size, uint32_t memoryTypeIndex, VkDeviceMemory *outMemory) {
+    /* A memory type index is only meaningful below memoryTypeCount. The
+     * bug in issue #10 passed findMemoryType()'s -1 failure return here,
+     * where it wrapped to 0xFFFFFFFF. Individual call sites guard their
+     * findMemoryType() results, and this central check makes the whole
+     * class of failure impossible regardless of caller. */
+    if (memoryTypeIndex >= m_memProps.memoryTypeCount) {
+        log_msg("[libqemu_svga3d] allocateMemory: invalid memory type index %u (type count %u)\n",
+                memoryTypeIndex, m_memProps.memoryTypeCount);
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    }
+
     VkMemoryAllocateInfo allocInfo = {};
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     allocInfo.allocationSize = size;

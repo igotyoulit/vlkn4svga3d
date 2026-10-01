@@ -11,6 +11,54 @@
 #include <vector>
 
 /*
+ * Mock-backend test hooks: failure injection + live-object accounting.
+ * Only the mock entry points below consult this state; the real Vulkan
+ * loader path never touches it. The mock exposes 3 memory types, so any
+ * vkAllocateMemory call with memoryTypeIndex >= 3 is by definition the
+ * findMemoryType(-1) wrap class of bug and is recorded.
+ */
+static int      g_mockFailCreateImageView = 0;
+static int      g_mockFailBindImageMemory = 0;
+static bool     g_mockImageTypeBitsOverrideOn = false;
+static uint32_t g_mockImageTypeBitsOverride = 0;
+static long     g_mockLiveImages = 0;
+static long     g_mockLiveMemory = 0;
+static long     g_mockLiveViews = 0;
+static long     g_mockAllocateCalls = 0;
+static int      g_mockSawInvalidAllocType = 0;
+static long     g_mockUnboundImageUses = 0;
+
+void svga3_mock_reset_hooks(void) {
+    g_mockFailCreateImageView = 0;
+    g_mockFailBindImageMemory = 0;
+    g_mockImageTypeBitsOverrideOn = false;
+    g_mockImageTypeBitsOverride = 0;
+    g_mockAllocateCalls = 0;
+    g_mockSawInvalidAllocType = 0;
+    g_mockUnboundImageUses = 0;
+}
+
+void svga3_mock_fail_create_image_view(int count) { g_mockFailCreateImageView = count; }
+void svga3_mock_fail_bind_image_memory(int count) { g_mockFailBindImageMemory = count; }
+
+void svga3_mock_set_image_memory_type_bits(uint32_t bits) {
+    g_mockImageTypeBitsOverrideOn = true;
+    g_mockImageTypeBitsOverride = bits;
+}
+
+void svga3_mock_clear_image_memory_type_bits(void) {
+    g_mockImageTypeBitsOverrideOn = false;
+    g_mockImageTypeBitsOverride = 0;
+}
+
+long svga3_mock_live_images(void) { return g_mockLiveImages; }
+long svga3_mock_live_memory(void) { return g_mockLiveMemory; }
+long svga3_mock_live_views(void) { return g_mockLiveViews; }
+long svga3_mock_allocate_calls(void) { return g_mockAllocateCalls; }
+int  svga3_mock_saw_invalid_alloc_type(void) { return g_mockSawInvalidAllocType; }
+long svga3_mock_unbound_image_uses(void) { return g_mockUnboundImageUses; }
+
+/*
  * Mock Vulkan Implementation Structures
  */
 typedef struct MockDevice_T {
@@ -303,12 +351,16 @@ static VkResult VKAPI_CALL mock_vkCreateImage(VkDevice device, const VkImageCrea
     img->usage = pCreateInfo->usage;
     (void)s_imgId;
     *pImage = (VkImage)(uintptr_t)img;
+    g_mockLiveImages++;
     return VK_SUCCESS;
 }
 
 static void VKAPI_CALL mock_vkDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator) {
     (void)device; (void)pAllocator;
-    if (image) free((void*)(uintptr_t)image);
+    if (image) {
+        g_mockLiveImages--;
+        free((void*)(uintptr_t)image);
+    }
 }
 
 static size_t mock_format_bpp(VkFormat fmt) {
@@ -384,6 +436,9 @@ static void VKAPI_CALL mock_vkGetImageMemoryRequirements(VkDevice device, VkImag
     MockImage_T *img = (MockImage_T*)(uintptr_t)image;
     pReqs->alignment = 256;
     pReqs->memoryTypeBits = 0x7; /* Types 0, 1, 2 */
+    if (g_mockImageTypeBitsOverrideOn) {
+        pReqs->memoryTypeBits = g_mockImageTypeBitsOverride;
+    }
     if (img) {
         VkDeviceSize bpp = mock_format_bpp(img->format);
         uint32_t layers = img->arrayLayers ? img->arrayLayers : 1;
@@ -396,13 +451,19 @@ static void VKAPI_CALL mock_vkGetImageMemoryRequirements(VkDevice device, VkImag
 
 static VkResult VKAPI_CALL mock_vkCreateImageView(VkDevice device, const VkImageViewCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkImageView* pView) {
     (void)device; (void)pCreateInfo; (void)pAllocator;
+    if (g_mockFailCreateImageView > 0) {
+        g_mockFailCreateImageView--;
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
     static uint64_t s_viewId = 0x6000;
     *pView = reinterpret_cast<VkImageView>((uintptr_t)++s_viewId);
+    g_mockLiveViews++;
     return VK_SUCCESS;
 }
 
 static void VKAPI_CALL mock_vkDestroyImageView(VkDevice device, VkImageView imageView, const VkAllocationCallbacks* pAllocator) {
-    (void)device; (void)imageView; (void)pAllocator;
+    (void)device; (void)pAllocator;
+    if (imageView) g_mockLiveViews--;
 }
 
 static VkResult VKAPI_CALL mock_vkCreateBuffer(VkDevice device, const VkBufferCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkBuffer* pBuffer) {
@@ -429,11 +490,16 @@ static void VKAPI_CALL mock_vkGetBufferMemoryRequirements(VkDevice device, VkBuf
 
 static VkResult VKAPI_CALL mock_vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* pAllocateInfo, const VkAllocationCallbacks* pAllocator, VkDeviceMemory* pMemory) {
     (void)device; (void)pAllocator;
+    g_mockAllocateCalls++;
+    if (pAllocateInfo && pAllocateInfo->memoryTypeIndex >= 3) {
+        g_mockSawInvalidAllocType = 1;
+    }
     MockMemory_T *mem = (MockMemory_T*)calloc(1, sizeof(MockMemory_T));
     mem->size = pAllocateInfo->allocationSize;
     mem->memoryTypeIndex = pAllocateInfo->memoryTypeIndex;
     mem->data = calloc(1, mem->size);
     *pMemory = (VkDeviceMemory)(uintptr_t)mem;
+    g_mockLiveMemory++;
     return VK_SUCCESS;
 }
 
@@ -441,6 +507,7 @@ static void VKAPI_CALL mock_vkFreeMemory(VkDevice device, VkDeviceMemory memory,
     (void)device; (void)pAllocator;
     MockMemory_T *mem = (MockMemory_T*)(uintptr_t)memory;
     if (mem) {
+        g_mockLiveMemory--;
         if (mem->data) free(mem->data);
         free(mem);
     }
@@ -459,6 +526,10 @@ static VkResult VKAPI_CALL mock_vkBindBufferMemory(VkDevice device, VkBuffer buf
 
 static VkResult VKAPI_CALL mock_vkBindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
     (void)device;
+    if (g_mockFailBindImageMemory > 0) {
+        g_mockFailBindImageMemory--;
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
     MockImage_T *img = (MockImage_T*)(uintptr_t)image;
     MockMemory_T *mem = (MockMemory_T*)(uintptr_t)memory;
     if (img && mem) {
@@ -600,7 +671,15 @@ static void VKAPI_CALL mock_vkCmdClearAttachments(VkCommandBuffer commandBuffer,
 }
 
 static void VKAPI_CALL mock_vkCmdPipelineBarrier(VkCommandBuffer commandBuffer, VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage, VkDependencyFlags depFlags, uint32_t memCount, const VkMemoryBarrier* pMem, uint32_t bufCount, const VkBufferMemoryBarrier* pBuf, uint32_t imgCount, const VkImageMemoryBarrier* pImg) {
-    (void)commandBuffer; (void)srcStage; (void)dstStage; (void)depFlags; (void)memCount; (void)pMem; (void)bufCount; (void)pBuf; (void)imgCount; (void)pImg;
+    (void)commandBuffer; (void)srcStage; (void)dstStage; (void)depFlags; (void)memCount; (void)pMem; (void)bufCount; (void)pBuf;
+    /* Record barriers against images with no bound memory: invalid usage
+     * that the context-init hardening must never produce. */
+    if (pImg) {
+        for (uint32_t i = 0; i < imgCount; ++i) {
+            MockImage_T *img = (MockImage_T*)(uintptr_t)pImg[i].image;
+            if (img && !img->memory) g_mockUnboundImageUses++;
+        }
+    }
 }
 
 static void VKAPI_CALL mock_vkCmdCopyBuffer(VkCommandBuffer commandBuffer, VkBuffer src, VkBuffer dst, uint32_t count, const VkBufferCopy* pRegions) {
@@ -629,6 +708,7 @@ static void VKAPI_CALL mock_vkCmdCopyBufferToImage(VkCommandBuffer commandBuffer
     (void)commandBuffer; (void)layout;
     MockBuffer_T *s = (MockBuffer_T*)(uintptr_t)src;
     MockImage_T *d = (MockImage_T*)(uintptr_t)dst;
+    if (d && !d->memory) g_mockUnboundImageUses++;
     if (s && d && s->memory && d->memory) {
         size_t bpp = mock_format_bpp(d->format);
         for (uint32_t i = 0; i < count; ++i) {

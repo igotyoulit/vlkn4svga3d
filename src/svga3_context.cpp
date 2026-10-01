@@ -297,26 +297,59 @@ VlknContext::VlknContext(VlknBackend *backend, VlknSurfaceManager *surfaceMgr, u
     imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
     imgInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    m_backend->dispatch().vkCreateImage(m_backend->device(), &imgInfo, nullptr, &m_dummyImage);
-
-    VkMemoryRequirements memReqs;
-    m_backend->dispatch().vkGetImageMemoryRequirements(m_backend->device(), m_dummyImage, &memReqs);
-    int memType = m_backend->findMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (memType >= 0) {
-        if (m_backend->allocateMemory(memReqs.size, memType, &m_dummyMemory) == SVGA3_VLKN_SUCCESS) {
-            m_backend->dispatch().vkBindImageMemory(m_backend->device(), m_dummyImage, m_dummyMemory, 0);
+    /* Create one 1x1 sampled image with every step checked. Any failure —
+     * no suitable memory type, allocation, bind, or view creation —
+     * releases whatever was created and nulls all three handles, so the
+     * caller can skip layout initialization for that image and the
+     * destructor (which null-checks every handle) stays safe. Previously
+     * these results were unchecked: a failed bind or a missing memory
+     * type left an image with no bound memory that layout barriers and
+     * buffer copies were then recorded against. */
+    auto createUnitImage = [&](VkImage *outImage, VkDeviceMemory *outMemory, VkImageView *outView) -> bool {
+        VlknDispatchTable &disp = m_backend->dispatch();
+        VkDevice device = m_backend->device();
+        if (disp.vkCreateImage(device, &imgInfo, nullptr, outImage) != VK_SUCCESS) {
+            *outImage = VK_NULL_HANDLE;
+            return false;
         }
-    }
+        VkMemoryRequirements reqs;
+        disp.vkGetImageMemoryRequirements(device, *outImage, &reqs);
+        int type = m_backend->findMemoryType(reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        bool ok = type >= 0
+            && m_backend->allocateMemory(reqs.size, (uint32_t)type, outMemory) == SVGA3_VLKN_SUCCESS
+            && disp.vkBindImageMemory(device, *outImage, *outMemory, 0) == VK_SUCCESS;
+        if (ok) {
+            VkImageViewCreateInfo unitViewInfo = {};
+            unitViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            unitViewInfo.image = *outImage;
+            unitViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            unitViewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+            unitViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            unitViewInfo.subresourceRange.levelCount = 1;
+            unitViewInfo.subresourceRange.layerCount = 1;
+            ok = disp.vkCreateImageView(device, &unitViewInfo, nullptr, outView) == VK_SUCCESS;
+        }
+        if (!ok) {
+            if (*outView) {
+                disp.vkDestroyImageView(device, *outView, nullptr);
+                *outView = VK_NULL_HANDLE;
+            }
+            if (*outImage) {
+                disp.vkDestroyImage(device, *outImage, nullptr);
+                *outImage = VK_NULL_HANDLE;
+            }
+            if (*outMemory) {
+                m_backend->freeMemory(*outMemory);
+                *outMemory = VK_NULL_HANDLE;
+            }
+        }
+        return ok;
+    };
 
-    VkImageViewCreateInfo viewInfo = {};
-    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    viewInfo.image = m_dummyImage;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
-    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    viewInfo.subresourceRange.levelCount = 1;
-    viewInfo.subresourceRange.layerCount = 1;
-    m_backend->dispatch().vkCreateImageView(m_backend->device(), &viewInfo, nullptr, &m_dummyView);
+    bool dummyOk = createUnitImage(&m_dummyImage, &m_dummyMemory, &m_dummyView);
+    if (!dummyOk) {
+        log_msg("[libqemu_svga3d] context init: dummy image creation failed; unbound-stage sampling fallback unavailable\n");
+    }
 
     VkSamplerCreateInfo sampInfo = {};
     sampInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -326,93 +359,98 @@ VlknContext::VlknContext(VlknBackend *backend, VlknSurfaceManager *surfaceMgr, u
     sampInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sampInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sampInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    m_backend->dispatch().vkCreateSampler(m_backend->device(), &sampInfo, nullptr, &m_dummySampler);
+    if (m_backend->dispatch().vkCreateSampler(m_backend->device(), &sampInfo, nullptr, &m_dummySampler) != VK_SUCCESS) {
+        log_msg("[libqemu_svga3d] context init: vkCreateSampler failed for dummy sampler\n");
+        m_dummySampler = VK_NULL_HANDLE;
+    }
 
-    /* Initialize m_dummyImage to SHADER_READ_ONLY_OPTIMAL layout with a cleared white pixel */
+    /* Initialize m_dummyImage to SHADER_READ_ONLY_OPTIMAL layout with a cleared white pixel.
+     * Skipped entirely when creation failed above: recording barriers or
+     * copies against an image with no bound memory is invalid usage. */
     VkCommandBuffer initCb = m_backend->getActiveCommandBuffer();
     VkImageMemoryBarrier dummyBarrier = {};
     dummyBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    dummyBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    dummyBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    dummyBarrier.srcAccessMask = 0;
-    dummyBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    dummyBarrier.image = m_dummyImage;
     dummyBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    dummyBarrier.subresourceRange.baseMipLevel = 0;
     dummyBarrier.subresourceRange.levelCount = 1;
-    dummyBarrier.subresourceRange.baseArrayLayer = 0;
     dummyBarrier.subresourceRange.layerCount = 1;
+    if (dummyOk) {
+        dummyBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        dummyBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        dummyBarrier.srcAccessMask = 0;
+        dummyBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        dummyBarrier.image = m_dummyImage;
+        dummyBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        dummyBarrier.subresourceRange.baseMipLevel = 0;
+        dummyBarrier.subresourceRange.levelCount = 1;
+        dummyBarrier.subresourceRange.baseArrayLayer = 0;
+        dummyBarrier.subresourceRange.layerCount = 1;
 
-    m_backend->dispatch().vkCmdPipelineBarrier(
-        initCb,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &dummyBarrier
-    );
+        m_backend->dispatch().vkCmdPipelineBarrier(
+            initCb,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &dummyBarrier
+        );
 
-    if (m_backend->stagingBuffer() && m_backend->stagingMapped()) {
-        std::lock_guard<std::mutex> lock(m_backend->stagingMutex());
-        uint32_t white = 0xFFFFFFFF;
-        memcpy(m_backend->stagingMapped(), &white, sizeof(white));
-        VkBufferImageCopy region = {};
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.layerCount = 1;
-        region.imageExtent = { 1, 1, 1 };
-        m_backend->dispatch().vkCmdCopyBufferToImage(
-            initCb, m_backend->stagingBuffer(), m_dummyImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region
+        if (m_backend->stagingBuffer() && m_backend->stagingMapped()) {
+            std::lock_guard<std::mutex> lock(m_backend->stagingMutex());
+            uint32_t white = 0xFFFFFFFF;
+            memcpy(m_backend->stagingMapped(), &white, sizeof(white));
+            VkBufferImageCopy region = {};
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = { 1, 1, 1 };
+            m_backend->dispatch().vkCmdCopyBufferToImage(
+                initCb, m_backend->stagingBuffer(), m_dummyImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region
+            );
+        }
+
+        dummyBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        dummyBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        dummyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        dummyBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        m_backend->dispatch().vkCmdPipelineBarrier(
+            initCb,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &dummyBarrier
         );
     }
 
-    dummyBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    dummyBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    dummyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    dummyBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-    m_backend->dispatch().vkCmdPipelineBarrier(
-        initCb,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &dummyBarrier
-    );
-
     /* White 1x1 for a stage the guest bound before its image view exists. */
-    m_backend->dispatch().vkCreateImage(m_backend->device(), &imgInfo, nullptr, &m_whiteImage);
-    m_backend->dispatch().vkGetImageMemoryRequirements(m_backend->device(), m_whiteImage, &memReqs);
-    memType = m_backend->findMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (memType >= 0) {
-        if (m_backend->allocateMemory(memReqs.size, memType, &m_whiteMemory) == SVGA3_VLKN_SUCCESS) {
-            m_backend->dispatch().vkBindImageMemory(m_backend->device(), m_whiteImage, m_whiteMemory, 0);
+    bool whiteOk = createUnitImage(&m_whiteImage, &m_whiteMemory, &m_whiteView);
+    if (!whiteOk) {
+        log_msg("[libqemu_svga3d] context init: white image creation failed; unbound-stage sampling fallback unavailable\n");
+    }
+    if (whiteOk) {
+        dummyBarrier.image = m_whiteImage;
+        dummyBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        dummyBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        dummyBarrier.srcAccessMask = 0;
+        dummyBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        m_backend->dispatch().vkCmdPipelineBarrier(
+            initCb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &dummyBarrier);
+        if (m_backend->stagingBuffer() && m_backend->stagingMapped()) {
+            std::lock_guard<std::mutex> lock(m_backend->stagingMutex());
+            uint32_t white = 0xFFFFFFFF;
+            memcpy(m_backend->stagingMapped(), &white, sizeof(white));
+            VkBufferImageCopy region = {};
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = { 1, 1, 1 };
+            m_backend->dispatch().vkCmdCopyBufferToImage(
+                initCb, m_backend->stagingBuffer(), m_whiteImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
         }
+        dummyBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        dummyBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        dummyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        dummyBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        m_backend->dispatch().vkCmdPipelineBarrier(
+            initCb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &dummyBarrier);
     }
-    viewInfo.image = m_whiteImage;
-    m_backend->dispatch().vkCreateImageView(m_backend->device(), &viewInfo, nullptr, &m_whiteView);
-
-    dummyBarrier.image = m_whiteImage;
-    dummyBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    dummyBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    dummyBarrier.srcAccessMask = 0;
-    dummyBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    m_backend->dispatch().vkCmdPipelineBarrier(
-        initCb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &dummyBarrier);
-    if (m_backend->stagingBuffer() && m_backend->stagingMapped()) {
-        std::lock_guard<std::mutex> lock(m_backend->stagingMutex());
-        uint32_t white = 0xFFFFFFFF;
-        memcpy(m_backend->stagingMapped(), &white, sizeof(white));
-        VkBufferImageCopy region = {};
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.layerCount = 1;
-        region.imageExtent = { 1, 1, 1 };
-        m_backend->dispatch().vkCmdCopyBufferToImage(
-            initCb, m_backend->stagingBuffer(), m_whiteImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    }
-    dummyBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    dummyBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    dummyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    dummyBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    m_backend->dispatch().vkCmdPipelineBarrier(
-        initCb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &dummyBarrier);
 
     m_backend->flushCommandBuffer();
 
@@ -2096,6 +2134,9 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         } else {
             imageInfos[i].imageView = m_whiteView;
             imageInfos[i].sampler = m_dummySampler;
+        }
+        if (!imageInfos[i].imageView || !imageInfos[i].sampler) {
+            return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
         }
         m_boundImageViews[i] = imageInfos[i].imageView;
         m_boundSamplers[i] = imageInfos[i].sampler;
