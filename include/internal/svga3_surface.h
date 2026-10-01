@@ -58,6 +58,7 @@ public:
     VkImageView imageView() const { return m_imageView; }
     VkImageView getRenderTargetView(uint32_t mip, uint32_t face);
     VkImageLayout currentLayout() const { return m_currentLayout; }
+    void transitionLayout(VkCommandBuffer cb, VkImageLayout layout);
     void setLayout(VkImageLayout layout) { m_currentLayout = layout; }
 
     VkBuffer buffer() const { return m_buffer; }

@@ -583,6 +583,19 @@ int main() {
         TEST_CHECK(module_builtin_count(spirv, 17) == 0, "plain PS declares no FrontFacing builtin");
     }
 
+    // Mesa emits SLT for the time conditions in glmark2 Ideas' vertex shaders.
+    {
+        const uint32_t vs[] = {
+            0xfffe0300, (31)|(2<<24), 0x80000000, D3D9_DST(1,0,15),
+            (31)|(2<<24), 0x80000000, D3D9_DST(6,0,15),
+            (12)|(3<<24), D3D9_DST(0,0,15), D3D9_SRC(2,0,0xe4), D3D9_SRC(2,1,0xe4),
+            (1)|(2<<24), D3D9_DST(6,0,15), D3D9_SRC(0,0,0xe4), 0xffff
+        };
+        std::vector<uint32_t> spirv;std::string err;
+        TEST_CHECK(svga3_translate_shader_d3d9(SVGA3D_SHADERTYPE_VS,vs,sizeof(vs)/4,spirv,err)==SVGA3_VLKN_SUCCESS,"SLT vertex condition translates");
+        TEST_CHECK_SPIRV(spirv,"slt","SLT vertex condition passes spirv-val");
+    }
+
     /* Stage A opcodes: SGE / EXP / POW / SINCOS / DEFI-adjacent float ops.
      * Asserts translation, spirv-val, the concrete SPIR-V ops emitted, and
      * that the SGE comparison result actually reaches oC0 (derivation chain
@@ -812,16 +825,16 @@ int main() {
         };
         TEST_CHECK(rejected(setpBadRelop, sizeof(setpBadRelop)/sizeof(uint32_t), SVGA3D_SHADERTYPE_PS),
                    "SETP with an invalid comparison function is rejected");
-        const uint32_t predMovToOutput[] = {
+        const uint32_t predMovToConstant[] = {
             0xFFFF0300,
-            (1) | (3 << 24) | (1u << 28), // (p0) MOV oC0, c0 — outputs cannot be read back
-            D3D9_DST(D3DSPR_COLOROUT_VAL, 0, 0xF),
+            (1) | (3 << 24) | (1u << 28), // (p0) MOV c1, c0 — constants are read-only
+            D3D9_DST(D3DSPR_CONST_VAL, 1, 0xF),
             D3D9_SRC(D3DSPR_PREDICATE_VAL, 0, 0xE4),
             D3D9_SRC(D3DSPR_CONST_VAL, 0, 0xE4),
             0x0000FFFF
         };
-        TEST_CHECK(rejected(predMovToOutput, sizeof(predMovToOutput)/sizeof(uint32_t), SVGA3D_SHADERTYPE_PS),
-                   "Predicated MOV to a non-temp destination is rejected");
+        TEST_CHECK(rejected(predMovToConstant, sizeof(predMovToConstant)/sizeof(uint32_t), SVGA3D_SHADERTYPE_PS),
+                   "Predicated MOV to a read-only destination is rejected");
     }
 
     std::cout << "All ICD-free translator tests PASSED!" << std::endl;
