@@ -7,12 +7,17 @@
 #include <cstring>
 #include <iostream>
 #include <mutex>
+#include <cstdlib>
 
 extern "C" void log_msg(const char *fmt, ...);
 
 namespace svga3_vlkn {
 
 static void blitClientSurfaceToFramebuffer(Svga3VlknDevice *dev, uint32_t cid, uint32_t sid, const char *reason) {
+    /* Legacy application guessing can overwrite a correctly positioned guest
+     * window. Normal scanout follows explicit guest presentation commands. */
+    const char *legacy = std::getenv("SVGA3_VLKN_LEGACY_CLIENT_PRESENT");
+    if (!legacy || std::strcmp(legacy, "1") != 0) return;
     if (!dev || !dev->guestMem || !dev->surfaceMgr || sid == 0 || sid == SVGA3D_INVALID_ID) return;
     VlknSurface *surf = dev->surfaceMgr->getSurface(sid);
     /* Cursors are 64 or smaller. A window can be as small as the OpenGL test. */

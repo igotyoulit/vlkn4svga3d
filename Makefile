@@ -1,5 +1,5 @@
 CXX ?= g++
-CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -pthread -fPIC
+CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -pthread -fPIC -MMD -MP
 
 DEFINES = \
     -DVBOX \
@@ -218,3 +218,6 @@ dump: $(ORACLE_TARGET) | $(DATA_DIR)
 
 clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR) $(LIB_DIR)
+
+# Track transitive headers to prevent stale objects after interface changes.
+-include $(wildcard $(BUILD_DIR)/*.d)

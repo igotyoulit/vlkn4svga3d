@@ -4,9 +4,11 @@ An experimental SVGA3D-to-Vulkan rendering library and QEMU integration prototyp
 
 **Work in progress — incomplete and not production-ready.** This is a source snapshot, not a finished virtual GPU or a drop-in replacement for VMware graphics. Shader, format, state, and guest compatibility are not comprehensively verified. Minecraft has reached an in-game world in the PlayBook guest. Recorded September 24 screenshots show terrain, the hotbar, and a textured player hand after integration fixes. A September 25 live check identified the Intel HD Graphics 630 Vulkan driver and measured GPU activity. This is a narrow compatibility milestone, not comprehensive visual validation or a cold-boot reliability guarantee. No general compatibility or performance guarantee is made.
 
-## Warning:
+## QEMU lab adapter
 
-Currently runs as root on the host!
+The preload adapter supports one allowlisted QEMU build and checks instruction bytes before patching. Use it only for the designated VM; never configure global `LD_PRELOAD`. The tested Proxmox VM runs QEMU as `qemu119` and guest graphics as `svga3d`.
+
+Set `SVGA3_VLKN_VALIDATE=1` to request Vulkan validation layers; initialization fails if they cannot be activated. Portrait mode overrides require `SVGA3_VLKN_GUEST_PROFILE=playbook-portrait`; normal guests use their requested mode. Framebuffer GPA comes from the device register. Application-context centering is disabled by default; the old heuristic is available only with `SVGA3_VLKN_LEGACY_CLIENT_PRESENT=1`. Guest-RAM discovery still uses a lab-only mapping heuristic; official QEMU integration remains follow-up work.
 
 ## What is included
 

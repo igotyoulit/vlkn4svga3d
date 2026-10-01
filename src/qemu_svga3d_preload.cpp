@@ -51,6 +51,7 @@
 #define ADDR_VNC_CONT                 0x3c2350
 #define ADDR_QEMU_INPUT_UPDATE_BUTTONS 0x3b4510
 #define ADDR_QEMU_INPUT_QUEUE_REL     0x3b4670
+#define ADDR_QEMU_INPUT_QUEUE_ABS     0x3b4700
 #define ADDR_QEMU_INPUT_EVENT_SYNC    0x3b3f20
 #define ADDR_VNC_BUTTON_MAP           0x1b4a3a0
 
@@ -64,10 +65,9 @@
 #define INPUT_AXIS_Y                  1
 #define VNC_LEFT_BUTTON               1
 #define REL_STEP                      40
-#define HOME_STEPS                    24
 #define TAP_DWELL_NS                  150000000LL
 #define SCREEN_W                      1280
-#define SCREEN_H                      768
+#define SCREEN_H                      800
 
 /* SVGA Capabilities Advertised to Guest (0x00d2c0e3):
  * Bit 0: RECT_COPY (0x01)
@@ -131,6 +131,7 @@ static uint64_t (*orig_io_read)(void *opaque, uint64_t addr, unsigned size) = NU
 static void (*orig_io_write)(void *opaque, uint64_t addr, uint64_t data, unsigned size) = NULL;
 static void (*orig_input_update_buttons)(void *con, uint32_t *map, uint32_t old, uint32_t newm) = NULL;
 static void (*orig_input_queue_rel)(void *con, int axis, int value) = NULL;
+static void (*orig_input_queue_abs)(void *con, int axis, int value, int min, int max) = NULL;
 static void (*orig_input_event_sync)(void) = NULL;
 
 /* Input & Pointer State */
@@ -154,6 +155,13 @@ static void *g_guest_ram_base = nullptr;
 static size_t g_guest_ram_size = 0;
 static bool g_vlkn_initialized = false;
 static std::mutex g_vlkn_mutex;
+static bool portrait_profile_enabled() {
+    const char *profile = getenv("SVGA3_VLKN_GUEST_PROFILE");
+    return profile && strcmp(profile, "playbook-portrait") == 0;
+}
+
+static SVGAFifoCmdDefineGMRFB g_display_gmrfb = {};
+static bool g_display_gmrfb_defined = false;
 
 extern "C" void log_msg(const char *fmt, ...) {
     if (!log_file) {
@@ -186,6 +194,15 @@ static uint32_t reg_value(void *s, int index) {
     return value;
 }
 
+static void set_qemu_reg_value(void *s, int index, uint32_t value) {
+    int *reg = (int *)((char *)s + OFFSET_INDEX);
+    int saved = *reg;
+    *reg = index;
+    /* Call QEMU's original port handler so its legacy VGA scanout is resized. */
+    orig_io_write(s, 1, value, 4);
+    *reg = saved;
+}
+
 static void redraw(void *s, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     int *last = (int *)((char *)s + OFFSET_REDRAW_FIFO_LAST);
     struct vmsvga_rect_s *rects = (struct vmsvga_rect_s *)((char *)s + OFFSET_REDRAW_FIFO);
@@ -215,6 +232,61 @@ static bool draw_rect(void *s, bool copy, uint32_t color,
         else for (uint32_t col = 0; col < w; col++) memcpy(dst + (size_t)col * bytes, &color, bytes);
     }
     redraw(s, x, y, w, h);
+    return true;
+}
+
+/* vmwgfx renders the desktop into a guest framebuffer and then submits a
+ * BLIT_GMRFB_TO_SCREEN command. QEMU's normal SVGA handler performs this DMA
+ * copy into the legacy scanout surface; this preload consumes the command,
+ * so reproduce the primary-screen 32-bit path here. */
+static bool blit_gmrfb_to_legacy(void *s,
+                                 int32_t src_x, int32_t src_y,
+                                 int32_t left, int32_t top,
+                                 int32_t right, int32_t bottom,
+                                 uint32_t screen_id) {
+    if (!s || (screen_id != 0 && screen_id != SVGA_ID_INVALID) || !g_display_gmrfb_defined ||
+        g_display_gmrfb.ptr.gmrId != SVGA_GMR_FRAMEBUFFER ||
+        g_display_gmrfb.format.s.bitsPerPixel != 32 ||
+        g_display_gmrfb.format.s.colorDepth != 24 ||
+        right <= left || bottom <= top || src_x < 0 || src_y < 0) {
+        return false;
+    }
+
+    uint32_t width = reg_value(s, SVGA_REG_WIDTH);
+    uint32_t height = reg_value(s, SVGA_REG_HEIGHT);
+    uint32_t dst_pitch = reg_value(s, SVGA_REG_BYTES_PER_LINE);
+    uint32_t vram_size = reg_value(s, SVGA_REG_VRAM_SIZE);
+    uint8_t *vram = *(uint8_t **)((char *)s + 8);
+    const uint32_t src_pitch = g_display_gmrfb.bytesPerLine;
+    const uint64_t src_base = g_display_gmrfb.ptr.offset;
+    if (!vram || !width || !height || !dst_pitch || !vram_size ||
+        !src_pitch || (uint64_t)width * 4 > dst_pitch ||
+        (uint64_t)height * dst_pitch > vram_size ||
+        (uint64_t)(uint32_t)src_x * 4 >= src_pitch) {
+        return false;
+    }
+
+    int64_t x0 = std::max<int64_t>(left, 0);
+    int64_t y0 = std::max<int64_t>(top, 0);
+    int64_t x1 = std::min<int64_t>(right, width);
+    int64_t y1 = std::min<int64_t>(bottom, height);
+    if (x0 >= x1 || y0 >= y1) return true;
+
+    /* Clipping the destination's left/top also advances the source origin. */
+    int64_t sx = (int64_t)src_x + (x0 - left);
+    int64_t sy = (int64_t)src_y + (y0 - top);
+    uint64_t row_bytes = (uint64_t)(x1 - x0) * 4;
+    if (sx < 0 || sy < 0 || (uint64_t)sx * 4 + row_bytes > src_pitch) return false;
+
+    for (int64_t row = 0; row < y1 - y0; ++row) {
+        uint64_t src_offset = src_base + (uint64_t)(sy + row) * src_pitch + (uint64_t)sx * 4;
+        uint64_t dst_offset = (uint64_t)(y0 + row) * dst_pitch + (uint64_t)x0 * 4;
+        if (src_offset > vram_size || row_bytes > vram_size - src_offset ||
+            dst_offset > vram_size || row_bytes > vram_size - dst_offset) {
+            return false;
+        }
+        memmove(vram + dst_offset, vram + src_offset, (size_t)row_bytes);
+    }
     return true;
 }
 
@@ -265,7 +337,8 @@ static void ensure_vlkn_device(void *s) {
     cfg.apiVersion = VK_API_VERSION_1_0;
     cfg.stagingBufferSize = 64 * 1024 * 1024;
     cfg.forceMockBackend = false;
-    cfg.enableValidationLayers = false;
+    const char *validate = getenv("SVGA3_VLKN_VALIDATE");
+    cfg.enableValidationLayers = validate && strcmp(validate, "1") == 0;
 
     g_vlknDev = svga3_vlkn_device_create(&cfg);
     if (!g_vlknDev) {
@@ -280,9 +353,9 @@ static void ensure_vlkn_device(void *s) {
     }
 
     uint32_t width = reg_value(s, SVGA_REG_WIDTH);
-    if (!width || width == 768) width = SCREEN_W;
+    if (!width || (portrait_profile_enabled() && width == 768)) width = SCREEN_W;
     uint32_t height = reg_value(s, SVGA_REG_HEIGHT);
-    if (!height || height == 1280) height = SCREEN_H;
+    if (!height || (portrait_profile_enabled() && height == 1280)) height = SCREEN_H;
     uint32_t pitch = reg_value(s, SVGA_REG_BYTES_PER_LINE);
     if (!pitch) pitch = width * 4;
     uint32_t bpp = reg_value(s, SVGA_REG_BITS_PER_PIXEL);
@@ -293,7 +366,7 @@ static void ensure_vlkn_device(void *s) {
     log_msg("[libqemu_svga3d] Framebuffer init: vram=%p w=%u h=%u pitch=%u bpp=%u vram_size=%u\n",
             vram, width, height, pitch, bpp, vram_size);
 
-    svga3_vlkn_device_set_framebuffer(g_vlknDev, vram, 0xE0000000, vram_size, width, height, pitch, bpp / 8);
+    svga3_vlkn_device_set_framebuffer(g_vlknDev, vram, reg_value(s, SVGA_REG_FB_START), vram_size, width, height, pitch, bpp / 8);
     svga3_vlkn_device_set_display_callback(g_vlknDev, s, vlkn_display_update_cb);
 
     g_vlkn_initialized = true;
@@ -362,8 +435,8 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
 
     uint32_t cur_w = reg_value(s, SVGA_REG_WIDTH);
     uint32_t cur_h = reg_value(s, SVGA_REG_HEIGHT);
-    if (cur_w == 768) cur_w = SCREEN_W;
-    if (cur_h == 1280) cur_h = SCREEN_H;
+    if (portrait_profile_enabled() && cur_w == 768) cur_w = SCREEN_W;
+    if (portrait_profile_enabled() && cur_h == 1280) cur_h = SCREEN_H;
     uint32_t cur_p = reg_value(s, SVGA_REG_BYTES_PER_LINE);
     if (!cur_p) cur_p = cur_w * 4;
     static uint32_t s_last_w = 0, s_last_h = 0, s_last_p = 0;
@@ -374,7 +447,7 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
         uint32_t vram_sz = reg_value(s, SVGA_REG_VRAM_SIZE);
         if (!vram_sz) vram_sz = 128 * 1024 * 1024;
         uint8_t *vram = *(uint8_t **)((char *)s + 8);
-        svga3_vlkn_device_set_framebuffer(g_vlknDev, vram, 0xE0000000, vram_sz, cur_w, cur_h, cur_p, bpp / 8);
+        svga3_vlkn_device_set_framebuffer(g_vlknDev, vram, reg_value(s, SVGA_REG_FB_START), vram_sz, cur_w, cur_h, cur_p, bpp / 8);
         log_msg("[libqemu_svga3d] Display mode synchronized: w=%u h=%u pitch=%u bpp=%u\n", cur_w, cur_h, cur_p, bpp);
     }
 
@@ -525,29 +598,67 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
                 log_msg("[libqemu_svga3d] DEFINE_SCREEN: id=%u flags=0x%x size=%ux%u pos=(%d,%d)\n",
                         screenId, flags, sw, sh, sx, sy);
                 if (sw > 0 && sh > 0 && !(flags & SVGA_SCREEN_DEACTIVATE)) {
+                    uint32_t pitch = (structSize >= sizeof(uint32_t) * 9) ? P(10) : 0;
+                    if (screenId == 0) {
+                        /*
+                         * This shim consumes screen-object commands instead
+                         * of passing them to QEMU's FIFO parser. Mirror the
+                         * primary mode into QEMU's legacy SVGA registers so
+                         * its DisplaySurface (and VNC/noVNC) gets a scanout.
+                         */
+                        set_qemu_reg_value(s, SVGA_REG_WIDTH, sw);
+                        set_qemu_reg_value(s, SVGA_REG_HEIGHT, sh);
+                        if (pitch) set_qemu_reg_value(s, SVGA_REG_BYTES_PER_LINE, pitch);
+                        log_msg("[libqemu_svga3d] Mirrored primary screen mode to legacy scanout: %ux%u pitch=%u\n",
+                                sw, sh, pitch);
+                    }
                     redraw(s, (sx < 0) ? 0 : (uint32_t)sx, (sy < 0) ? 0 : (uint32_t)sy, sw, sh);
                     if (g_vlknDev && screenId == 0) {
-                        uint32_t pitch = (structSize >= sizeof(uint32_t) * 9) ? P(10) : 0;
                         if (!pitch) pitch = sw * 4;
                         uint8_t *vram = *(uint8_t **)((char *)s + 8);
                         uint32_t vram_sz = reg_value(s, SVGA_REG_VRAM_SIZE);
                         if (!vram_sz) vram_sz = 128 * 1024 * 1024;
-                        svga3_vlkn_device_set_framebuffer(g_vlknDev, vram, 0xE0000000, vram_sz, sw, sh, pitch, 4);
+                        svga3_vlkn_device_set_framebuffer(g_vlknDev, vram, reg_value(s, SVGA_REG_FB_START), vram_sz, sw, sh, pitch, 4);
                     }
                 }
             }
         } else if (cmd == SVGA_CMD_DESTROY_SCREEN) {
             log_msg("[libqemu_svga3d] DESTROY_SCREEN: id=%u\n", P(1));
         } else if (cmd == SVGA_CMD_DEFINE_GMRFB) {
+            g_display_gmrfb.ptr.gmrId = P(1);
+            g_display_gmrfb.ptr.offset = P(2);
+            g_display_gmrfb.bytesPerLine = P(3);
+            g_display_gmrfb.format.value = P(4);
+            g_display_gmrfb_defined = true;
             log_msg("[libqemu_svga3d] DEFINE_GMRFB: gmrId=%u offset=0x%x bytesPerLine=%u format=0x%x\n",
-                    P(1), P(2), P(3), P(4));
+                    g_display_gmrfb.ptr.gmrId, g_display_gmrfb.ptr.offset,
+                    g_display_gmrfb.bytesPerLine, g_display_gmrfb.format.value);
         } else if (cmd == SVGA_CMD_BLIT_GMRFB_TO_SCREEN) {
-            int32_t dx = (int32_t)P(3);
-            int32_t dy = (int32_t)P(4);
-            int32_t dw = (int32_t)P(5) - dx;
-            int32_t dh = (int32_t)P(6) - dy;
-            if (dw > 0 && dh > 0 && dx >= 0 && dy >= 0) {
-                redraw(s, (uint32_t)dx, (uint32_t)dy, (uint32_t)dw, (uint32_t)dh);
+            int32_t src_x = (int32_t)P(1);
+            int32_t src_y = (int32_t)P(2);
+            int32_t left = (int32_t)P(3);
+            int32_t top = (int32_t)P(4);
+            int32_t right = (int32_t)P(5);
+            int32_t bottom = (int32_t)P(6);
+            uint32_t screen_id = P(7);
+            bool copied = blit_gmrfb_to_legacy(s, src_x, src_y, left, top, right, bottom, screen_id);
+            static uint32_t blit_log_count = 0;
+            if (blit_log_count++ < 8) {
+                log_msg("[libqemu_svga3d] BLIT_GMRFB_TO_SCREEN #%u: gmr=%u offset=0x%x pitch=%u format=0x%x src=(%d,%d) dst=(%d,%d)-(%d,%d) screen=%u copied=%d\n",
+                        blit_log_count, g_display_gmrfb.ptr.gmrId, g_display_gmrfb.ptr.offset,
+                        g_display_gmrfb.bytesPerLine, g_display_gmrfb.format.value,
+                        src_x, src_y, left, top, right, bottom, screen_id, copied ? 1 : 0);
+            }
+            if (copied &&
+                right > left && bottom > top) {
+                uint32_t width = reg_value(s, SVGA_REG_WIDTH);
+                uint32_t height = reg_value(s, SVGA_REG_HEIGHT);
+                int32_t x0 = std::max<int32_t>(left, 0);
+                int32_t y0 = std::max<int32_t>(top, 0);
+                int32_t x1 = std::min<int32_t>(right, width);
+                int32_t y1 = std::min<int32_t>(bottom, height);
+                if (x1 > x0 && y1 > y0)
+                    redraw(s, (uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
             }
         } else if (cmd == SVGA_CMD_BLIT_SCREEN_TO_GMRFB) {
             log_msg("[libqemu_svga3d] BLIT_SCREEN_TO_GMRFB\n");
@@ -714,10 +825,10 @@ extern "C" void my_vmsvga_io_write(void *opaque, uint64_t addr, uint64_t data, u
         case SVGA_REG_BYTES_PER_LINE:
         case SVGA_REG_WIDTH:
         case SVGA_REG_HEIGHT: {
-            if (index == SVGA_REG_WIDTH && data == 768) {
+            if (portrait_profile_enabled() && index == SVGA_REG_WIDTH && data == 768) {
                 log_msg("[libqemu_svga3d] Suppressing portrait SVGA_REG_WIDTH %lu -> %d\n", (unsigned long)data, SCREEN_W);
                 data = SCREEN_W;
-            } else if (index == SVGA_REG_HEIGHT && data == 1280) {
+            } else if (portrait_profile_enabled() && index == SVGA_REG_HEIGHT && data == 1280) {
                 log_msg("[libqemu_svga3d] Suppressing portrait SVGA_REG_HEIGHT %lu -> %d\n", (unsigned long)data, SCREEN_H);
                 data = SCREEN_H;
             }
@@ -725,8 +836,8 @@ extern "C" void my_vmsvga_io_write(void *opaque, uint64_t addr, uint64_t data, u
             if (g_vlknDev && *(int *)((char *)s + OFFSET_ENABLE)) {
                 uint32_t w = reg_value(s, SVGA_REG_WIDTH);
                 uint32_t h = reg_value(s, SVGA_REG_HEIGHT);
-                if (w == 768) w = SCREEN_W;
-                if (h == 1280) h = SCREEN_H;
+                if (portrait_profile_enabled() && w == 768) w = SCREEN_W;
+                if (portrait_profile_enabled() && h == 1280) h = SCREEN_H;
                 uint32_t p = reg_value(s, SVGA_REG_BYTES_PER_LINE);
                 uint32_t bpp = reg_value(s, SVGA_REG_BITS_PER_PIXEL);
                 uint32_t vram_sz = reg_value(s, SVGA_REG_VRAM_SIZE);
@@ -735,7 +846,7 @@ extern "C" void my_vmsvga_io_write(void *opaque, uint64_t addr, uint64_t data, u
                     if (!p) p = w * 4;
                     if (!bpp) bpp = 32;
                     if (!vram_sz) vram_sz = 128 * 1024 * 1024;
-                    svga3_vlkn_device_set_framebuffer(g_vlknDev, vram, 0xE0000000, vram_sz, w, h, p, bpp / 8);
+                    svga3_vlkn_device_set_framebuffer(g_vlknDev, vram, reg_value(s, SVGA_REG_FB_START), vram_sz, w, h, p, bpp / 8);
                 }
             }
             return;
@@ -861,47 +972,29 @@ extern "C" void my_input_event_sync(void) {
     orig_input_event_sync();
 }
 
-static int guest_x, guest_y;
-static bool pointer_homed;
 static uint32_t guest_bmask;
 static uint32_t vnc_bmap[10] = { 0x01, 0x04, 0x02, 0x08, 0x10, 0x20, 0x40 };
 __attribute__((visibility("hidden"))) void *vnc_pointer_cont = NULL;
 
-static void rel_xy(int dx, int dy) {
-    if (dx) orig_input_queue_rel(NULL, INPUT_AXIS_X, dx);
-    if (dy) orig_input_queue_rel(NULL, INPUT_AXIS_Y, dy);
-    orig_input_event_sync();
-}
-
 extern "C" void my_vnc_pointer_event(void *vs, uint32_t button_mask, int x, int y) {
-    int dx, dy;
-    uint32_t prev;
-    if (!vs || !orig_input_queue_rel) return;
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if (x > SCREEN_W - 1) x = SCREEN_W - 1;
-    if (y > SCREEN_H - 1) y = SCREEN_H - 1;
-    if (!pointer_homed) {
-        int i;
-        for (i = 0; i < 25; i++) rel_xy(-100, -100);
-        guest_x = guest_y = 0;
-        pointer_homed = true;
-        log_msg("[libqemu_svga3d] homed default console pointer\n");
-    }
-    while (guest_x != x || guest_y != y) {
-        dx = x - guest_x;
-        dy = y - guest_y;
-        if (dx > REL_STEP) dx = REL_STEP;
-        if (dx < -REL_STEP) dx = -REL_STEP;
-        if (dy > REL_STEP) dy = REL_STEP;
-        if (dy < -REL_STEP) dy = -REL_STEP;
-        rel_xy(dx, dy);
-        guest_x += dx;
-        guest_y += dy;
-    }
-    prev = guest_bmask;
+    if (!vs || !orig_input_queue_abs) return;
+    void *vnc_display = *(void **)((char *)vs + VS_VD);
+    void *con = vnc_display ? *(void **)((char *)vnc_display + VD_CONSOLE) : NULL;
+    const int width = g_vmsvga_state ? static_cast<int>(reg_value(g_vmsvga_state, SVGA_REG_WIDTH)) : SCREEN_W;
+    const int height = g_vmsvga_state ? static_cast<int>(reg_value(g_vmsvga_state, SVGA_REG_HEIGHT)) : SCREEN_H;
+    if (width <= 0 || height <= 0) return;
+    x = std::clamp(x, 0, width - 1);
+    y = std::clamp(y, 0, height - 1);
+    /* QEMU's own VNC handler uses qemu_input_queue_abs for absolute-pointer
+     * devices. Feed the same guest console and coordinate range directly so
+     * the USB tablet and VMware absolute pointer stay aligned with VNC. */
+    orig_input_queue_abs(con, INPUT_AXIS_X, x, 0, width);
+    orig_input_queue_abs(con, INPUT_AXIS_Y, y, 0, height);
+    orig_input_event_sync();
+
+    uint32_t prev = guest_bmask;
     if ((button_mask & VNC_LEFT_BUTTON) && !(prev & VNC_LEFT_BUTTON)) {
-        orig_input_update_buttons(NULL, vnc_bmap, prev, button_mask);
+        orig_input_update_buttons(con, vnc_bmap, prev, button_mask);
         orig_input_event_sync();
         left_down_ns = now_ns();
         log_msg("[libqemu_svga3d] default-console press %d,%d\n", x, y);
@@ -911,11 +1004,11 @@ extern "C" void my_vnc_pointer_event(void *vs, uint32_t button_mask, int x, int 
             struct timespec ts = { 0, (long)remain };
             nanosleep(&ts, NULL);
         }
-        orig_input_update_buttons(NULL, vnc_bmap, prev, button_mask);
+        orig_input_update_buttons(con, vnc_bmap, prev, button_mask);
         orig_input_event_sync();
         log_msg("[libqemu_svga3d] default-console release %d,%d\n", x, y);
     } else if (prev != button_mask) {
-        orig_input_update_buttons(NULL, vnc_bmap, prev, button_mask);
+        orig_input_update_buttons(con, vnc_bmap, prev, button_mask);
         orig_input_event_sync();
     }
     guest_bmask = button_mask;
@@ -986,6 +1079,7 @@ static void svga3d_init(void) {
     const unsigned char expected_fifo[]={0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x55,0x53,0x4c,0x8d,0x9c,0x24};
     const unsigned char expected_btn[]={0xf3,0x0f,0x1e,0xfa,0x41,0x57,0x41,0x56,0x49,0x89,0xfe};
     const unsigned char expected_rel[]={0xf3,0x0f,0x1e,0xfa,0x53,0x48,0x63,0xd2,0x48,0x83,0xec,0x30};
+    const unsigned char expected_abs[]={0xf3,0x0f,0x1e,0xfa,0x53,0x48,0x63,0xc9,0x4d,0x63,0xc0,0xb8};
     const unsigned char expected_sync[]={0xf3,0x0f,0x1e,0xfa,0x48,0x83,0xec,0x08,0xe8};
     const unsigned char expected_ptr[]={0x49,0x8b,0x87,0xa0,0x51,0x01,0x00,0xf3,0x0f,0x7e,0x24,0x24,0x48,0x8b};
     if (memcmp((void *)(qemu_base+ADDR_PCIVMSVGA_REALIZE_SIZE1),expected1,sizeof(expected1)) ||
@@ -993,6 +1087,7 @@ static void svga3d_init(void) {
         memcmp((void *)(qemu_base+ADDR_VMSVGA_FIFO_RUN),expected_fifo,sizeof(expected_fifo)) ||
         memcmp((void *)(qemu_base+ADDR_QEMU_INPUT_UPDATE_BUTTONS),expected_btn,sizeof(expected_btn)) ||
         memcmp((void *)(qemu_base+ADDR_QEMU_INPUT_QUEUE_REL),expected_rel,sizeof(expected_rel)) ||
+        memcmp((void *)(qemu_base+ADDR_QEMU_INPUT_QUEUE_ABS),expected_abs,sizeof(expected_abs)) ||
         memcmp((void *)(qemu_base+ADDR_QEMU_INPUT_EVENT_SYNC),expected_sync,sizeof(expected_sync)) ||
         memcmp((void *)(qemu_base+ADDR_VNC_POINTER),expected_ptr,sizeof(expected_ptr))) {
         fprintf(stderr,"SVGA shim: unexpected instruction bytes; refusing patch\n"); _exit(78);
@@ -1050,6 +1145,7 @@ static void svga3d_init(void) {
 
     orig_input_update_buttons = (void (*)(void *, uint32_t *, uint32_t, uint32_t))make_orig_tramp(qemu_base + ADDR_QEMU_INPUT_UPDATE_BUTTONS, 22, -1, 0);
     orig_input_queue_rel = (void (*)(void *, int, int))make_orig_tramp(qemu_base + ADDR_QEMU_INPUT_QUEUE_REL, 21, -1, 0);
+    orig_input_queue_abs = (void (*)(void *, int, int, int, int))(qemu_base + ADDR_QEMU_INPUT_QUEUE_ABS);
     orig_input_event_sync = (void (*)(void))make_orig_tramp(qemu_base + ADDR_QEMU_INPUT_EVENT_SYNC, 15, 8,
                                                             qemu_base + 0x607150);
     if (!orig_input_update_buttons || !orig_input_queue_rel || !orig_input_event_sync) {
@@ -1073,5 +1169,7 @@ static void svga3d_init(void) {
     }
     install_abs_jmp(qemu_base + ADDR_VNC_POINTER, (void *)vnc_pointer_hook);
     mprotect((void *)page_ptr, 4096 * 2, PROT_READ | PROT_EXEC);
-    log_msg("[libqemu_svga3d] Hooked VNC pointer_event preamble for homing\n");
+    log_msg("[libqemu_svga3d] Hooked VNC pointer preamble with %ux%u absolute mapping\n",
+            SCREEN_W, SCREEN_H);
+
 }
