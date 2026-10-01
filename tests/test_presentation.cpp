@@ -109,6 +109,7 @@ int main() {
     cfg.appName = "Deliverable 5: Presentation Acceptance Test";
     cfg.forceMockBackend = false;
     cfg.enableValidationLayers = true;
+    cfg.stagingBufferSize = 64 * 1024;
 
     Svga3VlknDevice *dev = svga3_vlkn_device_create(&cfg);
     TEST_CHECK(dev != nullptr, "Real Vulkan device creation succeeded");
@@ -126,7 +127,6 @@ int main() {
     const uint32_t FB_W = 160;
     const uint32_t FB_H = 120;
     const uint32_t FB_BPP = 4;
-    const uint32_t FB_PITCH = FB_W * FB_BPP;
     std::vector<Pixel> qemuFb(FB_W * FB_H);
 
     /* Initialize baseline background pattern: Dark Navy Blue (0xFF051025) */
@@ -140,7 +140,7 @@ int main() {
     resetFramebuffer();
 
     Svga3VlknStatus status = svga3_vlkn_device_set_framebuffer(dev, qemuFb.data(), 0xE0000000ULL, qemuFb.size() * sizeof(Pixel),
-                                                              FB_W, FB_H, FB_PITCH, FB_BPP);
+                                                              FB_W, FB_H, FB_W * FB_BPP, FB_BPP);
     TEST_CHECK(status == SVGA3_VLKN_SUCCESS, "Registered emulated QEMU display framebuffer (BAR1)");
 
     status = svga3_vlkn_device_set_display_callback(dev, nullptr, testDisplayUpdateCallback);
@@ -550,8 +550,8 @@ int main() {
     p5.destScreenId = 0;
     p5.destRect = { 10, 10, 70, 70 };
     SVGASignedRect blitClips[2] = {
-        { 15, 15, 35, 35 },
-        { 45, 45, 65, 65 }
+        { 5, 5, 25, 25 },
+        { 35, 35, 55, 55 }
     };
     append5(&cmdBlit, sizeof(cmdBlit));
     append5(&hdrBlit5, sizeof(hdrBlit5));
@@ -648,6 +648,70 @@ int main() {
     TEST_CHECK(offscreenMatches, "Test 6: Visible [0..29, 0..29] correctly matches clipped source [10..39, 10..39]");
     TEST_CHECK(pixelsIdentical(qemuFb[30 * FB_W + 30], BASELINE_PIXEL), "Test 6: Pixel (30, 30) outside destination preserved");
 
+    /* A small visible area of a large image must fit in the staging buffer.
+     * The entire 256x256 image exceeds the deliberately small 64 KiB pool. */
+    const uint32_t SID_LARGE = 505;
+    SVGA3dSize largeSize = {256, 256, 1};
+    status = svga3_vlkn_surface_define(dev, SID_LARGE, SVGA3D_SURFACE_HINT_TEXTURE,
+        SVGA3D_X8R8G8B8, &largeSize, 1);
+    TEST_CHECK(status == SVGA3_VLKN_SUCCESS, "Define image larger than readback staging capacity");
+    std::vector<Pixel> tile(8 * 8);
+    for (size_t i = 0; i < tile.size(); ++i)
+        tile[i] = Pixel{static_cast<uint8_t>(i), static_cast<uint8_t>(i + 32), 210, 255};
+    SVGA3dBox tileBox = {200, 201, 0, 8, 8, 1};
+    status = svga3_vlkn_surface_dma_upload(dev, SID_LARGE, 0, &tileBox, tile.data(), 8 * sizeof(Pixel));
+    TEST_CHECK(status == SVGA3_VLKN_SUCCESS, "Upload offset tile for partial presentation");
+
+    auto executeBlit = [&](const SVGA3dCmdBlitSurfaceToScreen &command,
+                           const std::vector<SVGASignedRect> &clips) {
+        const size_t payloadBytes = sizeof(command) + clips.size() * sizeof(SVGASignedRect);
+        std::vector<uint8_t> packet(sizeof(cmdBlit) + sizeof(SVGA3dCmdHeader) + payloadBytes);
+        SVGA3dCmdHeader header = {static_cast<uint32_t>(payloadBytes)};
+        memcpy(packet.data(), &cmdBlit, sizeof(cmdBlit));
+        memcpy(packet.data() + sizeof(cmdBlit), &header, sizeof(header));
+        memcpy(packet.data() + sizeof(cmdBlit) + sizeof(header), &command, sizeof(command));
+        if (!clips.empty()) memcpy(packet.data() + sizeof(cmdBlit) + sizeof(header) + sizeof(command),
+                                   clips.data(), clips.size() * sizeof(SVGASignedRect));
+        return executeFifo(packet);
+    };
+    resetFramebuffer();
+    SVGA3dCmdBlitSurfaceToScreen partialBlit = {{SID_LARGE, 0, 0}, {202, 203, 206, 207},
+        0, {17, 19, 21, 23}};
+    status = executeBlit(partialBlit, {{0, 0, 2, 4}, {1, 1, 4, 3}});
+    TEST_CHECK(status == SVGA3_VLKN_SUCCESS, "Read back only visible tile with overlapping relative clip rectangles");
+    bool partialMatches = true;
+    for (uint32_t y = 0; y < FB_H; ++y) {
+        for (uint32_t x = 0; x < FB_W; ++x) {
+            const bool visible = (x >= 17 && x < 19 && y >= 19 && y < 23) ||
+                                 (x >= 18 && x < 21 && y >= 20 && y < 22);
+            const Pixel expected = visible ? tile[(y - 17) * 8 + (x - 15)] : BASELINE_PIXEL;
+            partialMatches &= pixelsIdentical(qemuFb[y * FB_W + x], expected);
+        }
+    }
+    TEST_CHECK(partialMatches, "Partial readback preserves source offsets, overlapping clips and all surrounding pixels");
+    svga3_vlkn_surface_destroy(dev, SID_LARGE);
+
+    resetFramebuffer();
+    partialBlit = {{SID_RT, 0, 0}, {-4, -5, 12, 11}, 0, {8, 9, 24, 25}};
+    status = executeBlit(partialBlit, {});
+    bool sourceClipMatches = status == SVGA3_VLKN_SUCCESS;
+    for (uint32_t y = 0; y < FB_H; ++y) {
+        for (uint32_t x = 0; x < FB_W; ++x) {
+            const bool visible = x >= 12 && x < 24 && y >= 14 && y < 25;
+            const Pixel expected = visible ? renderedSurface[(y - 14) * RT_W + x - 12] : BASELINE_PIXEL;
+            sourceClipMatches &= pixelsIdentical(qemuFb[y * FB_W + x], expected);
+        }
+    }
+    TEST_CHECK(sourceClipMatches, "Negative source origins clip and advance destination without changing surrounding pixels");
+
+    resetFramebuffer();
+    partialBlit = {{SID_RT, 0, 0}, {0, 0, 64, 64},
+        0, {INT32_MIN, INT32_MIN, INT32_MAX, INT32_MAX}};
+    status = executeBlit(partialBlit, {});
+    TEST_CHECK(status == SVGA3_VLKN_SUCCESS &&
+        std::all_of(qemuFb.begin(), qemuFb.end(), [&](const Pixel &p) {return pixelsIdentical(p, BASELINE_PIXEL);}),
+        "Extreme signed endpoints safely produce an offscreen blit");
+
     /* =========================================================================
      * TEST 7: Negative Controls
      * ========================================================================= */
@@ -684,12 +748,28 @@ int main() {
                        "Presenting nonexistent surface ID fails safely with error code");
     }
 
+    /* A legitimate all-black image must replace the previous framebuffer contents. */
+    std::vector<Pixel> blackPixels(RT_W * RT_H, Pixel{0, 0, 0, 255});
+    SVGA3dBox fullRt = {0, 0, 0, RT_W, RT_H, 1};
+    status = svga3_vlkn_surface_dma_upload(dev, SID_RT, 0, &fullRt, blackPixels.data(), RT_W * sizeof(Pixel));
+    if (status == SVGA3_VLKN_SUCCESS) status = svga3_vlkn_surface_present(dev, SID_RT, nullptr, 0);
+    TEST_CHECK_ERR(status == SVGA3_VLKN_SUCCESS && qemuFb[0].r == 0 && qemuFb[0].g == 0 && qemuFb[0].b == 0,
+                   "Presenting a black frame clears old framebuffer pixels");
+
     /* Clean up */
     svga3_vlkn_context_destroy(dev, CID);
     svga3_vlkn_surface_destroy(dev, SID_RT);
     svga3_vlkn_surface_destroy(dev, SID_TEX);
     svga3_vlkn_surface_destroy(dev, SID_VB);
+    dev->contextMgr->clear();
+    dev->surfaceMgr->clear();
+    Svga3VlknStatus idleStatus = backend->waitIdle();
+    backend->shutdown();
+    const uint32_t validationErrors = backend->validationErrors();
+    const uint32_t validationWarnings = backend->validationWarnings();
     svga3_vlkn_device_destroy(dev);
+    TEST_CHECK(idleStatus == SVGA3_VLKN_SUCCESS && validationErrors == 0 && validationWarnings == 0,
+        "Presentation and teardown are validation-clean");
 
     std::cout << "\n======================================================================\n";
     std::cout << "DELIVERABLE 5 ACCEPTANCE SUITE: ALL PRESENTATION TESTS PASSED!\n";

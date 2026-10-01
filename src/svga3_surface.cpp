@@ -1780,95 +1780,91 @@ Svga3VlknStatus VlknSurfaceManager::blitSurfaceToScreen(const SVGA3dSurfaceImage
     (void)destScreenId;
     VlknSurface *surf = getSurface(srcImage.sid);
     if (!surf) return SVGA3_VLKN_ERROR_NOT_FOUND;
+    const auto *mip = surf->getMipInfo(srcImage.mipmap);
+    if (!mip) return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    if (svga3_format_is_compressed(surf->svgaFormat()) || surf->isDepthStencil())
+        return SVGA3_VLKN_ERROR_UNSUPPORTED_FORMAT;
 
     if (guestMem && guestMem->getFramebuffer().hva) {
         const auto &fb = guestMem->getFramebuffer();
-        uint32_t surfW = surf->width();
-        uint32_t surfH = surf->height();
-        size_t bpp = svga3_format_bytes_per_pixel(surf->svgaFormat());
-        if (bpp == 0) bpp = 4;
+        const size_t bpp = svga3_format_bytes_per_pixel(surf->svgaFormat());
+        const size_t dstBpp = fb.bpp;
+        if (!bpp || !dstBpp) return SVGA3_VLKN_ERROR_UNSUPPORTED_FORMAT;
+        const size_t dstPitch = fb.pitch ? fb.pitch : static_cast<size_t>(fb.width) * dstBpp;
 
+        /* Clip in screen coordinates before readback. Use wide signed values
+         * so negative origins and extreme guest rectangle endpoints are safe. */
+        const int64_t sx = srcRect.left, sy = srcRect.top;
+        const int64_t dx = destRect.left, dy = destRect.top;
+        const int64_t sw = int64_t(srcRect.right) - sx;
+        const int64_t sh = int64_t(srcRect.bottom) - sy;
+        const int64_t dw = int64_t(destRect.right) - dx;
+        const int64_t dh = int64_t(destRect.bottom) - dy;
+        const int64_t x0 = std::max({dx, int64_t(0), dx - sx});
+        const int64_t y0 = std::max({dy, int64_t(0), dy - sy});
+        const int64_t x1 = std::min({dx + std::min(sw, dw), int64_t(fb.width), dx + mip->width - sx});
+        const int64_t y1 = std::min({dy + std::min(sh, dh), int64_t(fb.height), dy + mip->height - sy});
+        if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 || x1 <= x0 || y1 <= y0)
+            return m_backend->flushCommandBuffer();
+
+        /* SVGA clip rectangles are relative to the destination origin. Walk
+         * their intersections twice: once to bound the GPU transfer and once
+         * to copy visible rows. This avoids a per-frame allocation. */
+        auto forEachRect = [&](auto &&visit) {
+            if (!numClipRects || !clipRects) {
+                visit(x0, y0, x1, y1);
+            } else {
+                for (uint32_t c = 0; c < numClipRects; ++c) {
+                    const int64_t cx0 = std::max(x0, dx + clipRects[c].left);
+                    const int64_t cy0 = std::max(y0, dy + clipRects[c].top);
+                    const int64_t cx1 = std::min(x1, dx + clipRects[c].right);
+                    const int64_t cy1 = std::min(y1, dy + clipRects[c].bottom);
+                    if (cx1 > cx0 && cy1 > cy0) visit(cx0, cy0, cx1, cy1);
+                }
+            }
+        };
+        int64_t left = x1, top = y1, right = x0, bottom = y0;
+        forEachRect([&](int64_t l, int64_t t, int64_t r, int64_t b) {
+            left = std::min(left, l); top = std::min(top, t);
+            right = std::max(right, r); bottom = std::max(bottom, b);
+        });
+        if (right <= left || bottom <= top) return m_backend->flushCommandBuffer();
+
+        SVGA3dBox readbackBox = {static_cast<uint32_t>(sx + left - dx),
+            static_cast<uint32_t>(sy + top - dy), 0,
+            static_cast<uint32_t>(right - left), static_cast<uint32_t>(bottom - top), 1};
         const void *mappedData = nullptr;
         size_t rowPitch = 0;
         std::unique_lock<std::mutex> lock;
-        Svga3VlknStatus st = surf->dmaDownloadToStaging(srcImage.mipmap, nullptr, &mappedData, &rowPitch, lock);
-        if (st != SVGA3_VLKN_SUCCESS) {
-            return st;
-        }
+        Svga3VlknStatus st = surf->dmaDownloadToStaging(srcImage.mipmap, &readbackBox,
+                                                      &mappedData, &rowPitch, lock);
+        if (st != SVGA3_VLKN_SUCCESS) return st;
 
-        uint32_t dstW = fb.width ? fb.width : surfW;
-        uint32_t dstH = fb.height ? fb.height : surfH;
-        uint32_t dstBpp = fb.bpp ? fb.bpp : 4;
-        uint32_t dstPitch = fb.pitch ? fb.pitch : (dstW * dstBpp);
-
-        int32_t sx = srcRect.left;
-        int32_t sy = srcRect.top;
-        int32_t sw = srcRect.right - srcRect.left;
-        int32_t sh = srcRect.bottom - srcRect.top;
-
-        int32_t dx = destRect.left;
-        int32_t dy = destRect.top;
-        int32_t dw = destRect.right - destRect.left;
-        int32_t dh = destRect.bottom - destRect.top;
-
-        if (sw > 0 && sh > 0 && dw > 0 && dh > 0) {
-            uint32_t copyW = std::min(static_cast<uint32_t>(sw), static_cast<uint32_t>(dw));
-            uint32_t copyH = std::min(static_cast<uint32_t>(sh), static_cast<uint32_t>(dh));
-
-            for (uint32_t y = 0; y < copyH; ++y) {
-                int32_t curDy = dy + static_cast<int32_t>(y);
-                int32_t curSy = sy + static_cast<int32_t>(y);
-                if (curDy < 0 || curDy >= static_cast<int32_t>(dstH)) continue;
-                if (curSy < 0 || curSy >= static_cast<int32_t>(surfH)) continue;
-
-                for (uint32_t x = 0; x < copyW; ++x) {
-                    int32_t curDx = dx + static_cast<int32_t>(x);
-                    int32_t curSx = sx + static_cast<int32_t>(x);
-                    if (curDx < 0 || curDx >= static_cast<int32_t>(dstW)) continue;
-                    if (curSx < 0 || curSx >= static_cast<int32_t>(surfW)) continue;
-
-                    if (numClipRects > 0 && clipRects) {
-                        bool inside = false;
-                        for (uint32_t c = 0; c < numClipRects; ++c) {
-                            if (curDx >= clipRects[c].left && curDx < clipRects[c].right &&
-                                curDy >= clipRects[c].top && curDy < clipRects[c].bottom) {
-                                inside = true;
-                                break;
-                            }
-                        }
-                        if (!inside) continue;
-                    }
-
-                    /* 64-bit destination offset: the old 32-bit product wrapped
-                     * for large pitches. Never write outside the registered
-                     * framebuffer. */
-                    uint64_t dstOff = (uint64_t)curDy * dstPitch + (uint64_t)curDx * dstBpp;
-                    size_t pxBytes = std::min(bpp, static_cast<size_t>(dstBpp));
-                    if (dstOff > fb.size || pxBytes > fb.size - dstOff) {
-                        continue;
-                    }
-                    uint8_t *dst = fb.hva + (size_t)dstOff;
-                    const uint8_t *src = static_cast<const uint8_t*>(mappedData) + curSy * rowPitch + curSx * bpp;
-                    memcpy(dst, src, pxBytes);
+        bool boundsValid = true;
+        forEachRect([&](int64_t l, int64_t t, int64_t r, int64_t b) {
+            const size_t width = static_cast<size_t>(r - l);
+            const size_t pixelBytes = std::min(bpp, dstBpp);
+            const uint64_t lastOffset = uint64_t(b - 1) * dstPitch + uint64_t(r - 1) * dstBpp;
+            if (lastOffset > fb.size || pixelBytes > fb.size - lastOffset) {
+                boundsValid = false;
+                return;
+            }
+            for (int64_t y = t; y < b; ++y) {
+                uint8_t *dst = fb.hva + static_cast<size_t>(y) * dstPitch + static_cast<size_t>(l) * dstBpp;
+                const uint8_t *src = static_cast<const uint8_t*>(mappedData) +
+                    static_cast<size_t>(y - top) * rowPitch + static_cast<size_t>(l - left) * bpp;
+                if (bpp == dstBpp) {
+                    memcpy(dst, src, width * bpp);
+                } else {
+                    for (size_t x = 0; x < width; ++x)
+                        memcpy(dst + x * dstBpp, src + x * bpp, pixelBytes);
                 }
             }
-
-            if (numClipRects == 0 || !clipRects) {
-                guestMem->notifyDisplayUpdate(dx, dy, copyW, copyH);
-            } else {
-                for (uint32_t c = 0; c < numClipRects; ++c) {
-                    int32_t ix0 = std::max(dx, static_cast<int32_t>(clipRects[c].left));
-                    int32_t iy0 = std::max(dy, static_cast<int32_t>(clipRects[c].top));
-                    int32_t ix1 = std::min(dx + static_cast<int32_t>(copyW), static_cast<int32_t>(clipRects[c].right));
-                    int32_t iy1 = std::min(dy + static_cast<int32_t>(copyH), static_cast<int32_t>(clipRects[c].bottom));
-                    if (ix1 > ix0 && iy1 > iy0) {
-                        guestMem->notifyDisplayUpdate(ix0, iy0, ix1 - ix0, iy1 - iy0);
-                    }
-                }
-            }
-        }
+            guestMem->notifyDisplayUpdate(static_cast<int32_t>(l), static_cast<int32_t>(t),
+                static_cast<int32_t>(r - l), static_cast<int32_t>(b - t));
+        });
+        if (!boundsValid) return SVGA3_VLKN_ERROR_INVALID_PARAM;
     }
-
     return m_backend->flushCommandBuffer();
 }
 
@@ -1944,55 +1940,44 @@ Svga3VlknStatus VlknSurfaceManager::present(uint32_t sid,
 
         uint32_t copyW = std::min(surfW, dstW);
         uint32_t copyH = std::min(surfH, dstH);
-        bool isBlank = (p0 == 0 || (p0 & 0x00FFFFFF) == 0) &&
-                       is_buffer_all_black_or_zero(mappedData, copyW, copyH, rowPitch, bpp);
-
-        if (isBlank) {
-            static uint32_t blank_warn = 0;
-            if (blank_warn++ < 5 || (blank_warn % 500) == 0) {
-                log_msg("[libqemu_svga3d] WARNING: present sid=%u is completely blank/zero, preserving fb.hva\n", sid);
+        if (numRects == 0 || !rects) {
+            size_t bytesToCopy = copyW * std::min(bpp, static_cast<size_t>(dstBpp));
+            for (uint32_t y = 0; y < copyH; ++y) {
+                /* 64-bit offset: the old 32-bit y*dstPitch wrapped for
+                 * large pitches. Skip rows outside the framebuffer. */
+                uint64_t dstOff = (uint64_t)y * dstPitch;
+                if (dstOff > fb.size || bytesToCopy > fb.size - dstOff) {
+                    continue;
+                }
+                uint8_t *dst = fb.hva + (size_t)dstOff;
+                const uint8_t *src = static_cast<const uint8_t*>(mappedData) + y * rowPitch;
+                memcpy(dst, src, bytesToCopy);
             }
             guestMem->notifyDisplayUpdate(0, 0, copyW, copyH);
         } else {
-            if (numRects == 0 || !rects) {
-                size_t bytesToCopy = copyW * std::min(bpp, static_cast<size_t>(dstBpp));
-                for (uint32_t y = 0; y < copyH; ++y) {
-                    /* 64-bit offset: the old 32-bit y*dstPitch wrapped for
+            for (uint32_t i = 0; i < numRects; ++i) {
+                const auto &r = rects[i];
+                if (r.srcx >= surfW || r.srcy >= surfH) continue;
+                if (r.x >= dstW || r.y >= dstH) continue;
+
+                uint32_t cw = std::min(r.w, surfW - r.srcx);
+                cw = std::min(cw, dstW - r.x);
+                uint32_t ch = std::min(r.h, surfH - r.srcy);
+                ch = std::min(ch, dstH - r.y);
+
+                size_t bytesToCopy = cw * std::min(bpp, static_cast<size_t>(dstBpp));
+                for (uint32_t y = 0; y < ch; ++y) {
+                    /* 64-bit offset: the old 32-bit product wrapped for
                      * large pitches. Skip rows outside the framebuffer. */
-                    uint64_t dstOff = (uint64_t)y * dstPitch;
+                    uint64_t dstOff = ((uint64_t)r.y + y) * dstPitch + (uint64_t)r.x * dstBpp;
                     if (dstOff > fb.size || bytesToCopy > fb.size - dstOff) {
                         continue;
                     }
                     uint8_t *dst = fb.hva + (size_t)dstOff;
-                    const uint8_t *src = static_cast<const uint8_t*>(mappedData) + y * rowPitch;
+                    const uint8_t *src = static_cast<const uint8_t*>(mappedData) + (r.srcy + y) * rowPitch + r.srcx * bpp;
                     memcpy(dst, src, bytesToCopy);
                 }
-                guestMem->notifyDisplayUpdate(0, 0, copyW, copyH);
-            } else {
-                for (uint32_t i = 0; i < numRects; ++i) {
-                    const auto &r = rects[i];
-                    if (r.srcx >= surfW || r.srcy >= surfH) continue;
-                    if (r.x >= dstW || r.y >= dstH) continue;
-
-                    uint32_t cw = std::min(r.w, surfW - r.srcx);
-                    cw = std::min(cw, dstW - r.x);
-                    uint32_t ch = std::min(r.h, surfH - r.srcy);
-                    ch = std::min(ch, dstH - r.y);
-
-                    size_t bytesToCopy = cw * std::min(bpp, static_cast<size_t>(dstBpp));
-                    for (uint32_t y = 0; y < ch; ++y) {
-                        /* 64-bit offset: the old 32-bit product wrapped for
-                         * large pitches. Skip rows outside the framebuffer. */
-                        uint64_t dstOff = ((uint64_t)r.y + y) * dstPitch + (uint64_t)r.x * dstBpp;
-                        if (dstOff > fb.size || bytesToCopy > fb.size - dstOff) {
-                            continue;
-                        }
-                        uint8_t *dst = fb.hva + (size_t)dstOff;
-                        const uint8_t *src = static_cast<const uint8_t*>(mappedData) + (r.srcy + y) * rowPitch + r.srcx * bpp;
-                        memcpy(dst, src, bytesToCopy);
-                    }
-                    guestMem->notifyDisplayUpdate(r.x, r.y, cw, ch);
-                }
+                guestMem->notifyDisplayUpdate(r.x, r.y, cw, ch);
             }
         }
     }
