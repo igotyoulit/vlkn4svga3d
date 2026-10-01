@@ -6,9 +6,11 @@ An experimental SVGA3D-to-Vulkan rendering library and QEMU integration prototyp
 
 ## QEMU lab adapter
 
-The preload adapter supports one allowlisted QEMU build and checks instruction bytes before patching. Use it only for the designated VM; never configure global `LD_PRELOAD`. The tested Proxmox VM runs QEMU as `qemu119` and guest graphics as `svga3d`.
+The preload adapter supports one allowlisted QEMU build and checks instruction bytes before patching; a build-id mismatch refuses with `_exit(78)` and logs the observed build-id. It only arms inside `qemu-system*` processes. Use it only for the designated VM; never configure global `LD_PRELOAD`. The tested Proxmox VM runs QEMU as `qemu119` and guest graphics as `svga3d`.
 
-Set `SVGA3_VLKN_VALIDATE=1` to request Vulkan validation layers; initialization fails if they cannot be activated. Portrait mode overrides require `SVGA3_VLKN_GUEST_PROFILE=playbook-portrait`; normal guests use their requested mode. Framebuffer GPA comes from the device register. Application-context centering is disabled by default; the old heuristic is available only with `SVGA3_VLKN_LEGACY_CLIENT_PRESENT=1`. Guest-RAM discovery still uses a lab-only mapping heuristic; official QEMU integration remains follow-up work.
+Build the lab adapter explicitly with `make preload-lab` — it is intentionally not part of the default `make all` target, since the binary only works with its allowlisted QEMU build.
+
+`SVGA3_VLKN_VALIDATE=1` forces Vulkan validation layers on, `=0` forces them off; otherwise debug builds validate and release (`NDEBUG`) builds do not. Layers are enabled only when `VK_LAYER_KHRONOS_validation` is actually installed, so a missing layer install cannot break initialization. Portrait mode overrides require `SVGA3_VLKN_GUEST_PROFILE=playbook-portrait`; normal guests use their requested mode. Framebuffer GPA comes from the device register. Application-context centering is disabled by default; the old heuristic is available only with `SVGA3_VLKN_LEGACY_CLIENT_PRESENT=1`. Guest-RAM discovery still uses a lab-only mapping heuristic; official QEMU integration remains follow-up work.
 
 ## What is included
 
@@ -51,7 +53,7 @@ cd vlkn4svga3d
 make -j4 all
 ```
 
-Outputs include `lib/libsvga3_vlkn.a`, `lib/libqemu_svga3d.so`, and test executables under `bin/`. Public interfaces are in `include/svga3_vlkn.h` and `include/qemu_vmsvga.h`. Link consumers with the static library, `-ldl`, and `-pthread`.
+Outputs include `lib/libsvga3_vlkn.a` and test executables under `bin/`. The QEMU lab adapter (`lib/libqemu_svga3d.so`) is built separately via `make preload-lab`. Public interfaces are in `include/svga3_vlkn.h` and `include/qemu_vmsvga.h`. Link consumers with the static library, `-ldl`, and `-pthread`.
 
 Make generates header dependency files for compiled objects, so header edits rebuild affected objects.
 
@@ -108,6 +110,7 @@ What each suite proves:
 | --- | --- |
 | `test_translator_novulkan` | D3D9→SPIR-V translation without a Vulkan ICD; optional `spirv-val` (prints SKIP, not PASS, when unavailable); SPIR-V value-flow assertions that shader inputs actually reach the declared outputs (not just decorations) |
 | `test_preload_fifo` | Actual preload FIFO walker on a synthetic QEMU state, without patching a process: batches exceeding 8192 commands, ring wrap, producer notification races, incomplete packets and final fences |
+| `test_preload_fence` | Issue-#11 lab-adapter fences: build-id allowlist exact-match refusal (+ hex diagnostics), validation opt-in policy (`SVGA3_VLKN_VALIDATE=1`/`0`, debug builds), portrait hacks locked behind the explicit guest profile |
 | `test_buffer_ordering` | Strict Vulkan validation through teardown; queued buffers/constants, compressed FIFO/GMR transfers, sampler retirement, mip/image ordering, depth sampling and shader pixel regressions |
 | `test_shader_translation` | Translation plus real Vulkan shader-module creation; malformed/unsupported bytecode rejected; `_SAT` handling |
 | `test_real_vulkan` | Real device init and bit-exact buffer upload/download; no mock fallback |

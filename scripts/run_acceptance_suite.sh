@@ -34,6 +34,7 @@ REQUIRED_BINARIES=(
     "bin/test_shader_translation"
     "bin/test_shader_execution"
     "bin/test_preload_fifo"
+    "bin/test_preload_fence"
     "bin/test_buffer_ordering"
     "bin/test_guest_memory"
     "bin/test_verified_rendering"
@@ -94,6 +95,7 @@ echo ""
 echo "[RUN] ./bin/test_shader_execution"
 ./bin/test_shader_execution
 ./bin/test_preload_fifo
+./bin/test_preload_fence
 ./bin/test_buffer_ordering
 
 # ------------------------------------------------------------------------------
