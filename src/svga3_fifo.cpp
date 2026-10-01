@@ -7,12 +7,17 @@
 #include <cstring>
 #include <iostream>
 #include <mutex>
+#include <cstdlib>
 
 extern "C" void log_msg(const char *fmt, ...);
 
 namespace svga3_vlkn {
 
 static void blitClientSurfaceToFramebuffer(Svga3VlknDevice *dev, uint32_t cid, uint32_t sid, const char *reason) {
+    /* Legacy application guessing can overwrite a correctly positioned guest
+     * window. Normal scanout follows explicit guest presentation commands. */
+    const char *legacy = std::getenv("SVGA3_VLKN_LEGACY_CLIENT_PRESENT");
+    if (!legacy || std::strcmp(legacy, "1") != 0) return;
     if (!dev || !dev->guestMem || !dev->surfaceMgr || sid == 0 || sid == SVGA3D_INVALID_ID) return;
     VlknSurface *surf = dev->surfaceMgr->getSurface(sid);
     /* Cursors are 64 or smaller. A window can be as small as the OpenGL test. */
@@ -107,7 +112,12 @@ void svga3_vlkn_present_client_surfaces(Svga3VlknDevice *dev, const char *reason
 
     /* The readback normally flushed the command buffer. This also completes
      * work submitted on paths that have no window surface to read back. */
-    if (dev->backend) dev->backend->flushCommandBuffer();
+    if (dev->backend) {
+        Svga3VlknStatus fst = dev->backend->flushCommandBuffer();
+        if (fst != SVGA3_VLKN_SUCCESS) {
+            log_msg("[libqemu_svga3d] present_client_surfaces: flush failed (%d)\n", (int)fst);
+        }
+    }
 }
 
 Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
@@ -189,7 +199,9 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
             offset += numBoxes * sizeof(SVGA3dCopyBox);
 
             if (dev->contextMgr) dev->contextMgr->endAllRenderPasses();
-            Svga3VlknStatus st = dev->surfaceMgr->copy(pCmd->src.sid, pCmd->dest.sid, boxes, numBoxes);
+            Svga3VlknStatus st = dev->surfaceMgr->copy(pCmd->src.sid, pCmd->dest.sid, boxes, numBoxes,
+                                                       pCmd->src.mipmap, pCmd->src.face,
+                                                       pCmd->dest.mipmap, pCmd->dest.face);
             *bytesRead = offset;
             return st;
         }
@@ -648,7 +660,7 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
 
             uint32_t result = 0;
             Svga3VlknStatus st = ctx->waitForQuery(pCmd->type, &result);
-            if (dev->guestMem && pCmd->guestResult.gmrId != SVGA_GMR_NULL) {
+            if (st == SVGA3_VLKN_SUCCESS && dev->guestMem && pCmd->guestResult.gmrId != SVGA_GMR_NULL) {
                 SVGA3dQueryResult res = {};
                 res.totalSize = sizeof(SVGA3dQueryResult);
                 res.state = SVGA3D_QUERYSTATE_SUCCEEDED;
@@ -937,7 +949,10 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
                 return SVGA3_VLKN_ERROR_INVALID_COMMAND_BUFFER;
             }
             if (dev->contextMgr) dev->contextMgr->endAllRenderPasses();
-            if (dev->backend) dev->backend->flushCommandBuffer();
+            if (dev->backend) {
+                Svga3VlknStatus fst = dev->backend->flushCommandBuffer();
+                if (fst != SVGA3_VLKN_SUCCESS) return fst;
+            }
             *bytesRead = sizeof(uint32_t);
             return SVGA3_VLKN_SUCCESS;
         }

@@ -4,11 +4,13 @@
 
 #include "svga3_context.h"
 #include "svga3_shader_translator.h"
+#include "svga3_spirv_builder.h"
 #include "../data/svga3d_reference.h"
 #include <cstring>
 #include <algorithm>
 #include <iostream>
 #include <cstdlib>
+#include <cstdio>
 #include <type_traits>
 
 extern "C" void log_msg(const char *fmt, ...);
@@ -543,12 +545,9 @@ VlknContext::~VlknContext() {
     }
     m_pipelineCache.clear();
 
-    for (uint32_t i = 0; i < SVGA3_MAX_TEXTURE_STAGES; ++i) {
-        if (m_stages[i].sampler) {
-            m_backend->dispatch().vkDestroySampler(m_backend->device(), m_stages[i].sampler, nullptr);
-            m_stages[i].sampler = VK_NULL_HANDLE;
-        }
-    }
+    for (const auto &entry : m_samplerCache)
+        m_backend->dispatch().vkDestroySampler(m_backend->device(), entry.second, nullptr);
+    m_samplerCache.clear();
 
     for (auto &pair : m_vertexShaders) {
         if (pair.second.module && pair.second.module != m_defaultVS) {
@@ -1084,9 +1083,22 @@ Svga3VlknStatus VlknContext::defineShader(uint32_t shid, SVGA3dShaderType type, 
         uint32_t inMask = 0;
         Svga3VlknStatus st = svga3_translate_shader_d3d9(type, bytecode, numDwords, spirv, err, &inMask);
         if (st != SVGA3_VLKN_SUCCESS) {
-            return st; /* Explicit error on unsupported instructions or malformed tokens */
+            log_msg("[libqemu_svga3d] shader translation failed cid=%u shid=%u type=%u: %s\n", m_cid, shid, type, err.c_str());
+            return st;
         }
         shader.inputLocationMask = inMask;
+        shader.hasFragmentSideEffects = false;
+        for (size_t word = 5; word < spirv.size();) {
+            const uint32_t count = spirv[word] >> 16;
+            if (!count || count > spirv.size() - word) {
+                shader.hasFragmentSideEffects = true;
+                break;
+            }
+            if ((spirv[word] & 0xffff) == SpvOpKill)
+                shader.hasFragmentSideEffects = true;
+            word += count;
+        }
+
         VkShaderModuleCreateInfo info = {};
         info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         info.codeSize = spirv.size() * sizeof(uint32_t);
@@ -1244,14 +1256,20 @@ bool VlknContext::hasShader(uint32_t shid, SVGA3dShaderType type) const {
 
 VkSampler VlknContext::getOrCreateSampler(uint32_t stage) {
     TextureStageState &s = m_stages[stage];
-    if (s.sampler && !s.samplerDirty) {
+    VlknSurface *surf = m_surfaceMgr ? m_surfaceMgr->getSurface(s.sid) : nullptr;
+    uint32_t lodBits;
+    memcpy(&lodBits, &s.mipLodBias, sizeof(lodBits));
+    const std::array<uint32_t, 9> key{{s.addressU, s.addressV, s.addressW,
+        s.minFilter, s.magFilter, s.mipFilter, s.maxAnisotropy, lodBits,
+        surf ? surf->mipLevels() : 0}};
+    auto cached = m_samplerCache.find(key);
+    if (cached != m_samplerCache.end()) {
+        s.sampler = cached->second;
+        s.samplerDirty = false;
         return s.sampler;
     }
-
-    if (s.sampler) {
-        m_backend->dispatch().vkDestroySampler(m_backend->device(), s.sampler, nullptr);
-        s.sampler = VK_NULL_HANDLE;
-    }
+    /* Recorded draws and immutable descriptors retain their samplers. */
+    s.sampler = VK_NULL_HANDLE;
 
     VkSamplerCreateInfo info = {};
     info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -1265,17 +1283,19 @@ VkSampler VlknContext::getOrCreateSampler(uint32_t stage) {
     info.anisotropyEnable = (s.maxAnisotropy > 1) ? VK_TRUE : VK_FALSE;
     info.maxAnisotropy = (float)std::max(1u, s.maxAnisotropy);
     info.minLod = 0.0f;
-    /* FIX: Clamp maxLod = 0.0f when mipmapping is disabled or surface has <= 1 mip */
-    VlknSurface *surf = m_surfaceMgr ? m_surfaceMgr->getSurface(s.sid) : nullptr;
-    if (s.mipFilter == SVGA3D_TEX_FILTER_NONE || (surf && surf->viewMipLevels() <= 1)) {
+    /* Clamp maxLod to the image's own level count when mipmapping is in
+     * use; the sampled view's current level count is timing-dependent
+     * (it expands as levels are produced) and must not pin LOD to 0. */
+    if (s.mipFilter == SVGA3D_TEX_FILTER_NONE || (surf && surf->mipLevels() <= 1)) {
         info.maxLod = 0.0f;
-    } else if (surf && surf->viewMipLevels() > 1) {
-        info.maxLod = (float)(surf->viewMipLevels() - 1);
+    } else if (surf && surf->mipLevels() > 1) {
+        info.maxLod = (float)(surf->mipLevels() - 1);
     } else {
         info.maxLod = 16.0f;
     }
 
     m_backend->dispatch().vkCreateSampler(m_backend->device(), &info, nullptr, &s.sampler);
+    if (s.sampler) m_samplerCache.emplace(key, s.sampler);
     s.samplerDirty = false;
     return s.sampler;
 }
@@ -1310,11 +1330,24 @@ Svga3VlknStatus VlknContext::ensureRenderPassActive() {
     uint32_t fbWidth = 800;
     uint32_t fbHeight = 600;
     if (colorSurf) {
-        fbWidth = colorSurf->width();
-        fbHeight = colorSurf->height();
+        /* The framebuffer extent must match the attached mip level, not
+         * the base level: an oversized framebuffer/render area against a
+         * smaller mip view misregisters rendering into that level. */
+        if (const SurfaceMipLevel *mi = colorSurf->getMipInfo(m_renderTargets[0].mipmap)) {
+            fbWidth = mi->width;
+            fbHeight = mi->height;
+        } else {
+            fbWidth = colorSurf->width();
+            fbHeight = colorSurf->height();
+        }
     } else if (depthSurf) {
-        fbWidth = depthSurf->width();
-        fbHeight = depthSurf->height();
+        if (const SurfaceMipLevel *mi = depthSurf->getMipInfo(m_depthStencilTarget.mipmap)) {
+            fbWidth = mi->width;
+            fbHeight = mi->height;
+        } else {
+            fbWidth = depthSurf->width();
+            fbHeight = depthSurf->height();
+        }
     }
 
     VkImageView colorView = colorSurf ? colorSurf->getRenderTargetView(m_renderTargets[0].mipmap, m_renderTargets[0].face) : VK_NULL_HANDLE;
@@ -1334,7 +1367,8 @@ Svga3VlknStatus VlknContext::ensureRenderPassActive() {
 
     if (fbNeedsRebuild) {
         if (m_activeFramebuffer != VK_NULL_HANDLE) {
-            m_backend->flushCommandBuffer();
+            Svga3VlknStatus fst = m_backend->flushCommandBuffer();
+            if (fst != SVGA3_VLKN_SUCCESS) return fst;
             m_backend->dispatch().vkDestroyFramebuffer(m_backend->device(), m_activeFramebuffer, nullptr);
             m_activeFramebuffer = VK_NULL_HANDLE;
         }
@@ -1382,7 +1416,7 @@ Svga3VlknStatus VlknContext::ensureRenderPassActive() {
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         barrier.oldLayout = colorSurf->currentLayout();
         barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        barrier.srcAccessMask = 0;
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
         barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
         barrier.image = colorSurf->image();
         barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1393,7 +1427,7 @@ Svga3VlknStatus VlknContext::ensureRenderPassActive() {
 
         m_backend->dispatch().vkCmdPipelineBarrier(
             cb,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
             0, 0, nullptr, 0, nullptr, 1, &barrier
         );
@@ -1405,7 +1439,7 @@ Svga3VlknStatus VlknContext::ensureRenderPassActive() {
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         barrier.oldLayout = depthSurf->currentLayout();
         barrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        barrier.srcAccessMask = 0;
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
         barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
         barrier.image = depthSurf->image();
         barrier.subresourceRange.aspectMask = svga3_format_has_stencil(depthSurf->svgaFormat()) ?
@@ -1417,7 +1451,7 @@ Svga3VlknStatus VlknContext::ensureRenderPassActive() {
 
         m_backend->dispatch().vkCmdPipelineBarrier(
             cb,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
             VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
             0, 0, nullptr, 0, nullptr, 1, &barrier
         );
@@ -1523,7 +1557,8 @@ Svga3VlknStatus VlknContext::clear(SVGA3dClearFlag flags,
     if (wantDepth && !haveDepth) flags = (SVGA3dClearFlag)(flags & ~(SVGA3D_CLEAR_DEPTH | SVGA3D_CLEAR_STENCIL));
     if (flags == 0) return SVGA3_VLKN_SUCCESS;
 
-    ensureRenderPassActive();
+    Svga3VlknStatus rpStatus = ensureRenderPassActive();
+    if (rpStatus != SVGA3_VLKN_SUCCESS) return rpStatus;
     VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
 
     VkClearAttachment attachments[2];
@@ -1616,9 +1651,21 @@ VkPipeline VlknContext::getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
     key.srcColorBlend = m_renderStates[SVGA3D_RS_SRCBLEND];
     key.dstColorBlend = m_renderStates[SVGA3D_RS_DSTBLEND];
     key.colorBlendEq = m_renderStates[SVGA3D_RS_BLENDEQUATION];
-    key.srcAlphaBlend = m_renderStates[SVGA3D_RS_SRCBLENDALPHA];
-    key.dstAlphaBlend = m_renderStates[SVGA3D_RS_DSTBLENDALPHA];
-    key.alphaBlendEq = m_renderStates[SVGA3D_RS_BLENDEQUATIONALPHA];
+    /* D3D9 semantics: when SEPARATEALPHABLENDENABLE is off, the alpha
+     * blend uses the color factors/equation and the *ALPHA states are
+     * ignored. Guests that drive non-separate blending (e.g. Mesa's
+     * SVGA backend) only emit the *ALPHA states when separate blending
+     * is on, so reading them unconditionally would blend alpha with
+     * stale or default factors. */
+    if (m_renderStates[SVGA3D_RS_SEPARATEALPHABLENDENABLE]) {
+        key.srcAlphaBlend = m_renderStates[SVGA3D_RS_SRCBLENDALPHA];
+        key.dstAlphaBlend = m_renderStates[SVGA3D_RS_DSTBLENDALPHA];
+        key.alphaBlendEq = m_renderStates[SVGA3D_RS_BLENDEQUATIONALPHA];
+    } else {
+        key.srcAlphaBlend = key.srcColorBlend;
+        key.dstAlphaBlend = key.dstColorBlend;
+        key.alphaBlendEq = key.colorBlendEq;
+    }
     key.stencilEnable = hasDepthAttachment ? m_renderStates[SVGA3D_RS_STENCILENABLE] : 0;
     key.stencilFunc = m_renderStates[SVGA3D_RS_STENCILFUNC];
     key.colorWriteMask = m_renderStates[SVGA3D_RS_COLORWRITEENABLE];
@@ -1830,10 +1877,11 @@ VkPipeline VlknContext::getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
     pipeInfo.pInputAssemblyState = &iaInfo;
 
     /* Viewport / Scissor */
+    VkViewport pipelineViewport = rasterViewport();
     VkPipelineViewportStateCreateInfo vpInfo = {};
     vpInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     vpInfo.viewportCount = 1;
-    vpInfo.pViewports = &m_viewport;
+    vpInfo.pViewports = &pipelineViewport;
     vpInfo.scissorCount = 1;
     vpInfo.pScissors = &m_scissor;
     pipeInfo.pViewportState = &vpInfo;
@@ -1902,8 +1950,29 @@ VkPipeline VlknContext::getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
 
     VkPipelineColorBlendStateCreateInfo blendInfo = {};
     blendInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    blendInfo.attachmentCount = 1;
-    blendInfo.pAttachments = &cbAttach;
+    /* The blend attachment count must equal the subpass color attachment
+     * count. Depth-only rendering (no color target bound, e.g. shadow /
+     * depth-prepass draws) uses a depth-only render pass, so the pipeline
+     * must declare zero blend attachments; declaring one anyway makes
+     * vkCreateGraphicsPipelines invalid and the draw is lost. When
+     * neither target is bound the render pass falls back to a default
+     * color attachment (see ensureRenderPassActive), hence the depth
+     * check in the fallback arm. */
+    bool hasColorTarget = (m_renderTargets[0].sid != 0 &&
+                           m_renderTargets[0].sid != SVGA3D_INVALID_ID);
+    bool hasDepthTarget = (m_depthStencilTarget.sid != 0 &&
+                           m_depthStencilTarget.sid != SVGA3D_INVALID_ID);
+    bool hasColorAttachment = hasColorTarget || !hasDepthTarget;
+    if (!hasColorAttachment) {
+        auto ps = m_pixelShaders.find(m_boundPS);
+        const bool fragmentSideEffects = ps != m_pixelShaders.end() && ps->second.hasFragmentSideEffects;
+        /* Color-only shading has no effect in a depth-only subpass. Preserve
+         * discard shaders, which can still affect depth coverage. */
+        if (!fragmentSideEffects) pipeInfo.stageCount = 1;
+    }
+
+    blendInfo.attachmentCount = hasColorAttachment ? 1 : 0;
+    blendInfo.pAttachments = hasColorAttachment ? &cbAttach : nullptr;
     pipeInfo.pColorBlendState = &blendInfo;
 
     /* Dynamic State */
@@ -1922,7 +1991,7 @@ VkPipeline VlknContext::getOrCreatePipeline(SVGA3dPrimitiveType primitiveType,
         m_backend->device(), VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &pipeline
     );
     if (pipeRes != VK_SUCCESS) {
-        log_msg("[libqemu_svga3d] ERROR: vkCreateGraphicsPipelines failed with VkResult=%d\n", pipeRes);
+        log_msg("[libqemu_svga3d] ERROR: vkCreateGraphicsPipelines failed with VkResult=%d cid=%u vs=%u ps=%u depthMask=%u\n", pipeRes, m_cid, m_boundVS, m_boundPS, key.depthSamplerMask);
         return VK_NULL_HANDLE;
     }
 
@@ -1967,6 +2036,21 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
                 m_scissor.extent.width, m_scissor.extent.height,
                 m_renderTargets[0].sid);
     }
+    /* Retire bounded caches only after all recorded references complete, and
+     * before allocating this draw's constants or descriptor inputs. */
+    if (m_samplerCache.size() >= 64 || m_descriptorSetCache.size() >= 128) {
+        endRenderPassIfActive();
+        Svga3VlknStatus st = m_backend->flushCommandBuffer();
+        if (st != SVGA3_VLKN_SUCCESS) return st;
+        clearDescriptorSetCache();
+        for (const auto &entry : m_samplerCache)
+            m_backend->dispatch().vkDestroySampler(m_backend->device(), entry.second, nullptr);
+        m_samplerCache.clear();
+        for (auto &stage : m_stages) {
+            stage.sampler = VK_NULL_HANDLE;
+            stage.samplerDirty = true;
+        }
+    }
     /* Compute MVP = World * View * Projection when using fixed-function vertex shader */
     std::array<float, 16> ffMvp{};
     if (m_boundVS == SVGA3D_INVALID_ID) {
@@ -1984,56 +2068,6 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         }
     }
 
-    /* 1. Update Constant Buffers (UBOs) */
-    if (m_constantsDirty) {
-        if (m_constantRingMapped && m_constantRingBuffer) {
-            const uint64_t submissionSerial = m_backend->completedSubmissionSerial();
-            if (submissionSerial != m_constantRingSubmissionSerial) {
-                m_constantRingCursor = 0;
-                m_constantRingSubmissionSerial = submissionSerial;
-            }
-            const size_t slotSize = m_constantRingStride * 2;
-            if (m_constantRingCursor + slotSize > m_constantRingSize) {
-                /* The ring is full. Submit and wait before reusing any slice. */
-                endRenderPassIfActive();
-                m_backend->flushCommandBuffer();
-                m_constantRingCursor = 0;
-                m_constantRingSubmissionSerial = m_backend->completedSubmissionSerial();
-            }
-
-            const size_t vsOffset = m_constantRingCursor;
-            const size_t psOffset = vsOffset + m_constantRingStride;
-            uint8_t *mapped = static_cast<uint8_t*>(m_constantRingMapped);
-            if (m_boundVS == SVGA3D_INVALID_ID) {
-                float tempConsts[256][4];
-                memcpy(tempConsts, m_vsConsts.floatConsts, sizeof(tempConsts));
-                for (int col = 0; col < 4; ++col) {
-                    for (int row = 0; row < 4; ++row) {
-                        tempConsts[col][row] = ffMvp[row * 4 + col];
-                    }
-                }
-                memcpy(mapped + vsOffset, tempConsts, sizeof(tempConsts));
-                m_lastFfMvp = ffMvp;
-                m_vsConstsUploadedForFf = true;
-            } else {
-                memcpy(mapped + vsOffset, m_vsConsts.floatConsts, sizeof(m_vsConsts.floatConsts));
-                m_vsConstsUploadedForFf = false;
-            }
-            memcpy(mapped + psOffset, m_psConsts.floatConsts, sizeof(m_psConsts.floatConsts));
-            if (getenv("SVGA3_VLKN_TRACE_FIFO")) {
-                fprintf(stderr, "[const-upload] vs c0=[%g %g %g %g] c1=[%g %g %g %g]\n",
-                        m_vsConsts.floatConsts[0][0], m_vsConsts.floatConsts[0][1],
-                        m_vsConsts.floatConsts[0][2], m_vsConsts.floatConsts[0][3],
-                        m_vsConsts.floatConsts[1][0], m_vsConsts.floatConsts[1][1],
-                        m_vsConsts.floatConsts[1][2], m_vsConsts.floatConsts[1][3]);
-            }
-            m_vsConstDynamicOffset = static_cast<uint32_t>(vsOffset);
-            m_psConstDynamicOffset = static_cast<uint32_t>(psOffset);
-            m_constantRingCursor += slotSize;
-        }
-        m_constantsDirty = false;
-    }
-
     /* Descriptor sets are immutable once a recorded draw references them.
      * Cache one set per texture/sampler tuple so state changes never force a
      * queue-idle just to rewrite a shared set. */
@@ -2045,6 +2079,18 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         bool stageBound = (m_stages[i].sid != SVGA3D_INVALID_ID && m_stages[i].sid != 0);
         VlknSurface *surf = stageBound ? m_surfaceMgr->getSurface(m_stages[i].sid) : nullptr;
         if (surf && surf->imageView()) {
+            /* A surface whose mip chain was produced by rendering (the
+             * guest's GenerateMipmap path) starts with a sampled view of
+             * level 0 only; uploads and the autogen blit are the other
+             * expansion triggers and neither fires for that path. Expand
+             * the view here so mip-filtered sampling can reach the chain. */
+            if (m_stages[i].mipFilter != SVGA3D_TEX_FILTER_NONE) {
+                if (!surf->ensureViewMipLevels(surf->mipLevels())) {
+                    /* The helper logged the failure and the surface kept
+                     * its previous view, so this stage samples the levels
+                     * that view covers instead of a destroyed/null view. */
+                }
+            }
             imageInfos[i].imageView = surf->imageView();
             imageInfos[i].sampler = getOrCreateSampler(i);
         } else {
@@ -2122,8 +2168,7 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
                 barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
                 barrier.oldLayout = surf->currentLayout();
                 barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                barrier.srcAccessMask = (surf->currentLayout() == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) ?
-                                        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0;
+                barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
                 barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
                 barrier.image = surf->image();
                 barrier.subresourceRange.aspectMask = surf->isDepthStencil() ?
@@ -2215,7 +2260,64 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         }
     }
 
-    ensureRenderPassActive();
+    Svga3VlknStatus rpStatus = ensureRenderPassActive();
+    if (rpStatus != SVGA3_VLKN_SUCCESS) return rpStatus;
+    /* Framebuffer/buffer changes above can submit previous work. Allocate
+     * constants after those submissions, so the next draw cannot reset the
+     * ring over a slot allocated before the submission but bound afterward. */
+    /* 1. Update Constant Buffers (UBOs)
+     * Upload on EVERY draw, not only when the guest resent constants.
+     * A draw that skips the upload binds the previous draw's ring slot;
+     * when the epoch later resets (any submission completes), the next
+     * upload rewrites that slot while the skipping draw may still be
+     * recorded-but-unsubmitted, so it executes with another draw's
+     * constants. A private slot per draw removes the aliasing; the
+     * ring-full path below already submits+waits before any reuse. */
+    {
+        if (m_constantRingMapped && m_constantRingBuffer) {
+            const uint64_t submissionSerial = m_backend->completedSubmissionSerial();
+            if (submissionSerial != m_constantRingSubmissionSerial) {
+                m_constantRingCursor = 0;
+                m_constantRingSubmissionSerial = submissionSerial;
+            }
+            const size_t slotSize = m_constantRingStride * 2;
+            if (m_constantRingCursor + slotSize > m_constantRingSize) {
+                /* The ring is full. Submit and wait before reusing any slice. */
+                endRenderPassIfActive();
+                Svga3VlknStatus fst = m_backend->flushCommandBuffer();
+                if (fst != SVGA3_VLKN_SUCCESS) return fst;
+                m_constantRingCursor = 0;
+                m_constantRingSubmissionSerial = m_backend->completedSubmissionSerial();
+                rpStatus = ensureRenderPassActive();
+                if (rpStatus != SVGA3_VLKN_SUCCESS) return rpStatus;
+            }
+
+            const size_t vsOffset = m_constantRingCursor;
+            const size_t psOffset = vsOffset + m_constantRingStride;
+            uint8_t *mapped = static_cast<uint8_t*>(m_constantRingMapped);
+            if (m_boundVS == SVGA3D_INVALID_ID) {
+                float tempConsts[256][4];
+                memcpy(tempConsts, m_vsConsts.floatConsts, sizeof(tempConsts));
+                for (int col = 0; col < 4; ++col) {
+                    for (int row = 0; row < 4; ++row) {
+                        tempConsts[col][row] = ffMvp[row * 4 + col];
+                    }
+                }
+                memcpy(mapped + vsOffset, tempConsts, sizeof(tempConsts));
+                m_lastFfMvp = ffMvp;
+                m_vsConstsUploadedForFf = true;
+            } else {
+                memcpy(mapped + vsOffset, m_vsConsts.floatConsts, sizeof(m_vsConsts.floatConsts));
+                m_vsConstsUploadedForFf = false;
+            }
+            memcpy(mapped + psOffset, m_psConsts.floatConsts, sizeof(m_psConsts.floatConsts));
+            m_vsConstDynamicOffset = static_cast<uint32_t>(vsOffset);
+            m_psConstDynamicOffset = static_cast<uint32_t>(psOffset);
+            m_constantRingCursor += slotSize;
+        }
+        m_constantsDirty = false;
+    }
+
     VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
 
     /* Draw tracing inspects and maps vertex buffers. Keep it opt-in so normal
@@ -2309,7 +2411,7 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
     VkPipeline pipeline = getOrCreatePipeline(primitiveType, decls, numDecls, m_activeRenderPass);
     if (pipeline == VK_NULL_HANDLE) {
         endRenderPassIfActive();
-        return SVGA3_VLKN_SUCCESS;
+        return SVGA3_VLKN_ERROR_DEVICE_LOST;
     }
     m_backend->dispatch().vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
@@ -2320,7 +2422,8 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         );
     }
 
-    m_backend->dispatch().vkCmdSetViewport(cb, 0, 1, &m_viewport);
+    VkViewport drawViewport = rasterViewport();
+    m_backend->dispatch().vkCmdSetViewport(cb, 0, 1, &drawViewport);
     VkRect2D activeScissor = m_scissor;
     if (!m_renderStates[SVGA3D_RS_SCISSORTESTENABLE]) {
         activeScissor.offset.x = (int32_t)m_viewport.x;
@@ -2386,7 +2489,10 @@ Svga3VlknStatus VlknContext::draw(SVGA3dPrimitiveType primitiveType,
         SVGA3dPrimitiveType ptype = (r.primType != SVGA3D_PRIMITIVE_INVALID) ? (SVGA3dPrimitiveType)r.primType : primitiveType;
         if (i == 0 || ptype != currentBoundType) {
             VkPipeline pipe = getOrCreatePipeline(ptype, decls, numDecls, m_activeRenderPass);
-            if (pipe == VK_NULL_HANDLE) continue;
+            if (pipe == VK_NULL_HANDLE) {
+                endRenderPassIfActive();
+                return SVGA3_VLKN_ERROR_DEVICE_LOST;
+            }
             m_backend->dispatch().vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             currentBoundType = ptype;
         }
@@ -2446,7 +2552,8 @@ Svga3VlknStatus VlknContext::endQuery(SVGA3dQueryType type) {
     if (m_queryPool != VK_NULL_HANDLE) {
         VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
         m_backend->dispatch().vkCmdEndQuery(cb, m_queryPool, 0);
-        m_backend->flushCommandBuffer();
+        Svga3VlknStatus fst = m_backend->flushCommandBuffer();
+        if (fst != SVGA3_VLKN_SUCCESS) return fst;
     }
     m_queryActive = false;
     m_queryEnded = true;
@@ -2457,7 +2564,8 @@ Svga3VlknStatus VlknContext::waitForQuery(SVGA3dQueryType type, uint32_t *outRes
     if (type >= SVGA3D_QUERYTYPE_MAX) return SVGA3_VLKN_ERROR_INVALID_PARAM;
     if (!m_queryEnded && !m_queryActive) return SVGA3_VLKN_ERROR_INVALID_PARAM;
 
-    m_backend->waitIdle();
+    const Svga3VlknStatus completed = m_backend->waitIdle();
+    if (completed != SVGA3_VLKN_SUCCESS) return completed;
     uint64_t pixels = 0;
     if (m_queryPool != VK_NULL_HANDLE) {
         VkResult res = m_backend->dispatch().vkGetQueryPoolResults(
@@ -2472,7 +2580,7 @@ Svga3VlknStatus VlknContext::waitForQuery(SVGA3dQueryType type, uint32_t *outRes
         if (res == VK_SUCCESS) {
             m_lastQueryResult = (uint32_t)pixels;
         } else {
-            m_lastQueryResult = (uint32_t)(m_vertexCount > 0 ? (m_drawCount * 1920) : 0);
+            return SVGA3_VLKN_ERROR_DEVICE_LOST;
         }
     } else {
         m_lastQueryResult = (uint32_t)(m_vertexCount > 0 ? (m_drawCount * 1920) : 0);
@@ -2514,6 +2622,9 @@ Svga3VlknStatus VlknContextManager::createContext(uint32_t cid) {
         return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
     }
 
+    // A new context initializes fallback textures on the shared command
+    // buffer, so finish any other context's pass before those transfers.
+    endAllRenderPasses();
     m_contexts[cid] = std::make_unique<VlknContext>(m_backend, m_surfaceMgr, cid);
     return SVGA3_VLKN_SUCCESS;
 }

@@ -57,6 +57,7 @@ struct Svga3Shader {
     std::vector<uint32_t> bytecode;
     VkShaderModule module;
     uint32_t inputLocationMask;
+    bool hasFragmentSideEffects = true;
     /* Pixel shaders are recompiled per depth-sampler mask. Bit N means stage N
      * was a depth texture when that variant was built. */
     std::unordered_map<uint32_t, VkShaderModule> depthVariants;
@@ -136,6 +137,32 @@ public:
     Svga3VlknStatus setViewport(const SVGA3dRect *rect);
     Svga3VlknStatus setScissorRect(const SVGA3dRect *rect);
     const VkViewport& getViewport() const { return m_viewport; }
+    /* Viewport actually submitted to Vulkan for rasterization.
+     * SVGA3D's raster grid is anchored half a pixel off Vulkan's:
+     * the guest emits D3D9 positions that assume fragment inputs are
+     * evaluated at window points offset by (+0.5,-0.5) px (GL
+     * orientation) from Vulkan pixel centers -- the same convention
+     * that makes SVGA vPos integer pixel indices rather than centers.
+     * Real SVGA hardware evaluates on that offset grid; Vulkan does
+     * not, so unmodified positions land half a pixel off and every
+     * varying (and coverage edge) is sampled at the wrong point.
+     * Translating the viewport by (+0.5,+0.5) framebuffer px moves
+     * geometry by the complementary amount, putting evaluation back
+     * on the guest's grid. The shift is expressed in Vulkan's Y-down
+     * framebuffer coordinates: the guest's GL-orientation -0.5 Y offset
+     * appears as +0.5 here because this viewport keeps a positive
+     * height (no negative-height Y-flip). If a Y-flip is ever
+     * introduced, this shift and the translator's vPos subtract must
+     * change together or the correction double-applies. m_viewport
+     * itself keeps guest values:
+     * scissor fallbacks and clear rects are integer pixel regions
+     * in guest surface space and must not shift. */
+    VkViewport rasterViewport() const {
+        VkViewport v = m_viewport;
+        v.x += 0.5f;
+        v.y += 0.5f;
+        return v;
+    }
     const VkRect2D& getScissor() const { return m_scissor; }
 
     /* Transforms & Geometry */
@@ -272,6 +299,7 @@ private:
     VkDescriptorSetLayout m_descriptorSetLayout;
     VkDescriptorSet m_descriptorSet;
     std::map<std::array<uint64_t, SVGA3_MAX_TEXTURE_STAGES * 2>, VkDescriptorSet> m_descriptorSetCache;
+    std::map<std::array<uint32_t, 9>, VkSampler> m_samplerCache;
     bool m_descriptorSetInitialized;
     bool m_descriptorSetDirty;
     bool m_constantsDirty;

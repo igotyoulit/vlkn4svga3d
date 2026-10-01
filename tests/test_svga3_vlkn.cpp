@@ -1513,6 +1513,148 @@ static void TestFlushPropagatesWaitFailures() {
     svga3_vlkn_device_destroy(dev);
 }
 
+static VkResult VKAPI_CALL failAllSubmits(VkQueue queue, uint32_t count,
+                                         const VkSubmitInfo *info, VkFence fence) {
+    (void)queue; (void)count; (void)info; (void)fence;
+    return VK_ERROR_DEVICE_LOST;
+}
+
+/* Failure-injection (issue #12): a failed flush must propagate out of the
+ * surface transfer paths instead of being silently discarded as SUCCESS. */
+static void TestSurfaceTransfersPropagateFlushFailures() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create flush-propagation regression device");
+    if (!dev) return;
+
+    SVGA3dSize size = {64, 64, 1};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 9201, 0, SVGA3D_X8R8G8B8, &size, 1) ==
+                   SVGA3_VLKN_SUCCESS,
+               "Define flush-propagation surface A");
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 9202, 0, SVGA3D_X8R8G8B8, &size, 1) ==
+                   SVGA3_VLKN_SUCCESS,
+               "Define flush-propagation surface B");
+
+    auto &dispatch = dev->backend->dispatch();
+    PFN_vkQueueSubmit saved = dispatch.vkQueueSubmit;
+    dispatch.vkQueueSubmit = failAllSubmits;
+
+    std::vector<uint32_t> pixels(64 * 64, 0x11223344u);
+    SVGA3dBox box = { 0, 0, 0, 64, 64, 1 };
+    TEST_CHECK(svga3_vlkn_surface_dma_upload(dev, 9201, 0, &box, pixels.data(),
+                                            64 * sizeof(uint32_t)) != SVGA3_VLKN_SUCCESS,
+               "dma_upload propagates flush/submit failure");
+
+    SVGA3dCopyBox cbox;
+    cbox.x = 0; cbox.y = 0; cbox.z = 0;
+    cbox.w = 64; cbox.h = 64; cbox.d = 1;
+    cbox.srcx = 0; cbox.srcy = 0; cbox.srcz = 0;
+    TEST_CHECK(svga3_vlkn_surface_copy(dev, 9201, 9202, &cbox, 1) != SVGA3_VLKN_SUCCESS,
+               "surface_copy propagates flush/submit failure");
+
+    dispatch.vkQueueSubmit = saved;
+    TEST_CHECK(svga3_vlkn_context_create(dev, 9201) == SVGA3_VLKN_SUCCESS,
+               "Create query failure regression context");
+    TEST_CHECK(svga3_vlkn_context_begin_query(dev, 9201, SVGA3D_QUERYTYPE_OCCLUSION) == SVGA3_VLKN_SUCCESS &&
+               svga3_vlkn_context_end_query(dev, 9201, SVGA3D_QUERYTYPE_OCCLUSION) == SVGA3_VLKN_SUCCESS,
+               "Complete query before injected device wait failure");
+    auto savedDeviceWait = dispatch.vkDeviceWaitIdle;
+    g_savedErrorDeviceWait = savedDeviceWait;
+    dispatch.vkDeviceWaitIdle = injectDeviceWaitResult;
+    g_injectedDeviceWaitResult = VK_ERROR_DEVICE_LOST;
+    uint32_t result = 0x12345678;
+    TEST_CHECK(svga3_vlkn_context_wait_for_query(dev, 9201, SVGA3D_QUERYTYPE_OCCLUSION, &result) == SVGA3_VLKN_ERROR_DEVICE_LOST && result == 0x12345678,
+               "Query wait propagates device loss without writing a successful result");
+    g_injectedDeviceWaitResult = VK_SUCCESS;
+    dispatch.vkDeviceWaitIdle = savedDeviceWait;
+    svga3_vlkn_device_destroy(dev);
+}
+
+static VkResult VKAPI_CALL failCreateFramebuffer(VkDevice device,
+                                                 const VkFramebufferCreateInfo *info,
+                                                 const VkAllocationCallbacks *alloc,
+                                                 VkFramebuffer *framebuffer) {
+    (void)device; (void)info; (void)alloc; (void)framebuffer;
+    return VK_ERROR_DEVICE_LOST;
+}
+
+/* Review findings (PR #16): clear()/draw() discarded the
+ * ensureRenderPassActive() status and recorded commands with no render
+ * pass active when framebuffer creation failed, and ensureBufferSize()
+ * leaked its growth budget reservation when the pre-growth flush failed.
+ * Both failures must propagate and leave no residue. */
+static void TestRenderPassAndGrowthFlushFailuresPropagate() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create review-findings regression device");
+    if (!dev) return;
+
+    SVGA3dSize size = {64, 64, 1};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 9301, SVGA3D_SURFACE_HINT_RENDERTARGET,
+                                         SVGA3D_A8R8G8B8, &size, 1) == SVGA3_VLKN_SUCCESS,
+               "Define review-findings render target");
+    TEST_CHECK(svga3_vlkn_context_create(dev, 9301) == SVGA3_VLKN_SUCCESS,
+               "Create review-findings context");
+    TEST_CHECK(svga3_vlkn_context_set_render_target(dev, 9301, SVGA3D_RT_COLOR0, 9301, 0, 0) ==
+                   SVGA3_VLKN_SUCCESS,
+               "Bind review-findings render target");
+
+    auto &dispatch = dev->backend->dispatch();
+    PFN_vkCreateFramebuffer savedCreateFb = dispatch.vkCreateFramebuffer;
+    dispatch.vkCreateFramebuffer = failCreateFramebuffer;
+
+    TEST_CHECK(svga3_vlkn_context_clear(dev, 9301, SVGA3D_CLEAR_COLOR, 0xff336699, 1.0f, 0,
+                                        nullptr, 0) != SVGA3_VLKN_SUCCESS,
+               "clear propagates render-pass activation failure");
+
+    SVGA3dVertexDecl decls[2];
+    memset(decls, 0, sizeof(decls));
+    decls[0].identity.usage = SVGA3D_DECLUSAGE_POSITION;
+    decls[0].identity.type = SVGA3D_DECLTYPE_FLOAT3;
+    decls[0].array.stride = 24;
+    decls[1].identity.usage = SVGA3D_DECLUSAGE_COLOR;
+    decls[1].identity.type = SVGA3D_DECLTYPE_D3DCOLOR;
+    decls[1].array.stride = 24;
+    decls[1].array.offset = 12;
+    SVGA3dPrimitiveRange range;
+    memset(&range, 0, sizeof(range));
+    range.primType = SVGA3D_PRIMITIVE_TRIANGLELIST;
+    range.primitiveCount = 1;
+    TEST_CHECK(svga3_vlkn_context_draw(dev, 9301, SVGA3D_PRIMITIVE_TRIANGLELIST,
+                                       decls, 2, &range, 1) != SVGA3_VLKN_SUCCESS,
+               "draw propagates render-pass activation failure");
+
+    dispatch.vkCreateFramebuffer = savedCreateFb;
+    TEST_CHECK(svga3_vlkn_context_clear(dev, 9301, SVGA3D_CLEAR_COLOR, 0xff336699, 1.0f, 0,
+                                        nullptr, 0) == SVGA3_VLKN_SUCCESS,
+               "Clear recovers once framebuffer creation succeeds again");
+
+    /* ensureBufferSize: a failed pre-growth flush must release the
+     * growth budget reservation it took before flushing. */
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 9302, 0, SVGA3D_X8R8G8B8, &size, 1) ==
+                   SVGA3_VLKN_SUCCESS,
+               "Define growth-budget surface");
+    svga3_vlkn::VlknSurface *surf = dev->surfaceMgr->getSurface(9302);
+    TEST_CHECK(surf != nullptr, "Growth-budget surface resolves");
+    if (surf) {
+        uint64_t budgetBefore = dev->backend->resourceBudgets().surfaceBytes();
+        dev->backend->getActiveCommandBuffer(); /* make the flush submit */
+        PFN_vkQueueSubmit savedSubmit = dispatch.vkQueueSubmit;
+        dispatch.vkQueueSubmit = failAllSubmits;
+        TEST_CHECK(surf->ensureBufferSize(1u << 20) != SVGA3_VLKN_SUCCESS,
+                   "Buffer growth propagates flush failure");
+        TEST_CHECK(dev->backend->resourceBudgets().surfaceBytes() == budgetBefore,
+                   "Failed growth flush releases the reserved growth budget");
+        dispatch.vkQueueSubmit = savedSubmit;
+        TEST_CHECK(surf->ensureBufferSize(1u << 20) == SVGA3_VLKN_SUCCESS,
+                   "Buffer growth succeeds once the flush recovers");
+    }
+
+    svga3_vlkn_device_destroy(dev);
+}
+
 static void TestPendingWindowPresentsOnlyWhenDirty() {
     Svga3VlknConfig cfg{};
     cfg.forceMockBackend = true;
@@ -1535,6 +1677,67 @@ static void TestPendingWindowPresentsOnlyWhenDirty() {
                "Collect a newly drawn window surface once");
     auto second = dev->contextMgr->collectPendingWindowPresents();
     TEST_CHECK(second.empty(), "Do not re-present an unchanged window surface");
+
+    svga3_vlkn_device_destroy(dev);
+}
+
+static unsigned presentUpdateCount;
+static void countDisplayUpdate(void *, int32_t, int32_t, int32_t, int32_t) {
+    ++presentUpdateCount;
+}
+
+static void TestPresentAlwaysCopies() {
+    /* PRESENT is a command to copy now: the framebuffer is shared state
+     * the driver does not own (the display layer may reset or redraw it
+     * at the same address), so re-presenting an unchanged surface must
+     * still copy and notify. A duplicate-present suppression here once
+     * dropped partial presents after a framebuffer reset
+     * (test_presentation Test 2). */
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create present-contract regression device");
+    if (!dev) return;
+
+    static std::vector<uint32_t> fb(128 * 128, 0);
+    TEST_CHECK(svga3_vlkn_device_set_framebuffer(dev, fb.data(), 0xE0000000ULL,
+                                                 fb.size() * sizeof(uint32_t),
+                                                 128, 128, 128 * 4, 4) == SVGA3_VLKN_SUCCESS,
+               "Register framebuffer for present contract");
+    TEST_CHECK(svga3_vlkn_device_set_display_callback(dev, nullptr, countDisplayUpdate) == SVGA3_VLKN_SUCCESS,
+               "Register display update counter");
+    SVGA3dSize size = {128, 128, 1};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 42, 0, SVGA3D_A8R8G8B8, &size, 1) == SVGA3_VLKN_SUCCESS,
+               "Define presentable surface");
+
+    std::vector<uint8_t> pixels(128 * 128 * 4, 0x7F);
+    TEST_CHECK(svga3_vlkn_surface_dma_upload(dev, 42, 0, nullptr, pixels.data(), 128 * 4) == SVGA3_VLKN_SUCCESS,
+               "Upload surface content");
+
+    presentUpdateCount = 0;
+    TEST_CHECK(svga3_vlkn_surface_present(dev, 42, nullptr, 0) == SVGA3_VLKN_SUCCESS,
+               "First present succeeds");
+    TEST_CHECK(presentUpdateCount == 1, "First present notifies display once");
+    TEST_CHECK(fb[0] == 0x7F7F7F7Fu, "First present copies surface into framebuffer");
+
+    /* Simulate the display layer resetting the framebuffer in place
+     * (same address, same size): the surface is unchanged, but the
+     * framebuffer no longer holds the frame. */
+    fb[0] = 0;
+    fb[64 * 128 + 64] = 0;
+    TEST_CHECK(svga3_vlkn_surface_present(dev, 42, nullptr, 0) == SVGA3_VLKN_SUCCESS,
+               "Re-present of unchanged surface succeeds");
+    TEST_CHECK(presentUpdateCount == 2, "Re-present of unchanged surface still notifies");
+    TEST_CHECK(fb[0] == 0x7F7F7F7Fu && fb[64 * 128 + 64] == 0x7F7F7F7Fu,
+               "Re-present restores framebuffer contents after external reset");
+
+    /* A partial present after a full present must copy its rects too. */
+    SVGA3dCopyRect rect = {10, 10, 20, 20, 0, 0};
+    fb[10 * 128 + 10] = 0;
+    TEST_CHECK(svga3_vlkn_surface_present(dev, 42, &rect, 1) == SVGA3_VLKN_SUCCESS,
+               "Partial present succeeds");
+    TEST_CHECK(fb[10 * 128 + 10] == 0x7F7F7F7Fu,
+               "Partial present copies its rectangle after a full present");
 
     svga3_vlkn_device_destroy(dev);
 }
@@ -1613,6 +1816,482 @@ static void TestDepthVariantCleanup() {
     }
 }
 
+static PFN_vkCreateGraphicsPipelines savedCreatePipelines;
+static uint32_t capturedBlendAttachmentCount;
+static unsigned pipelineCreateCalls;
+static VkResult VKAPI_CALL capturePipelineCreate(VkDevice device, VkPipelineCache cache,
+                                                 uint32_t createInfoCount,
+                                                 const VkGraphicsPipelineCreateInfo *infos,
+                                                 const VkAllocationCallbacks *allocator,
+                                                 VkPipeline *pipelines) {
+    ++pipelineCreateCalls;
+    if (createInfoCount > 0 && infos && infos[0].pColorBlendState) {
+        capturedBlendAttachmentCount = infos[0].pColorBlendState->attachmentCount;
+    }
+    return savedCreatePipelines(device, cache, createInfoCount, infos, allocator, pipelines);
+}
+
+static void TestDepthOnlyPipelineBlendState() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create depth-only pipeline regression device");
+    if (!dev) return;
+    TEST_CHECK(svga3_vlkn_context_create(dev, 1) == SVGA3_VLKN_SUCCESS, "Create depth-only pipeline context");
+    auto *ctx = dev->contextMgr->getContext(1);
+    TEST_CHECK(ctx != nullptr, "Find depth-only pipeline context");
+    if (!ctx) { svga3_vlkn_device_destroy(dev); return; }
+    SVGA3dSize size = {64, 64, 1};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 1, 0, SVGA3D_A8R8G8B8, &size, 1) == SVGA3_VLKN_SUCCESS,
+               "Create color target for pipeline test");
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 2, 0, SVGA3D_Z_D16, &size, 1) == SVGA3_VLKN_SUCCESS,
+               "Create depth target for pipeline test");
+    auto &dispatch = dev->backend->dispatch();
+    savedCreatePipelines = dispatch.vkCreateGraphicsPipelines;
+    dispatch.vkCreateGraphicsPipelines = capturePipelineCreate;
+
+    SVGA3dPrimitiveRange range{};
+    range.primType = SVGA3D_PRIMITIVE_TRIANGLELIST;
+    range.primitiveCount = 1;
+
+    /* Color + depth bound: the pipeline must declare one blend attachment. */
+    ctx->setRenderTarget(SVGA3D_RT_COLOR0, 1, 0, 0);
+    ctx->setRenderTarget(SVGA3D_RT_DEPTH, 2, 0, 0);
+    pipelineCreateCalls = 0;
+    capturedBlendAttachmentCount = 0xFFFFFFFFu;
+    TEST_CHECK(ctx->draw(range.primType, nullptr, 0, &range, 1) == SVGA3_VLKN_SUCCESS,
+               "Draw with color and depth targets");
+    TEST_CHECK(pipelineCreateCalls >= 1, "Pipeline created for color+depth draw");
+    TEST_CHECK(capturedBlendAttachmentCount == 1, "Color pipeline declares one blend attachment");
+
+    /* Depth only: the render pass has no color attachment, so the pipeline
+     * must declare zero blend attachments or creation is invalid. */
+    ctx->setRenderTarget(SVGA3D_RT_COLOR0, SVGA3D_INVALID_ID, 0, 0);
+    pipelineCreateCalls = 0;
+    capturedBlendAttachmentCount = 0xFFFFFFFFu;
+    TEST_CHECK(ctx->draw(range.primType, nullptr, 0, &range, 1) == SVGA3_VLKN_SUCCESS,
+               "Draw with depth target only");
+    TEST_CHECK(pipelineCreateCalls >= 1, "Pipeline created for depth-only draw");
+    TEST_CHECK(capturedBlendAttachmentCount == 0, "Depth-only pipeline declares zero blend attachments");
+
+    dispatch.vkCreateGraphicsPipelines = savedCreatePipelines;
+    svga3_vlkn_device_destroy(dev);
+}
+
+/* --------------------------------------------------------------------------
+ * Rendering-correctness regressions for the glmark2 validation gate.
+ * Each test pins one proven root cause:
+ *  - raster grid: guest D3D positions assume evaluation half a pixel off
+ *    Vulkan's grid; the draw viewport must carry the (+0.5,+0.5) shift
+ *    while the stored guest viewport stays unshifted.
+ *  - blend: D3D9 alpha selection — with SEPARATEALPHABLENDENABLE off,
+ *    alpha blends with the COLOR factors/equation and the *ALPHA states
+ *    are ignored; with it on, the *ALPHA states rule. Guests driving
+ *    non-separate blending only emit the *ALPHA states in separate
+ *    mode, so honoring them unconditionally blended alpha with stale
+ *    ONE/ZERO defaults (glmark2 desktop blur/shadow pixel failures).
+ *  - mip render target: the framebuffer/render area must use the bound
+ *    mip level's dimensions, not the base level's.
+ *  - mip copy: surface copies must honor the command's mip/face selection.
+ *  - constant ring: every draw uploads to a private ring slot; a draw
+ *    binding the previous draw's slot was rewritten by the next epoch.
+ *  - mip sampling: a render-generated mip chain must be reachable -- the
+ *    sampled view expands to all levels and the sampler maxLod follows
+ *    the image's level count, not the view's initial single level.
+ * -------------------------------------------------------------------------- */
+static PFN_vkCmdSetViewport savedCmdSetViewport;
+static VkViewport capturedDrawViewport;
+static unsigned setViewportCalls;
+static void VKAPI_CALL captureCmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t count,
+                                             const VkViewport *viewports) {
+    if (count > 0 && viewports) { capturedDrawViewport = viewports[0]; ++setViewportCalls; }
+    savedCmdSetViewport(cb, first, count, viewports);
+}
+
+static void TestRasterViewportCompensation() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create raster viewport regression device");
+    if (!dev) return;
+    TEST_CHECK(svga3_vlkn_context_create(dev, 1) == SVGA3_VLKN_SUCCESS, "Create raster viewport context");
+    auto *ctx = dev->contextMgr->getContext(1);
+    SVGA3dSize size = {64, 64, 1};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 1, 0, SVGA3D_A8R8G8B8, &size, 1) == SVGA3_VLKN_SUCCESS,
+               "Create raster viewport render target");
+    ctx->setRenderTarget(SVGA3D_RT_COLOR0, 1, 0, 0);
+    SVGA3dRect rect = {4, 8, 32, 16};
+    TEST_CHECK(ctx->setViewport(&rect) == SVGA3_VLKN_SUCCESS, "Set guest viewport");
+
+    /* The stored viewport keeps guest values (scissor/clear math depends
+     * on them); only the rasterization viewport is shifted. */
+    TEST_CHECK(ctx->getViewport().x == 4.0f && ctx->getViewport().y == 8.0f,
+               "Stored viewport keeps guest coordinates");
+    VkViewport rv = ctx->rasterViewport();
+    TEST_CHECK(rv.x == 4.5f && rv.y == 8.5f && rv.width == 32.0f && rv.height == 16.0f,
+               "Raster viewport shifted by (+0.5,+0.5)");
+
+    auto &dispatch = dev->backend->dispatch();
+    savedCmdSetViewport = dispatch.vkCmdSetViewport;
+    dispatch.vkCmdSetViewport = captureCmdSetViewport;
+    setViewportCalls = 0;
+    SVGA3dPrimitiveRange range{};
+    range.primType = SVGA3D_PRIMITIVE_TRIANGLELIST;
+    range.primitiveCount = 1;
+    TEST_CHECK(ctx->draw(range.primType, nullptr, 0, &range, 1) == SVGA3_VLKN_SUCCESS,
+               "Draw for raster viewport capture");
+    TEST_CHECK(setViewportCalls >= 1, "Draw sets a viewport");
+    TEST_CHECK(capturedDrawViewport.x == 4.5f && capturedDrawViewport.y == 8.5f,
+               "Draw binds the shifted raster viewport");
+    dispatch.vkCmdSetViewport = savedCmdSetViewport;
+    svga3_vlkn_device_destroy(dev);
+}
+
+static PFN_vkCreateGraphicsPipelines savedCreatePipelinesBlend;
+static VkPipelineColorBlendAttachmentState capturedBlendAttach;
+static bool capturedBlendValid;
+static VkResult VKAPI_CALL capturePipelineBlend(VkDevice device, VkPipelineCache cache,
+                                                uint32_t createInfoCount,
+                                                const VkGraphicsPipelineCreateInfo *infos,
+                                                const VkAllocationCallbacks *allocator,
+                                                VkPipeline *pipelines) {
+    if (createInfoCount > 0 && infos && infos[0].pColorBlendState &&
+        infos[0].pColorBlendState->attachmentCount > 0 && infos[0].pColorBlendState->pAttachments) {
+        capturedBlendAttach = infos[0].pColorBlendState->pAttachments[0];
+        capturedBlendValid = true;
+    }
+    return savedCreatePipelinesBlend(device, cache, createInfoCount, infos, allocator, pipelines);
+}
+
+static void TestSeparateAlphaBlendFactors() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create blend regression device");
+    if (!dev) return;
+    TEST_CHECK(svga3_vlkn_context_create(dev, 1) == SVGA3_VLKN_SUCCESS, "Create blend context");
+    auto *ctx = dev->contextMgr->getContext(1);
+    SVGA3dSize size = {64, 64, 1};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 1, 0, SVGA3D_A8R8G8B8, &size, 1) == SVGA3_VLKN_SUCCESS,
+               "Create blend render target");
+    ctx->setRenderTarget(SVGA3D_RT_COLOR0, 1, 0, 0);
+    ctx->setRenderState(SVGA3D_RS_BLENDENABLE, 1);
+    ctx->setRenderState(SVGA3D_RS_SRCBLEND, SVGA3D_BLENDOP_SRCALPHA);
+    ctx->setRenderState(SVGA3D_RS_DSTBLEND, SVGA3D_BLENDOP_INVSRCALPHA);
+    ctx->setRenderState(SVGA3D_RS_BLENDEQUATION, SVGA3D_BLENDEQ_ADD);
+    /* Distinct alpha states, deliberately different from the color
+     * states: with separate alpha blending disabled, D3D9 selects the
+     * COLOR factors/equation for the alpha channel and the *ALPHA
+     * states are ignored. */
+    ctx->setRenderState(SVGA3D_RS_SRCBLENDALPHA, SVGA3D_BLENDOP_ONE);
+    ctx->setRenderState(SVGA3D_RS_DSTBLENDALPHA, SVGA3D_BLENDOP_ZERO);
+    ctx->setRenderState(SVGA3D_RS_BLENDEQUATIONALPHA, SVGA3D_BLENDEQ_SUBTRACT);
+    ctx->setRenderState(SVGA3D_RS_SEPARATEALPHABLENDENABLE, 0);
+
+    auto &dispatch = dev->backend->dispatch();
+    savedCreatePipelinesBlend = dispatch.vkCreateGraphicsPipelines;
+    dispatch.vkCreateGraphicsPipelines = capturePipelineBlend;
+    SVGA3dPrimitiveRange range{};
+    range.primType = SVGA3D_PRIMITIVE_TRIANGLELIST;
+    range.primitiveCount = 1;
+
+    capturedBlendValid = false;
+    TEST_CHECK(ctx->draw(range.primType, nullptr, 0, &range, 1) == SVGA3_VLKN_SUCCESS,
+               "Draw with separate alpha disabled");
+    TEST_CHECK(capturedBlendValid, "Pipeline captured for separate-alpha-off draw");
+    TEST_CHECK(capturedBlendAttach.srcColorBlendFactor == VK_BLEND_FACTOR_SRC_ALPHA &&
+               capturedBlendAttach.dstColorBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA &&
+               capturedBlendAttach.colorBlendOp == VK_BLEND_OP_ADD,
+               "Color blend factors as set");
+    TEST_CHECK(capturedBlendAttach.srcAlphaBlendFactor == VK_BLEND_FACTOR_SRC_ALPHA &&
+               capturedBlendAttach.dstAlphaBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA &&
+               capturedBlendAttach.alphaBlendOp == VK_BLEND_OP_ADD,
+               "Alpha mirrors the color factors when separate alpha is disabled");
+
+    /* Enable separate alpha blending: now the *ALPHA states rule, so
+     * the pipeline key changes and a new pipeline is created. */
+    ctx->setRenderState(SVGA3D_RS_SRCBLENDALPHA, SVGA3D_BLENDOP_ONE);
+    ctx->setRenderState(SVGA3D_RS_DSTBLENDALPHA, SVGA3D_BLENDOP_ZERO);
+    ctx->setRenderState(SVGA3D_RS_BLENDEQUATIONALPHA, SVGA3D_BLENDEQ_ADD);
+    ctx->setRenderState(SVGA3D_RS_SEPARATEALPHABLENDENABLE, 1);
+    capturedBlendValid = false;
+    TEST_CHECK(ctx->draw(range.primType, nullptr, 0, &range, 1) == SVGA3_VLKN_SUCCESS,
+               "Draw with separate alpha enabled");
+    TEST_CHECK(capturedBlendValid, "Pipeline captured for separate-alpha-on draw");
+    TEST_CHECK(capturedBlendAttach.srcAlphaBlendFactor == VK_BLEND_FACTOR_ONE &&
+               capturedBlendAttach.dstAlphaBlendFactor == VK_BLEND_FACTOR_ZERO &&
+               capturedBlendAttach.alphaBlendOp == VK_BLEND_OP_ADD,
+               "Alpha uses its own factors when separate alpha is enabled");
+    dispatch.vkCreateGraphicsPipelines = savedCreatePipelinesBlend;
+    svga3_vlkn_device_destroy(dev);
+}
+
+static PFN_vkCmdBeginRenderPass savedCmdBeginRenderPass;
+static VkRect2D capturedRenderArea;
+static unsigned beginRenderPassCalls;
+static void VKAPI_CALL captureCmdBeginRenderPass(VkCommandBuffer cb,
+                                                 const VkRenderPassBeginInfo *info,
+                                                 VkSubpassContents contents) {
+    if (info) { capturedRenderArea = info->renderArea; ++beginRenderPassCalls; }
+    savedCmdBeginRenderPass(cb, info, contents);
+}
+
+static void TestNonzeroMipRenderTarget() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create mip render target regression device");
+    if (!dev) return;
+    TEST_CHECK(svga3_vlkn_context_create(dev, 1) == SVGA3_VLKN_SUCCESS, "Create mip RT context");
+    auto *ctx = dev->contextMgr->getContext(1);
+    SVGA3dSize sizes[2] = {{64, 64, 1}, {32, 32, 1}};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 7, 0, SVGA3D_A8R8G8B8, sizes, 2) == SVGA3_VLKN_SUCCESS,
+               "Define two-level surface");
+    auto &dispatch = dev->backend->dispatch();
+    savedCmdBeginRenderPass = dispatch.vkCmdBeginRenderPass;
+    dispatch.vkCmdBeginRenderPass = captureCmdBeginRenderPass;
+    SVGA3dPrimitiveRange range{};
+    range.primType = SVGA3D_PRIMITIVE_TRIANGLELIST;
+    range.primitiveCount = 1;
+
+    ctx->setRenderTarget(SVGA3D_RT_COLOR0, 7, 0, 0);
+    beginRenderPassCalls = 0;
+    TEST_CHECK(ctx->draw(range.primType, nullptr, 0, &range, 1) == SVGA3_VLKN_SUCCESS,
+               "Draw to mip level 0");
+    TEST_CHECK(beginRenderPassCalls >= 1 &&
+               capturedRenderArea.extent.width == 64 && capturedRenderArea.extent.height == 64,
+               "Mip 0 render area is 64x64");
+    ctx->endRenderPassIfActive();
+
+    ctx->setRenderTarget(SVGA3D_RT_COLOR0, 7, 0, 1);
+    beginRenderPassCalls = 0;
+    TEST_CHECK(ctx->draw(range.primType, nullptr, 0, &range, 1) == SVGA3_VLKN_SUCCESS,
+               "Draw to mip level 1");
+    TEST_CHECK(beginRenderPassCalls >= 1 &&
+               capturedRenderArea.extent.width == 32 && capturedRenderArea.extent.height == 32,
+               "Mip 1 render area is 32x32, not the base level size");
+    dispatch.vkCmdBeginRenderPass = savedCmdBeginRenderPass;
+    svga3_vlkn_device_destroy(dev);
+}
+
+static PFN_vkCmdCopyImage savedCmdCopyImage;
+static uint32_t capturedCopySrcMip, capturedCopyDstMip;
+static unsigned copyImageCalls;
+static void VKAPI_CALL captureCmdCopyImage(VkCommandBuffer cb, VkImage src, VkImageLayout srcLayout,
+                                           VkImage dst, VkImageLayout dstLayout,
+                                           uint32_t regionCount, const VkImageCopy *regions) {
+    if (regionCount > 0 && regions) {
+        capturedCopySrcMip = regions[0].srcSubresource.mipLevel;
+        capturedCopyDstMip = regions[0].dstSubresource.mipLevel;
+        ++copyImageCalls;
+    }
+    savedCmdCopyImage(cb, src, srcLayout, dst, dstLayout, regionCount, regions);
+}
+
+static void TestMipLevelCopy() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create mip copy regression device");
+    if (!dev) return;
+    SVGA3dSize sizes[4] = {{64, 64, 1}, {32, 32, 1}, {16, 16, 1}, {8, 8, 1}};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 10, 0, SVGA3D_A8R8G8B8, sizes, 4) == SVGA3_VLKN_SUCCESS,
+               "Define four-level copy source");
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 11, 0, SVGA3D_A8R8G8B8, sizes, 4) == SVGA3_VLKN_SUCCESS,
+               "Define four-level copy destination");
+    auto &dispatch = dev->backend->dispatch();
+    savedCmdCopyImage = dispatch.vkCmdCopyImage;
+    dispatch.vkCmdCopyImage = captureCmdCopyImage;
+    SVGA3dCopyBox box{};
+    box.x = 0; box.y = 0; box.z = 0; box.w = 8; box.h = 8; box.d = 1;
+    box.srcx = 0; box.srcy = 0; box.srcz = 0;
+
+    copyImageCalls = 0;
+    TEST_CHECK(dev->surfaceMgr->copy(10, 11, &box, 1, 2, 0, 3, 0) == SVGA3_VLKN_SUCCESS,
+               "Copy mip 2 to mip 3 succeeds");
+    TEST_CHECK(copyImageCalls >= 1 && capturedCopySrcMip == 2 && capturedCopyDstMip == 3,
+               "Copy honors the command's mip levels");
+
+    copyImageCalls = 0;
+    TEST_CHECK(dev->surfaceMgr->copy(10, 11, &box, 1, 0, 0, 0, 0) == SVGA3_VLKN_SUCCESS,
+               "Copy mip 0 to mip 0 succeeds");
+    TEST_CHECK(copyImageCalls >= 1 && capturedCopySrcMip == 0 && capturedCopyDstMip == 0,
+               "Base-level copy still targets level 0");
+    dispatch.vkCmdCopyImage = savedCmdCopyImage;
+    svga3_vlkn_device_destroy(dev);
+}
+
+static PFN_vkCmdBindDescriptorSets savedCmdBindDescriptorSets;
+static uint32_t capturedDynOffsets[2];
+static unsigned bindDescriptorCalls;
+static void VKAPI_CALL captureCmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bindPoint,
+                                                    VkPipelineLayout layout, uint32_t firstSet,
+                                                    uint32_t setCount, const VkDescriptorSet *sets,
+                                                    uint32_t dynamicOffsetCount,
+                                                    const uint32_t *dynamicOffsets) {
+    if (dynamicOffsetCount >= 2 && dynamicOffsets) {
+        capturedDynOffsets[0] = dynamicOffsets[0];
+        capturedDynOffsets[1] = dynamicOffsets[1];
+        ++bindDescriptorCalls;
+    }
+    savedCmdBindDescriptorSets(cb, bindPoint, layout, firstSet, setCount, sets,
+                               dynamicOffsetCount, dynamicOffsets);
+}
+
+static void TestConstantRingPerDrawSlot() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create constant ring regression device");
+    if (!dev) return;
+    TEST_CHECK(svga3_vlkn_context_create(dev, 1) == SVGA3_VLKN_SUCCESS, "Create constant ring context");
+    auto *ctx = dev->contextMgr->getContext(1);
+    SVGA3dSize size = {64, 64, 1};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 1, 0, SVGA3D_A8R8G8B8, &size, 1) == SVGA3_VLKN_SUCCESS,
+               "Create constant ring render target");
+    ctx->setRenderTarget(SVGA3D_RT_COLOR0, 1, 0, 0);
+    auto &dispatch = dev->backend->dispatch();
+    savedCmdBindDescriptorSets = dispatch.vkCmdBindDescriptorSets;
+    dispatch.vkCmdBindDescriptorSets = captureCmdBindDescriptorSets;
+    SVGA3dPrimitiveRange range{};
+    range.primType = SVGA3D_PRIMITIVE_TRIANGLELIST;
+    range.primitiveCount = 1;
+
+    /* Constants never change and nothing is submitted between the draws:
+     * the exact pattern that aliased when upload was dirty-only. Every
+     * draw must still bind its own ring slot. */
+    uint32_t vsOffsets[3] = {0, 0, 0};
+    uint32_t psOffsets[3] = {0, 0, 0};
+    for (int i = 0; i < 3; ++i) {
+        bindDescriptorCalls = 0;
+        TEST_CHECK(ctx->draw(range.primType, nullptr, 0, &range, 1) == SVGA3_VLKN_SUCCESS,
+                   "Draw for constant ring slot capture");
+        TEST_CHECK(bindDescriptorCalls >= 1, "Draw binds descriptor set with dynamic offsets");
+        vsOffsets[i] = capturedDynOffsets[0];
+        psOffsets[i] = capturedDynOffsets[1];
+    }
+    TEST_CHECK(vsOffsets[0] != vsOffsets[1] && vsOffsets[1] != vsOffsets[2] &&
+               vsOffsets[0] != vsOffsets[2],
+               "Each draw gets a private VS constant ring slot");
+    TEST_CHECK(psOffsets[0] != psOffsets[1] && psOffsets[1] != psOffsets[2] &&
+               psOffsets[0] != psOffsets[2],
+               "Each draw gets a private PS constant ring slot");
+    TEST_CHECK(vsOffsets[1] > vsOffsets[0] && vsOffsets[2] > vsOffsets[1],
+               "Ring slots advance monotonically within an epoch");
+    dispatch.vkCmdBindDescriptorSets = savedCmdBindDescriptorSets;
+    svga3_vlkn_device_destroy(dev);
+}
+
+static PFN_vkCreateSampler savedCreateSampler;
+static float capturedSamplerMaxLod;
+static unsigned createSamplerCalls;
+static VkResult VKAPI_CALL captureCreateSampler(VkDevice device, const VkSamplerCreateInfo *info,
+                                                const VkAllocationCallbacks *allocator,
+                                                VkSampler *sampler) {
+    if (info) { capturedSamplerMaxLod = info->maxLod; ++createSamplerCalls; }
+    return savedCreateSampler(device, info, allocator, sampler);
+}
+static PFN_vkCreateImageView savedCreateImageView;
+static uint32_t capturedMaxViewLevels;
+static VkResult VKAPI_CALL captureCreateImageView(VkDevice device, const VkImageViewCreateInfo *info,
+                                                  const VkAllocationCallbacks *allocator,
+                                                  VkImageView *view) {
+    if (info && info->subresourceRange.levelCount > capturedMaxViewLevels) {
+        capturedMaxViewLevels = info->subresourceRange.levelCount;
+    }
+    return savedCreateImageView(device, info, allocator, view);
+}
+
+static void TestMipSampledViewAndSamplerLod() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create mip sampling regression device");
+    if (!dev) return;
+    TEST_CHECK(svga3_vlkn_context_create(dev, 1) == SVGA3_VLKN_SUCCESS, "Create mip sampling context");
+    auto *ctx = dev->contextMgr->getContext(1);
+    SVGA3dSize rtSize = {64, 64, 1};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 1, 0, SVGA3D_A8R8G8B8, &rtSize, 1) == SVGA3_VLKN_SUCCESS,
+               "Create mip sampling render target");
+    SVGA3dSize sizes[4] = {{64, 64, 1}, {32, 32, 1}, {16, 16, 1}, {8, 8, 1}};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 5, 0, SVGA3D_A8R8G8B8, sizes, 4) == SVGA3_VLKN_SUCCESS,
+               "Define four-level texture");
+    auto *texSurf = dev->surfaceMgr->getSurface(5);
+    TEST_CHECK(texSurf && texSurf->mipLevels() == 4, "Texture reports four mip levels");
+    /* Only level 0 was ever uploaded; the chain is render-generated, so
+     * the sampled view starts at a single level (the bug condition). */
+    TEST_CHECK(texSurf && texSurf->viewMipLevels() == 1,
+               "Sampled view starts at one level before expansion");
+    ctx->setRenderTarget(SVGA3D_RT_COLOR0, 1, 0, 0);
+    ctx->setTexture(0, 5);
+    ctx->setTextureStageState(0, SVGA3D_TS_MINFILTER, SVGA3D_TEX_FILTER_LINEAR);
+    ctx->setTextureStageState(0, SVGA3D_TS_MAGFILTER, SVGA3D_TEX_FILTER_LINEAR);
+    ctx->setTextureStageState(0, SVGA3D_TS_MIPFILTER, SVGA3D_TEX_FILTER_LINEAR);
+
+    auto &dispatch = dev->backend->dispatch();
+    savedCreateSampler = dispatch.vkCreateSampler;
+    savedCreateImageView = dispatch.vkCreateImageView;
+    dispatch.vkCreateSampler = captureCreateSampler;
+    dispatch.vkCreateImageView = captureCreateImageView;
+    createSamplerCalls = 0;
+    capturedSamplerMaxLod = -1.0f;
+    capturedMaxViewLevels = 0;
+    SVGA3dPrimitiveRange range{};
+    range.primType = SVGA3D_PRIMITIVE_TRIANGLELIST;
+    range.primitiveCount = 1;
+    TEST_CHECK(ctx->draw(range.primType, nullptr, 0, &range, 1) == SVGA3_VLKN_SUCCESS,
+               "Draw sampling the mipmapped texture");
+    TEST_CHECK(createSamplerCalls >= 1, "Sampler created for the sampling draw");
+    TEST_CHECK(capturedSamplerMaxLod == 3.0f,
+               "Sampler maxLod covers all four levels despite the single-level start");
+    TEST_CHECK(capturedMaxViewLevels == 4,
+               "Sampled view expanded to all four levels for the draw");
+    TEST_CHECK(texSurf->viewMipLevels() == 4, "Surface view level count updated by expansion");
+    dispatch.vkCreateSampler = savedCreateSampler;
+    dispatch.vkCreateImageView = savedCreateImageView;
+    svga3_vlkn_device_destroy(dev);
+}
+
+static VkResult VKAPI_CALL failCreateImageView(VkDevice, const VkImageViewCreateInfo *,
+                                               const VkAllocationCallbacks *, VkImageView *view) {
+    if (view) *view = VK_NULL_HANDLE;
+    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+}
+
+/* Review follow-up: view expansion used to destroy the old view before
+ * creating the wider one and ignored the creation result, so a failed
+ * vkCreateImageView left the surface with a dead view and a level count
+ * claiming levels it did not cover. Expansion must now fail atomically:
+ * status reported, previous view and level count preserved. */
+static void TestMipViewExpansionFailureKeepsOldView() {
+    Svga3VlknConfig cfg{};
+    cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    TEST_CHECK(dev != nullptr, "Create mip expansion failure device");
+    if (!dev) return;
+    SVGA3dSize sizes[4] = {{64, 64, 1}, {32, 32, 1}, {16, 16, 1}, {8, 8, 1}};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 5, 0, SVGA3D_A8R8G8B8, sizes, 4) == SVGA3_VLKN_SUCCESS,
+               "Define four-level texture for expansion failure");
+    auto *texSurf = dev->surfaceMgr->getSurface(5);
+    TEST_CHECK(texSurf && texSurf->viewMipLevels() == 1, "View starts at one level");
+    VkImageView originalView = texSurf ? texSurf->imageView() : VK_NULL_HANDLE;
+    TEST_CHECK(originalView != VK_NULL_HANDLE, "Original sampled view exists");
+
+    auto &dispatch = dev->backend->dispatch();
+    savedCreateImageView = dispatch.vkCreateImageView;
+    dispatch.vkCreateImageView = failCreateImageView;
+    bool expanded = texSurf->ensureViewMipLevels(4);
+    dispatch.vkCreateImageView = savedCreateImageView;
+    TEST_CHECK(!expanded, "Failed view creation reports expansion failure");
+    TEST_CHECK(texSurf->imageView() == originalView,
+               "Failed expansion keeps the previous view");
+    TEST_CHECK(texSurf->viewMipLevels() == 1,
+               "Failed expansion keeps the previous level count");
+    TEST_CHECK(texSurf->ensureViewMipLevels(4), "Expansion succeeds once creation recovers");
+    TEST_CHECK(texSurf->viewMipLevels() == 4, "Recovered expansion reaches all four levels");
+    svga3_vlkn_device_destroy(dev);
+}
+
 /* --------------------------------------------------------------------------
  * Main Test Runner
  * -------------------------------------------------------------------------- */
@@ -1623,8 +2302,19 @@ int main() {
 
     TestFenceWithoutWindow();
     TestFlushPropagatesWaitFailures();
+    TestSurfaceTransfersPropagateFlushFailures();
+    TestRenderPassAndGrowthFlushFailuresPropagate();
     TestPendingWindowPresentsOnlyWhenDirty();
+    TestPresentAlwaysCopies();
     TestDepthVariantCleanup();
+    TestDepthOnlyPipelineBlendState();
+    TestRasterViewportCompensation();
+    TestSeparateAlphaBlendFactors();
+    TestNonzeroMipRenderTarget();
+    TestMipLevelCopy();
+    TestConstantRingPerDrawSlot();
+    TestMipSampledViewAndSamplerLod();
+    TestMipViewExpansionFailureKeepsOldView();
     TestRenderPassEndingBatchesCommands();
     TestSurfaceFormatMappings();
     TestTopologyMappings();

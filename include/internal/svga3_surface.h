@@ -58,6 +58,7 @@ public:
     VkImageView imageView() const { return m_imageView; }
     VkImageView getRenderTargetView(uint32_t mip, uint32_t face);
     VkImageLayout currentLayout() const { return m_currentLayout; }
+    void transitionLayout(VkCommandBuffer cb, VkImageLayout layout);
     void setLayout(VkImageLayout layout) { m_currentLayout = layout; }
 
     VkBuffer buffer() const { return m_buffer; }
@@ -70,7 +71,10 @@ public:
     uint32_t depth() const { return m_depth; }
     uint32_t mipLevels() const { return m_mipLevels; }
     uint32_t viewMipLevels() const { return m_viewMipLevels; }
-    void ensureViewMipLevels(uint32_t levels);
+    /* Expand the sampled view to cover `levels` mip levels. Returns false
+     * if the wider view could not be created; the previous view is then
+     * kept untouched, so callers may safely keep sampling through it. */
+    bool ensureViewMipLevels(uint32_t levels);
     uint32_t arrayLayers() const { return m_arrayLayers; }
     uint32_t multisampleCount() const { return m_multisampleCount; }
     SVGA3dTextureFilter autogenFilter() const { return m_autogenFilter; }
@@ -196,7 +200,11 @@ public:
     Svga3VlknStatus copy(uint32_t srcSid,
                          uint32_t dstSid,
                          const SVGA3dCopyBox *boxes,
-                         uint32_t numBoxes);
+                         uint32_t numBoxes,
+                         uint32_t srcMip = 0,
+                         uint32_t srcFace = 0,
+                         uint32_t dstMip = 0,
+                         uint32_t dstFace = 0);
 
     Svga3VlknStatus stretchBlt(uint32_t srcSid,
                                uint32_t dstSid,

@@ -1,5 +1,5 @@
 CXX ?= g++
-CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -pthread -fPIC
+CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -pthread -fPIC -MMD -MP
 
 DEFINES = \
     -DVBOX \
@@ -66,9 +66,9 @@ PRESENTATION_TEST_TARGET = $(BIN_DIR)/test_presentation
 QEMU_TEST_TARGET = $(BIN_DIR)/test_qemu_integration
 LIB_QEMU_SVGA3D = $(LIB_DIR)/libqemu_svga3d.so
 
-.PHONY: all clean test test-oracle test-vlkn test-real-vulkan test-shader-translation test-shader test-guest-mem test-verified-rendering test-presentation test-qemu acceptance dump
+.PHONY: all clean test test-oracle test-vlkn test-real-vulkan test-shader-translation test-shader test-guest-mem test-verified-rendering test-presentation test-qemu harness-loop acceptance dump
 
-all: $(ORACLE_TARGET) $(VLKN_LIB) $(LIB_QEMU_SVGA3D) $(VLKN_TEST_TARGET) $(REAL_VULKAN_TEST_TARGET) $(SHADER_TRANSLATION_TEST_TARGET) $(TRANSLATOR_NOVULKAN_TEST_TARGET) $(SHADER_TEST_TARGET) $(GUEST_MEM_TEST_TARGET) $(VERIFIED_RENDERING_TEST_TARGET) $(PRESENTATION_TEST_TARGET) $(QEMU_TEST_TARGET) $(MALFORMED_INPUT_TEST_TARGET)
+all: $(BIN_DIR)/test_preload_fifo $(BIN_DIR)/test_buffer_ordering $(ORACLE_TARGET) $(VLKN_LIB) $(LIB_QEMU_SVGA3D) $(VLKN_TEST_TARGET) $(REAL_VULKAN_TEST_TARGET) $(SHADER_TRANSLATION_TEST_TARGET) $(TRANSLATOR_NOVULKAN_TEST_TARGET) $(SHADER_TEST_TARGET) $(GUEST_MEM_TEST_TARGET) $(VERIFIED_RENDERING_TEST_TARGET) $(PRESENTATION_TEST_TARGET) $(QEMU_TEST_TARGET) $(MALFORMED_INPUT_TEST_TARGET)
 
 # Oracle Binary
 $(ORACLE_TARGET): $(ORACLE_OBJS) | $(BIN_DIR) $(DATA_DIR)
@@ -175,6 +175,15 @@ test-presentation: $(PRESENTATION_TEST_TARGET)
 test-qemu: $(QEMU_TEST_TARGET)
 	./$(QEMU_TEST_TARGET)
 
+# Tight feedback loop: build -> ICD-free translator suite -> lavapipe suites ->
+# per-iteration summary. Stops on NEW regressions vs the previous iteration.
+# Env: HARNESS_ICD (Vulkan ICD JSON), SPIRV_TOOLS_DIR (spirv-val/spirv-dis),
+# HARNESS_TIMEOUT (per-suite seconds). Extra args via HARNESS_LOOP_ARGS, e.g.
+#   make harness-loop HARNESS_LOOP_ARGS="--iterations 5 --fail-fast"
+harness-loop:
+	@chmod +x scripts/harness_loop.sh
+	./scripts/harness_loop.sh $(HARNESS_LOOP_ARGS)
+
 acceptance: all
 	@chmod +x scripts/run_acceptance_suite.sh
 	./scripts/run_acceptance_suite.sh
@@ -191,11 +200,12 @@ $(LIB_DIR):
 $(DATA_DIR):
 	mkdir -p $(DATA_DIR)
 
-test: $(ORACLE_TARGET) $(VLKN_TEST_TARGET)
+test: $(ORACLE_TARGET) $(VLKN_TEST_TARGET) $(BIN_DIR)/test_preload_fifo
 	@echo "=== Running Oracle Reference Verification ==="
 	./$(ORACLE_TARGET) --test
 	@echo "\n=== Running SVGA3=VLKN Product Verification ==="
 	./$(VLKN_TEST_TARGET)
+	./$(BIN_DIR)/test_preload_fifo
 
 test-oracle: $(ORACLE_TARGET)
 	./$(ORACLE_TARGET) --test
@@ -209,3 +219,12 @@ dump: $(ORACLE_TARGET) | $(DATA_DIR)
 
 clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR) $(LIB_DIR)
+
+# Track transitive headers to prevent stale objects after interface changes.
+-include $(wildcard $(BUILD_DIR)/*.d)
+
+$(BIN_DIR)/test_buffer_ordering: tests/test_buffer_ordering.cpp $(VLKN_LIB) | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) $< -L$(LIB_DIR) -lsvga3_vlkn -ldl -o $@
+
+$(BIN_DIR)/test_preload_fifo: tests/test_preload_fifo.cpp src/qemu_svga3d_preload.cpp $(VLKN_LIB) | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) $< -L$(LIB_DIR) -lsvga3_vlkn -ldl -o $@

@@ -4,9 +4,11 @@ An experimental SVGA3D-to-Vulkan rendering library and QEMU integration prototyp
 
 **Work in progress — incomplete and not production-ready.** This is a source snapshot, not a finished virtual GPU or a drop-in replacement for VMware graphics. Shader, format, state, and guest compatibility are not comprehensively verified. Minecraft has reached an in-game world in the PlayBook guest. Recorded September 24 screenshots show terrain, the hotbar, and a textured player hand after integration fixes. A September 25 live check identified the Intel HD Graphics 630 Vulkan driver and measured GPU activity. This is a narrow compatibility milestone, not comprehensive visual validation or a cold-boot reliability guarantee. No general compatibility or performance guarantee is made.
 
-## Warning:
+## QEMU lab adapter
 
-Currently runs as root on the host!
+The preload adapter supports one allowlisted QEMU build and checks instruction bytes before patching. Use it only for the designated VM; never configure global `LD_PRELOAD`. The tested Proxmox VM runs QEMU as `qemu119` and guest graphics as `svga3d`.
+
+Set `SVGA3_VLKN_VALIDATE=1` to request Vulkan validation layers; initialization fails if they cannot be activated. Portrait mode overrides require `SVGA3_VLKN_GUEST_PROFILE=playbook-portrait`; normal guests use their requested mode. Framebuffer GPA comes from the device register. Application-context centering is disabled by default; the old heuristic is available only with `SVGA3_VLKN_LEGACY_CLIENT_PRESENT=1`. Guest-RAM discovery still uses a lab-only mapping heuristic; official QEMU integration remains follow-up work.
 
 ## What is included
 
@@ -51,7 +53,7 @@ make -j4 all
 
 Outputs include `lib/libsvga3_vlkn.a`, `lib/libqemu_svga3d.so`, and test executables under `bin/`. Public interfaces are in `include/svga3_vlkn.h` and `include/qemu_vmsvga.h`. Link consumers with the static library, `-ldl`, and `-pthread`.
 
-Use `make clean` before rebuilding after header changes: the current Makefile does not generate complete header dependencies.
+Make generates header dependency files for compiled objects, so header edits rebuild affected objects.
 
 ## Tests
 
@@ -85,6 +87,37 @@ Individual targets:
 | `make test-qemu` | Host-side device integration harness |
 
 **`test-qemu` does not boot an actual QEMU guest.** Passing it is not proof of working Linux, Windows, or QNX graphics. Test names and success banners inherited from development should not be read as completeness claims.
+
+## Harness loop
+
+`make harness-loop` runs the tight build/test loop used for iterative translator and driver work:
+
+```sh
+make harness-loop                      # one full build + all suites
+make harness-loop HARNESS_ICD=/path/to/icd.json
+SPIRV_TOOLS_DIR=/path/to/spirv-tools/build/tools make harness-loop
+scripts/harness_loop.sh --iterations 5 # repeat; stops on pass->fail regressions
+scripts/harness_loop.sh --fail-fast --skip-build
+```
+
+The loop requires a real Vulkan ICD (`HARNESS_ICD`, else a hard failure — never a silent skip), enables `spirv-val` when `SPIRV_TOOLS_DIR` provides it, builds everything, then runs the ICD-free translator and preload FIFO suites followed by all lavapipe-backed suites. Logs and a `results.tsv` are written per iteration under `.harness-loop/`. Iteration stops on the first pass→fail regression between runs.
+
+What each suite proves:
+
+| Suite | Proves |
+| --- | --- |
+| `test_translator_novulkan` | D3D9→SPIR-V translation without a Vulkan ICD; optional `spirv-val` (prints SKIP, not PASS, when unavailable); SPIR-V value-flow assertions that shader inputs actually reach the declared outputs (not just decorations) |
+| `test_preload_fifo` | Actual preload FIFO walker on a synthetic QEMU state, without patching a process: batches exceeding 8192 commands, ring wrap, producer notification races, incomplete packets and final fences |
+| `test_buffer_ordering` | Strict Vulkan validation through teardown; queued buffers/constants, compressed FIFO/GMR transfers, sampler retirement, mip/image ordering, depth sampling and shader pixel regressions |
+| `test_shader_translation` | Translation plus real Vulkan shader-module creation; malformed/unsupported bytecode rejected; `_SAT` handling |
+| `test_real_vulkan` | Real device init and bit-exact buffer upload/download; no mock fallback |
+| `test_svga3_vlkn` | Engine/unit suite incl. failure-injection of Vulkan dispatch (flush-error propagation) |
+| `test_shader_execution` | Translated shaders execute under real Vulkan |
+| `test_guest_memory` | Guest memory, GMR/translation, transfer paths |
+| `test_malformed_inputs` | Malformed FIFO/input and resource-accounting rejection |
+| `test_verified_rendering` | Analytical pixel/rendering scenes (repository-local; does not prove external GLES rendering) |
+| `test_presentation` | Presentation/framebuffer paths |
+| `test_qemu_integration` | Host-side integration only; no QEMU guest boots |
 
 ## QEMU integration limitations
 

@@ -39,20 +39,42 @@ enum D3dOpcode {
     D3DSIO_M3x4 = 22,
     D3DSIO_M3x3 = 23,
     D3DSIO_M3x2 = 24,
+    D3DSIO_CALL = 25,
+    D3DSIO_CALLNZ = 26,
+    D3DSIO_LOOP = 27,
+    D3DSIO_RET = 28,
+    D3DSIO_ENDLOOP = 29,
+    D3DSIO_LABEL = 30,
     D3DSIO_DCL = 31,
     D3DSIO_POW = 32,
     D3DSIO_CRS = 33,
+    D3DSIO_SGN = 34,
     D3DSIO_ABS = 35,
     D3DSIO_NRM = 36,
     D3DSIO_SINCOS = 37,
+    D3DSIO_REP = 38,
+    D3DSIO_ENDREP = 39,
+    D3DSIO_IF = 40,
+    D3DSIO_IFC = 41,
+    D3DSIO_ELSE = 42,
+    D3DSIO_ENDIF = 43,
+    D3DSIO_BREAK = 44,
+    D3DSIO_BREAKC = 45,
+    D3DSIO_MOVA = 46,
+    D3DSIO_DEFB = 47,
+    D3DSIO_DEFI = 48,
     D3DSIO_TEXCOORD = 64,
     D3DSIO_TEXKILL = 65,
     D3DSIO_TEX = 66,
     D3DSIO_DEF = 81,
     D3DSIO_CMP = 88,
     D3DSIO_DP2ADD = 90,
+    D3DSIO_DSX = 91,
+    D3DSIO_DSY = 92,
     D3DSIO_TEXLDD = 93,
+    D3DSIO_SETP = 94,
     D3DSIO_TEXLDL = 95,
+    D3DSIO_BREAKP = 96,
     D3DSIO_COMMENT = 0xFFFE,
     D3DSIO_END = 0xFFFF
 };
@@ -72,7 +94,20 @@ enum D3dRegType {
     D3DSPR_COLOROUT = 8,
     D3DSPR_DEPTHOUT = 9,
     D3DSPR_SAMPLER = 10,
-    D3DSPR_CONSTBOOL = 11
+    /* SVGA3D dialect numbering (SVGA3dShaderRegType in svga3d_shaderdefs.h):
+     * unlike stock D3D9, CONSTBOOL/LOOP/TEMPFLOAT16 occupy 14/15/16, so
+     * MISCTYPE is 17, not 14. Guest bytecode arriving via SHADER_DEFINE is
+     * SVGA3D dialect (Mesa's SVGA backend emits it); the PS misc registers
+     * vPos/vFace decode as MISCTYPE 0/1. */
+    D3DSPR_CONST2 = 11,
+    D3DSPR_CONST3 = 12,
+    D3DSPR_CONST4 = 13,
+    D3DSPR_CONSTBOOL = 14,
+    D3DSPR_LOOP = 15,
+    D3DSPR_TEMPFLOAT16 = 16,
+    D3DSPR_MISCTYPE = 17,
+    D3DSPR_LABEL = 18,
+    D3DSPR_PREDICATE = 19
 };
 
 struct ParsedDest {
@@ -91,6 +126,10 @@ struct ParsedSrc {
 
 struct ShaderDefConst {
     float values[4];
+};
+
+struct ShaderDefConstI {
+    int32_t values[4];
 };
 
 static bool parseDest(uint32_t token, ParsedDest &dst) {
@@ -191,8 +230,19 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
 
     /* First pass: validate opcodes and extract DEF constants */
     std::map<uint32_t, ShaderDefConst> defConstants;
+    std::map<uint32_t, ShaderDefConstI> defIntConstants;
     std::vector<uint32_t> dclPositions; /* true DCL instruction boundaries */
     std::unordered_map<uint32_t, bool> explicitVsOutputRegs;
+    /* DCL-less SM 3.0 VS: o0/oT0 (regtype 6) is ambiguous — it is the implicit
+     * position output only when the shader does NOT explicitly write oPos
+     * (RASTOUT). If oPos is written, regtype-6 outputs are real texcoords and
+     * TEMP r0/r1 are genuine temporaries. Computed in the pre-pass below. */
+    bool writesExplicitPosition = false;
+    /* Structured control-flow balance stack: (isLoop, elseSeen). */
+    std::vector<std::pair<bool, bool>> ctrlValidateStack;
+    /* MISCTYPE (vPos/vFace) usage recorded in pass 1 so the fragment
+     * builtins are declared only when the shader actually reads them. */
+    bool miscUsed[2] = { false, false };
     uint32_t pc = 1;
     bool foundEnd = false;
 
@@ -238,16 +288,45 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             continue;
         }
 
+        if (op == D3DSIO_DEFI) {
+            if (pc + 5 >= numTokens) {
+                outError = "Truncated D3DSIO_DEFI instruction";
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
+            ParsedDest dst;
+            if (!parseDest(tokens[pc + 1], dst)) {
+                outError = "Malformed D3DSIO_DEFI dest parameter";
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
+            if (dst.regType != D3DSPR_CONSTINT || dst.regNum >= 32 ||
+                (major >= 2 && instLen != 5)) {
+                outError = "Invalid D3DSIO_DEFI destination or operand count";
+                return SVGA3_VLKN_ERROR_INVALID_PARAM;
+            }
+            ShaderDefConstI defi;
+            memcpy(defi.values, &tokens[pc + 2], sizeof(int32_t) * 4);
+            defIntConstants[dst.regNum] = defi;
+            pc += 6;
+            continue;
+        }
+
         /* Reject malformed lengths before either pass can read parameters.
          * D3D9 token lengths count every following parameter token. */
         uint32_t requiredParams = UINT32_MAX;
         switch (op) {
-            case D3DSIO_NOP: requiredParams = 0; break;
+            case D3DSIO_NOP:
+            case D3DSIO_ELSE: case D3DSIO_ENDIF:
+            case D3DSIO_ENDLOOP: case D3DSIO_BREAK:
+                requiredParams = 0; break;
+            case D3DSIO_TEXKILL: case D3DSIO_IF: requiredParams = 1; break;
             case D3DSIO_MOV: case D3DSIO_RCP: case D3DSIO_RSQ: case D3DSIO_ABS:
-            case D3DSIO_FRC: case D3DSIO_DCL:
+            case D3DSIO_FRC: case D3DSIO_EXP: case D3DSIO_SINCOS:
+            case D3DSIO_LOOP: case D3DSIO_IFC:
+            case D3DSIO_DCL:
                 requiredParams = 2; break;
             case D3DSIO_ADD: case D3DSIO_SUB: case D3DSIO_MUL: case D3DSIO_DP3:
             case D3DSIO_DP4: case D3DSIO_MIN: case D3DSIO_MAX: case D3DSIO_M4x4:
+            case D3DSIO_SLT: case D3DSIO_SGE: case D3DSIO_SETP:
             case D3DSIO_TEX: case D3DSIO_POW:
                 requiredParams = 3; break;
             case D3DSIO_MAD: case D3DSIO_LRP: case D3DSIO_CMP:
@@ -255,23 +334,49 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             default: break; /* The opcode allowlist below rejects these. */
         }
         if (requiredParams != UINT32_MAX) {
-            if (instToken & (1u << 28)) {
-                outError = "Predicated shader instructions are not supported";
+            /* Predication (instruction-token bit 28, SM 3.0): one extra
+             * predicate operand token follows the destination token. */
+            bool predicated = (instToken & (1u << 28)) != 0;
+            if (predicated && instLen == 0) {
+                outError = "Predicated SM 1.x shader instructions are not supported";
                 return SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
             }
-            if ((major >= 2 && instLen != requiredParams) ||
-                requiredParams >= numTokens - pc) {
+            uint32_t expected = requiredParams + (predicated ? 1 : 0);
+            if ((major >= 2 && instLen != expected) ||
+                expected >= numTokens - pc) {
                 outError = "Invalid shader instruction operand count";
                 return SVGA3_VLKN_ERROR_INVALID_PARAM;
             }
-            for (uint32_t i = 1; i <= requiredParams; ++i) {
+            for (uint32_t i = 1; i <= expected; ++i) {
                 if (!(tokens[pc + i] & 0x80000000u)) {
                     outError = "Invalid shader parameter token";
                     return SVGA3_VLKN_ERROR_INVALID_PARAM;
                 }
+                if (predicated && i == 2) {
+                    /* Predicate operand: must name a predicate register; its
+                     * bit 13 is the negate flag, not relative addressing. */
+                    ParsedSrc pred;
+                    if (!parseSrc(tokens[pc + i], pred) ||
+                        pred.regType != D3DSPR_PREDICATE || pred.regNum >= 4) {
+                        outError = "Invalid predicate operand token";
+                        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                    }
+                    continue;
+                }
                 if (i > 1 && (tokens[pc + i] & (1u << 13))) {
                     outError = "Relative register addressing is not supported";
                     return SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
+                }
+                /* Record MISCTYPE reads for builtin declaration gating.
+                 * Register-type bits sit at the same offsets in source and
+                 * destination tokens, and MISCTYPE is never a destination,
+                 * so scanning every parameter token is safe. */
+                {
+                    ParsedSrc anyOp;
+                    if (parseSrc(tokens[pc + i], anyOp) &&
+                        anyOp.regType == D3DSPR_MISCTYPE && anyOp.regNum < 2) {
+                        miscUsed[anyOp.regNum] = true;
+                    }
                 }
             }
         }
@@ -291,10 +396,23 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             case D3DSIO_RSQ:
             case D3DSIO_MIN:
             case D3DSIO_MAX:
+            case D3DSIO_SLT: case D3DSIO_SGE:
+            case D3DSIO_EXP:
+            case D3DSIO_POW:
+            case D3DSIO_SINCOS:
             case D3DSIO_ABS:
             case D3DSIO_LRP:
             case D3DSIO_FRC:
             case D3DSIO_CMP:
+            case D3DSIO_SETP:
+            case D3DSIO_LOOP:
+            case D3DSIO_ENDLOOP:
+            case D3DSIO_IF:
+            case D3DSIO_IFC:
+            case D3DSIO_ELSE:
+            case D3DSIO_ENDIF:
+            case D3DSIO_BREAK:
+            case D3DSIO_TEXKILL:
             case D3DSIO_TEX:
             case D3DSIO_DCL:
                 break;
@@ -304,6 +422,52 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 outError = ss.str();
                 return SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
             }
+        }
+
+        /* Structured control flow must be balanced (fail-closed): pass 2
+         * lowers it directly to SPIR-V blocks and cannot recover from
+         * malformed nesting. */
+        switch (op) {
+            case D3DSIO_LOOP:
+                ctrlValidateStack.push_back({ true, false });
+                break;
+            case D3DSIO_IF: case D3DSIO_IFC:
+                ctrlValidateStack.push_back({ false, false });
+                break;
+            case D3DSIO_ELSE:
+                if (ctrlValidateStack.empty() || ctrlValidateStack.back().first ||
+                    ctrlValidateStack.back().second) {
+                    outError = "Unbalanced D3DSIO_ELSE in shader control flow";
+                    return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                }
+                ctrlValidateStack.back().second = true;
+                break;
+            case D3DSIO_ENDIF:
+                if (ctrlValidateStack.empty() || ctrlValidateStack.back().first) {
+                    outError = "Unbalanced D3DSIO_ENDIF in shader control flow";
+                    return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                }
+                ctrlValidateStack.pop_back();
+                break;
+            case D3DSIO_ENDLOOP:
+                if (ctrlValidateStack.empty() || !ctrlValidateStack.back().first) {
+                    outError = "Unbalanced D3DSIO_ENDLOOP in shader control flow";
+                    return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                }
+                ctrlValidateStack.pop_back();
+                break;
+            case D3DSIO_BREAK: {
+                bool inLoop = false;
+                for (const auto &frame : ctrlValidateStack) {
+                    if (frame.first) inLoop = true;
+                }
+                if (!inLoop) {
+                    outError = "D3DSIO_BREAK outside any loop";
+                    return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                }
+                break;
+            }
+            default: break;
         }
 
         /* Record true DCL instruction boundaries for the semantic scan. */
@@ -323,6 +487,8 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 case D3DSIO_RCP:
                 case D3DSIO_RSQ:
                 case D3DSIO_ABS:
+                case D3DSIO_EXP:
+                case D3DSIO_SINCOS:
                 case D3DSIO_FRC: advance = 3; break;
                 case D3DSIO_ADD:
                 case D3DSIO_SUB:
@@ -331,6 +497,8 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 case D3DSIO_DP4:
                 case D3DSIO_MIN:
                 case D3DSIO_MAX:
+                case D3DSIO_SLT: case D3DSIO_SGE:
+                case D3DSIO_POW:
                 case D3DSIO_M4x4: advance = 4; break;
                 case D3DSIO_TEX:
                     /* SM 1.x dest-only `tex t#` carries just the destination. */
@@ -339,6 +507,10 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 case D3DSIO_MAD:
                 case D3DSIO_LRP:
                 case D3DSIO_CMP: advance = 5; break;
+                case D3DSIO_SETP: advance = 4; break;
+                case D3DSIO_LOOP:
+                case D3DSIO_IFC: advance = 3; break;
+                case D3DSIO_TEXKILL: case D3DSIO_IF: advance = 2; break;
                 case D3DSIO_DCL: advance = 3; break;
                 default: advance = 1; break;
             }
@@ -352,8 +524,13 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
          * below does not steal same-numbered temporaries used for calculations. */
         if (isVS && major >= 3 && op != D3DSIO_DCL && advance > 1) {
             ParsedDest dst;
-            if (parseDest(tokens[pc + 1], dst) && dst.regType == D3DSPR_OUTPUT) {
-                explicitVsOutputRegs[dst.regNum] = true;
+            if (parseDest(tokens[pc + 1], dst)) {
+                if (dst.regType == D3DSPR_OUTPUT) {
+                    explicitVsOutputRegs[dst.regNum] = true;
+                }
+                if (dst.regType == D3DSPR_RASTOUT) {
+                    writesExplicitPosition = true;
+                }
             }
         }
         pc += advance;
@@ -361,6 +538,10 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
 
     if (!foundEnd) {
         outError = "Shader bytecode missing D3DSIO_END terminator";
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    }
+    if (!ctrlValidateStack.empty()) {
+        outError = "Unbalanced shader control flow at D3DSIO_END";
         return SVGA3_VLKN_ERROR_INVALID_PARAM;
     }
 
@@ -400,11 +581,21 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     uint32_t const2_f = b.allocId();
     uint32_t const0_v4 = b.allocId();
     uint32_t const1_v4 = b.allocId();
+    uint32_t constNeg1_f = b.allocId();
+    uint32_t constNeg1_v4 = b.allocId();
+    uint32_t constFalse_b = b.allocId();
+    uint32_t constTrue_b = b.allocId();
+    uint32_t constFalse_v4b = b.allocId();
+    uint32_t const0_i = b.allocId();
+    uint32_t constVPosBias_v4 = b.allocId();
 
     /* Pointer Types */
     uint32_t ptrFunctionV4Float = b.allocId();
     uint32_t ptrInputV4Float = b.allocId();
     uint32_t ptrOutputV4Float = b.allocId();
+    uint32_t ptrInputBool = b.allocId();
+    uint32_t ptrFunctionV4Bool = b.allocId();
+    uint32_t ptrFunctionInt = b.allocId();
 
     /* Collect DCL semantic declarations */
     struct SemanticInfo {
@@ -463,6 +654,9 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     uint32_t psInColor[2] = { 0 };
     uint32_t psInTexCoords[8] = { 0 };
     uint32_t psOutColor = 0;
+    /* MISCTYPE sources: vPos -> BuiltIn FragCoord, vFace -> FrontFacing. */
+    uint32_t psInFragCoord = 0;
+    uint32_t psInFrontFacing = 0;
 
     /* Samplers. depthSamplerMask bit N means stage N is a depth texture. */
     uint32_t samplerVars[8] = { 0 };
@@ -519,6 +713,14 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
         }
         psOutColor = b.allocId();
         entryInterface.push_back(psOutColor);
+        if (miscUsed[0]) {
+            psInFragCoord = b.allocId();
+            entryInterface.push_back(psInFragCoord);
+        }
+        if (miscUsed[1]) {
+            psInFrontFacing = b.allocId();
+            entryInterface.push_back(psInFrontFacing);
+        }
 
         for (int i = 0; i < 8; ++i) {
             samplerVars[i] = b.allocId();
@@ -566,6 +768,12 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             b.emitInst(b.annotations, SpvOpDecorate, { psInTexCoords[t], SpvDecorationLocation, (uint32_t)(2 + t) });
         }
         b.emitInst(b.annotations, SpvOpDecorate, { psOutColor, SpvDecorationLocation, 0 });
+        if (psInFragCoord) {
+            b.emitInst(b.annotations, SpvOpDecorate, { psInFragCoord, SpvDecorationBuiltIn, SpvBuiltInFragCoord });
+        }
+        if (psInFrontFacing) {
+            b.emitInst(b.annotations, SpvOpDecorate, { psInFrontFacing, SpvDecorationBuiltIn, SpvBuiltInFrontFacing });
+        }
 
         for (int i = 0; i < 8; ++i) {
             b.emitInst(b.annotations, SpvOpDecorate, { samplerVars[i], SpvDecorationDescriptorSet, 0 });
@@ -596,6 +804,9 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     b.emitInst(b.typesConstantsGlobals, SpvOpTypePointer, { ptrFunctionV4Float, SpvStorageClassFunction, typeV4Float });
     b.emitInst(b.typesConstantsGlobals, SpvOpTypePointer, { ptrInputV4Float, SpvStorageClassInput, typeV4Float });
     b.emitInst(b.typesConstantsGlobals, SpvOpTypePointer, { ptrOutputV4Float, SpvStorageClassOutput, typeV4Float });
+    b.emitInst(b.typesConstantsGlobals, SpvOpTypePointer, { ptrInputBool, SpvStorageClassInput, typeBool });
+    b.emitInst(b.typesConstantsGlobals, SpvOpTypePointer, { ptrFunctionV4Bool, SpvStorageClassFunction, typeV4Bool });
+    b.emitInst(b.typesConstantsGlobals, SpvOpTypePointer, { ptrFunctionInt, SpvStorageClassFunction, typeInt });
 
     /* Scalar & Vector Float Constants */
     union { float f; uint32_t u; } f2u;
@@ -603,9 +814,22 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     f2u.f = 1.0f; b.emitInst(b.typesConstantsGlobals, SpvOpConstant, { typeFloat, const1_f, f2u.u });
     f2u.f = 0.5f; b.emitInst(b.typesConstantsGlobals, SpvOpConstant, { typeFloat, constHalf_f, f2u.u });
     f2u.f = 2.0f; b.emitInst(b.typesConstantsGlobals, SpvOpConstant, { typeFloat, const2_f, f2u.u });
+    f2u.f = -1.0f; b.emitInst(b.typesConstantsGlobals, SpvOpConstant, { typeFloat, constNeg1_f, f2u.u });
 
     b.emitInst(b.typesConstantsGlobals, SpvOpConstantComposite, { typeV4Float, const0_v4, const0_f, const0_f, const0_f, const0_f });
     b.emitInst(b.typesConstantsGlobals, SpvOpConstantComposite, { typeV4Float, const1_v4, const1_f, const1_f, const1_f, const1_f });
+    b.emitInst(b.typesConstantsGlobals, SpvOpConstantComposite, { typeV4Float, constNeg1_v4, constNeg1_f, constNeg1_f, constNeg1_f, constNeg1_f });
+    /* vPos bias: SVGA hardware vPos is the integer pixel coordinate;
+     * Vulkan FragCoord is the pixel center (index + 0.5). Guest shaders
+     * (e.g. Mesa's SM3 output) add their own +0.5 to reach the center,
+     * so vPos must be delivered as FragCoord - (0.5, 0.5, 0, 0). */
+    b.emitInst(b.typesConstantsGlobals, SpvOpConstantComposite, { typeV4Float, constVPosBias_v4, constHalf_f, constHalf_f, const0_f, const0_f });
+
+    /* Bool constants (predicate registers) and integer zero (loop state) */
+    b.emitInst(b.typesConstantsGlobals, SpvOpConstantFalse, { typeBool, constFalse_b });
+    b.emitInst(b.typesConstantsGlobals, SpvOpConstantTrue, { typeBool, constTrue_b });
+    b.emitInst(b.typesConstantsGlobals, SpvOpConstantComposite, { typeV4Bool, constFalse_v4b, constFalse_b, constFalse_b, constFalse_b, constFalse_b });
+    b.emitInst(b.typesConstantsGlobals, SpvOpConstant, { typeInt, const0_i, 0 });
 
     /* Integer constants 0, 1, 2, 3 for vector extraction */
     uint32_t intConsts[4];
@@ -658,6 +882,12 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             b.emitInst(b.typesConstantsGlobals, SpvOpVariable, { ptrInputV4Float, psInTexCoords[t], SpvStorageClassInput });
         }
         b.emitInst(b.typesConstantsGlobals, SpvOpVariable, { ptrOutputV4Float, psOutColor, SpvStorageClassOutput });
+        if (psInFragCoord) {
+            b.emitInst(b.typesConstantsGlobals, SpvOpVariable, { ptrInputV4Float, psInFragCoord, SpvStorageClassInput });
+        }
+        if (psInFrontFacing) {
+            b.emitInst(b.typesConstantsGlobals, SpvOpVariable, { ptrInputBool, psInFrontFacing, SpvStorageClassInput });
+        }
 
         /* Sampler Types: OpTypeImage, OpTypeSampledImage.
          * Depth images must be declared with Depth=1. Sampling a depth image
@@ -707,12 +937,72 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
         b.emitInst(b.functionDefinitions, SpvOpVariable, { ptrFunctionV4Float, outTexCoordVar[t], SpvStorageClassFunction, const0_v4 });
     }
 
+    /* Predicate registers p0..p3 (v4bool) and loop state (counter + index)
+     * for up to 8 nested loops. All Function-storage variables must live in
+     * the entry block, so the pool is allocated up front; structured control
+     * flow then needs no SSA phi nodes — values flow through these variables
+     * and the temporaries exactly as loads/stores already do. */
+    uint32_t predVars[4];
+    for (int i = 0; i < 4; ++i) {
+        predVars[i] = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpVariable, { ptrFunctionV4Bool, predVars[i], SpvStorageClassFunction, constFalse_v4b });
+    }
+    uint32_t loopCtrVars[8];
+    uint32_t loopIdxVars[8];
+    for (int i = 0; i < 8; ++i) {
+        loopCtrVars[i] = b.allocId();
+        loopIdxVars[i] = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpVariable, { ptrFunctionInt, loopCtrVars[i], SpvStorageClassFunction, const0_i });
+        b.emitInst(b.functionDefinitions, SpvOpVariable, { ptrFunctionInt, loopIdxVars[i], SpvStorageClassFunction, const0_i });
+    }
+
     /* Fail-closed operand validation: the emit helpers below set transError
      * (and outError) on out-of-range indices, unsupported register classes,
      * or unimplemented source modifiers. The translation loop checks the
      * flag once per instruction and aborts. */
     bool transError = false;
     Svga3VlknStatus transErrorCode = SVGA3_VLKN_ERROR_INVALID_PARAM;
+
+    /* Structured control-flow state for pass 2. Pass 1 already proved the
+     * LOOP/IF nesting is balanced; frames here carry the SPIR-V block labels
+     * and, for loops, the DEFI constants and state variables. */
+    struct CtrlFrame {
+        bool isLoop = false;
+        uint32_t headerLabel = 0;
+        uint32_t mergeLabel = 0;
+        uint32_t continueLabel = 0; /* loops only */
+        uint32_t elseLabel = 0;     /* ifs only */
+        bool elseSeen = false;
+        uint32_t ctrVar = 0;        /* loops: aL counter variable */
+        uint32_t idxVar = 0;        /* loops: iteration index variable */
+        int32_t count = 0, start = 0, step = 0; /* loops: from DEFI */
+    };
+    std::vector<CtrlFrame> ctrlStack;
+
+    /* On-demand signed-int constants (loop bounds/steps come from DEFI). */
+    std::map<int32_t, uint32_t> intConstCache;
+    auto intConst = [&](int32_t v) -> uint32_t {
+        auto it = intConstCache.find(v);
+        if (it != intConstCache.end()) return it->second;
+        uint32_t id = b.allocId();
+        b.emitInst(b.typesConstantsGlobals, SpvOpConstant, { typeInt, id, (uint32_t)v });
+        intConstCache[v] = id;
+        return id;
+    };
+
+    /* D3D9 comparison function (instruction-token bits 16-19) -> SPIR-V op.
+     * Returns 0 for reserved values (fail-closed at the call site). */
+    auto relopVecOp = [&](uint32_t rel) -> SpvOp {
+        switch (rel) {
+            case 1: return SpvOpFOrdGreaterThan;
+            case 2: return SpvOpFOrdEqual;
+            case 3: return SpvOpFOrdGreaterThanEqual;
+            case 4: return SpvOpFOrdLessThan;
+            case 5: return SpvOpFOrdNotEqual;
+            case 6: return SpvOpFOrdLessThanEqual;
+            default: return SpvOpNop;
+        }
+    };
 
     /* Helper: load source register into vec4 value with swizzle and modifier */
     auto emitLoadSrc = [&](const ParsedSrc &src) -> uint32_t {
@@ -801,10 +1091,113 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 baseVal = b.allocId();
                 b.emitInst(b.functionDefinitions, SpvOpLoad, { typeV4Float, baseVal, elemPtr });
             }
+        } else if (src.regType == D3DSPR_MISCTYPE) {
+            /* SVGA3D misc registers (PS only): 0 = vPos (gl_FragCoord),
+             * 1 = vFace (gl_FrontFacing, +1 front / -1 back per D3D
+             * convention). Mesa emits these for FRAGCOORD/FACE system
+             * values; without this case every FragCoord-reading shader
+             * failed translation and aborted its whole FIFO batch. */
+            if (isVS) {
+                outError = "MISCTYPE source register has no vertex-shader representation";
+                transError = true;
+                transErrorCode = SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
+                return const0_v4;
+            }
+            if (src.regNum == 0) {
+                if (!psInFragCoord) {
+                    outError = "vPos read was not recorded during validation";
+                    transError = true;
+                    transErrorCode = SVGA3_VLKN_ERROR_INVALID_PARAM;
+                    return const0_v4;
+                }
+                uint32_t fcVal = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpLoad, { typeV4Float, fcVal, psInFragCoord });
+                /* Deliver SVGA vPos semantics (integer pixel coords):
+                 * FragCoord holds pixel centers, so subtract the half
+                 * texel; guest position fixups add it back themselves. */
+                baseVal = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpFSub, { typeV4Float, baseVal, fcVal, constVPosBias_v4 });
+            } else if (src.regNum == 1) {
+                if (!psInFrontFacing) {
+                    outError = "vFace read was not recorded during validation";
+                    transError = true;
+                    transErrorCode = SVGA3_VLKN_ERROR_INVALID_PARAM;
+                    return const0_v4;
+                }
+                uint32_t faceBool = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpLoad, { typeBool, faceBool, psInFrontFacing });
+                uint32_t faceVec = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpCompositeConstruct, { typeV4Bool, faceVec, faceBool, faceBool, faceBool, faceBool });
+                baseVal = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpSelect, { typeV4Float, baseVal, faceVec, const1_v4, constNeg1_v4 });
+            } else {
+                std::ostringstream ss;
+                ss << "Unsupported MISCTYPE source register: " << src.regNum;
+                outError = ss.str();
+                transError = true;
+                transErrorCode = SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
+                return const0_v4;
+            }
+        } else if (src.regType == D3DSPR_PREDICATE) {
+            /* Predicate register read as float: 1.0 where true, else 0.0. */
+            if (src.regNum >= 4) {
+                outError = "Predicate register index out of range (p0-p3 supported)";
+                transError = true;
+                transErrorCode = SVGA3_VLKN_ERROR_INVALID_PARAM;
+                return const0_v4;
+            }
+            uint32_t predVec = b.allocId();
+            b.emitInst(b.functionDefinitions, SpvOpLoad, { typeV4Bool, predVec, predVars[src.regNum] });
+            baseVal = b.allocId();
+            b.emitInst(b.functionDefinitions, SpvOpSelect, { typeV4Float, baseVal, predVec, const1_v4, const0_v4 });
+        } else if (src.regType == D3DSPR_LOOP) {
+            /* Loop register aL of the innermost enclosing loop:
+             * aL.x = current counter (start + index*step), aL.y = remaining
+             * iterations, per the D3D9 loop-register definition. */
+            const CtrlFrame *loopFrame = nullptr;
+            for (auto it = ctrlStack.rbegin(); it != ctrlStack.rend(); ++it) {
+                if (it->isLoop) { loopFrame = &(*it); break; }
+            }
+            if (!loopFrame) {
+                outError = "Loop register read outside any loop body";
+                transError = true;
+                transErrorCode = SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
+                return const0_v4;
+            }
+            uint32_t ctrVal = b.allocId();
+            b.emitInst(b.functionDefinitions, SpvOpLoad, { typeInt, ctrVal, loopFrame->ctrVar });
+            uint32_t idxVal = b.allocId();
+            b.emitInst(b.functionDefinitions, SpvOpLoad, { typeInt, idxVal, loopFrame->idxVar });
+            uint32_t remVal = b.allocId();
+            b.emitInst(b.functionDefinitions, SpvOpISub, { typeInt, remVal, intConst(loopFrame->count), idxVal });
+            uint32_t ctrF = b.allocId();
+            b.emitInst(b.functionDefinitions, SpvOpConvertSToF, { typeFloat, ctrF, ctrVal });
+            uint32_t remF = b.allocId();
+            b.emitInst(b.functionDefinitions, SpvOpConvertSToF, { typeFloat, remF, remVal });
+            baseVal = b.allocId();
+            b.emitInst(b.functionDefinitions, SpvOpCompositeConstruct, { typeV4Float, baseVal, ctrF, remF, const0_f, const0_f });
+        } else if (src.regType == D3DSPR_CONSTINT) {
+            /* Integer constant read as float (DEFI-defined values). */
+            auto it = defIntConstants.find(src.regNum);
+            if (it == defIntConstants.end()) {
+                outError = "Read of undefined integer constant register";
+                transError = true;
+                transErrorCode = SVGA3_VLKN_ERROR_INVALID_PARAM;
+                return const0_v4;
+            }
+            uint32_t cf[4];
+            for (int c = 0; c < 4; ++c) {
+                cf[c] = b.allocId();
+                union { float f; uint32_t u; } cv;
+                cv.f = (float)it->second.values[c];
+                b.emitInst(b.typesConstantsGlobals, SpvOpConstant, { typeFloat, cf[c], cv.u });
+            }
+            baseVal = b.allocId();
+            b.emitInst(b.typesConstantsGlobals, SpvOpConstantComposite, { typeV4Float, baseVal, cf[0], cf[1], cf[2], cf[3] });
         } else {
             /* ADDR-as-source is handled by the TEXTURE branch above; anything
-             * reaching here (integer/bool constants, sampler-as-source, loop
-             * counters, output registers) has no representation. */
+             * reaching here (bool constants, sampler-as-source, output
+             * registers) has no representation. */
             std::ostringstream ss;
             ss << "Unsupported D3D9 source register type: " << src.regType;
             outError = ss.str();
@@ -842,7 +1235,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     };
 
     /* Helper: store vec4 value into destination register with write mask */
-    auto emitStoreDest = [&](const ParsedDest &dst, uint32_t val) {
+    auto emitStoreDest = [&](const ParsedDest &dst, uint32_t val, uint32_t predicate = 0) {
         uint32_t dstVar = 0;
         /* Mesa's SVGA backend can encode a DCL-declared output destination as
          * TEMP. Only apply this compatibility fallback if the shader never
@@ -853,8 +1246,11 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                             explicitVsOutputRegs.find(dst.regNum) == explicitVsOutputRegs.end());
         /* SM 3.0 VS without output DCLs: implicit outputs o0=position, o1=color.
          * Mesa encodes these as TEMP in MOV dst tokens. Treat reg 0 as
-         * position, reg 1 as color. */
+         * position, reg 1 as color — but only when the shader does not write
+         * oPos explicitly (otherwise r0/r1 are genuine temporaries and o0 is
+         * a real texcoord; see writesExplicitPosition). */
         bool isImplicitVsOutput = (isVS && major >= 3 && outputRegToSemantic.empty() &&
+                                   !writesExplicitPosition &&
                                    dst.regType == D3DSPR_TEMP &&
                                    (dst.regNum == 0 || dst.regNum == 1) &&
                                    explicitVsOutputRegs.find(dst.regNum) == explicitVsOutputRegs.end());
@@ -888,6 +1284,16 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                     } else {
                         dstVar = (dst.regNum == 0) ? outPosVar : (dst.regNum == 1 ? outColorVar[0] : outTexCoordVar[(dst.regNum >= 2 && dst.regNum - 2 < 8) ? (dst.regNum - 2) : 0]);
                     }
+                } else if (isVS && major >= 3 && !writesExplicitPosition && dst.regNum <= 1) {
+                    /* DCL-less SM 3.0 VS without an explicit oPos write:
+                     * o0=position, o1=color (Mesa convention), whether encoded
+                     * as TEMP (implicit outputs) or OUTPUT. If oPos IS written
+                     * elsewhere, regtype-6 outputs are real texcoords (e.g.
+                     * oT0) and keep the texcoord routing below.
+                     * The old code routed these to texcoord shadows, so the
+                     * Position/color outputs kept only their decorations while
+                     * the actual values went to Location 2/3. */
+                    dstVar = (dst.regNum == 0) ? outPosVar : outColorVar[0];
                 } else {
                     dstVar = outTexCoordVar[dst.regNum < 8 ? dst.regNum : 0];
                 }
@@ -903,6 +1309,14 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             uint32_t satVal = b.allocId();
             b.emitInst(b.functionDefinitions, SpvOpExtInst, { typeV4Float, satVal, glslSetId, GLSLstd450FClamp, val, const0_v4, const1_v4 });
             finalVal = satVal;
+        }
+
+        if (predicate) {
+            uint32_t oldVal = b.allocId(), selected = b.allocId();
+            b.emitInst(b.functionDefinitions, SpvOpLoad, {typeV4Float, oldVal, dstVar});
+            b.emitInst(b.functionDefinitions, SpvOpSelect,
+                {typeV4Float, selected, predicate, finalVal, oldVal});
+            finalVal = selected;
         }
 
         if (dst.writeMask != 0x0F) {
@@ -958,6 +1372,11 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             continue;
         }
 
+        if (op == D3DSIO_DEFI) {
+            pc += 6;
+            continue;
+        }
+
         if (op == D3DSIO_DCL) {
             pc += 3;
             continue;
@@ -983,11 +1402,18 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
         } else if (paramCount == 0) {
             /* SM 1.x fallback parameter counts (length field is 0). */
             switch (op) {
-                case D3DSIO_NOP: paramCount = 0; break;
+                case D3DSIO_NOP:
+                case D3DSIO_ELSE: case D3DSIO_ENDIF:
+                case D3DSIO_ENDLOOP: case D3DSIO_BREAK: paramCount = 0; break;
+                case D3DSIO_TEXKILL: case D3DSIO_IF: paramCount = 1; break;
                 case D3DSIO_MOV:
                 case D3DSIO_RCP:
                 case D3DSIO_RSQ:
                 case D3DSIO_ABS:
+                case D3DSIO_EXP:
+                case D3DSIO_SINCOS:
+                case D3DSIO_LOOP:
+                case D3DSIO_IFC:
                 case D3DSIO_FRC: paramCount = 2; break;
                 case D3DSIO_ADD:
                 case D3DSIO_SUB:
@@ -996,6 +1422,9 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 case D3DSIO_DP4:
                 case D3DSIO_MIN:
                 case D3DSIO_MAX:
+                case D3DSIO_SLT: case D3DSIO_SGE:
+                case D3DSIO_SETP:
+                case D3DSIO_POW:
                 case D3DSIO_M4x4: paramCount = 3; break;
                 case D3DSIO_MAD:
                 case D3DSIO_LRP:
@@ -1014,11 +1443,18 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
          * Validate the max of both. */
         uint32_t naturalCount = 0;
         switch (op) {
-            case D3DSIO_NOP: naturalCount = 0; break;
+            case D3DSIO_NOP:
+            case D3DSIO_ELSE: case D3DSIO_ENDIF:
+            case D3DSIO_ENDLOOP: case D3DSIO_BREAK: naturalCount = 0; break;
+            case D3DSIO_TEXKILL: case D3DSIO_IF: naturalCount = 1; break;
             case D3DSIO_MOV:
             case D3DSIO_RCP:
             case D3DSIO_RSQ:
             case D3DSIO_ABS:
+            case D3DSIO_EXP:
+            case D3DSIO_SINCOS:
+            case D3DSIO_LOOP:
+            case D3DSIO_IFC:
             case D3DSIO_FRC: naturalCount = 2; break;
             case D3DSIO_ADD:
             case D3DSIO_SUB:
@@ -1027,12 +1463,21 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             case D3DSIO_DP4:
             case D3DSIO_MIN:
             case D3DSIO_MAX:
+            case D3DSIO_SLT: case D3DSIO_SGE:
+            case D3DSIO_SETP:
+            case D3DSIO_POW:
             case D3DSIO_M4x4: naturalCount = 3; break;
             case D3DSIO_MAD:
             case D3DSIO_LRP:
             case D3DSIO_CMP: naturalCount = 4; break;
             case D3DSIO_TEX: naturalCount = paramCount; break;
             default: naturalCount = paramCount; break;
+        }
+        /* A predicated instruction carries one extra operand token (the
+         * predicate, right after the destination); pass 1 already verified
+         * the declared length includes it. */
+        if (instToken & (1u << 28)) {
+            naturalCount += 1;
         }
         uint32_t checkCount = (naturalCount > paramCount) ? naturalCount : paramCount;
         if (checkCount >= numTokens - pc) {
@@ -1051,11 +1496,295 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
         switch (op) {
             case D3DSIO_MOV: {
                 ParsedDest dst;
-                ParsedSrc src;
                 parseDest(tokens[pc + 1], dst);
-                parseSrc(tokens[pc + 2], src);
-                uint32_t val = emitLoadSrc(src);
-                emitStoreDest(dst, val);
+                uint32_t val, predicate = 0;
+                if (instToken & (1u << 28)) {
+                    /* Predicated MOV: operands are [dst, predicate, src].
+                     * Pass 1 verified the predicate token names p0..p3.
+                     * The destination keeps its old value in every component
+                     * whose predicate component is false. Output shadow
+                     * registers preserve their previous values as well. */
+                    ParsedSrc pred, src;
+                    parseSrc(tokens[pc + 2], pred);
+                    parseSrc(tokens[pc + 3], src);
+                    const bool writable = dst.regType == D3DSPR_TEMP ||
+                        (isVS && (dst.regType == D3DSPR_OUTPUT || dst.regType == D3DSPR_RASTOUT || dst.regType == D3DSPR_ATTROUT)) ||
+                        (!isVS && dst.regType == D3DSPR_COLOROUT && dst.regNum == 0);
+                    if (!writable) {
+                        outError = "Invalid predicated MOV destination";
+                        return SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
+                    }
+                    uint32_t predVec = b.allocId();
+                    b.emitInst(b.functionDefinitions, SpvOpLoad, { typeV4Bool, predVec, predVars[pred.regNum] });
+                    if (pred.swizzle[0] != 0 || pred.swizzle[1] != 1 ||
+                        pred.swizzle[2] != 2 || pred.swizzle[3] != 3) {
+                        uint32_t shuf = b.allocId();
+                        b.emitInst(b.functionDefinitions, SpvOpVectorShuffle, {
+                            typeV4Bool, shuf, predVec, predVec,
+                            pred.swizzle[0], pred.swizzle[1], pred.swizzle[2], pred.swizzle[3] });
+                        predVec = shuf;
+                    }
+                    if (tokens[pc + 2] & (1u << 13)) {
+                        uint32_t neg = b.allocId();
+                        b.emitInst(b.functionDefinitions, SpvOpLogicalNot, { typeV4Bool, neg, predVec });
+                        predVec = neg;
+                    }
+                    val = emitLoadSrc(src);
+                    predicate = predVec;
+                } else {
+                    ParsedSrc src;
+                    parseSrc(tokens[pc + 2], src);
+                    val = emitLoadSrc(src);
+                }
+                emitStoreDest(dst, val, predicate);
+                break;
+            }
+            case D3DSIO_SETP: {
+                ParsedDest dst;
+                ParsedSrc s0, s1;
+                parseDest(tokens[pc + 1], dst);
+                parseSrc(tokens[pc + 2], s0);
+                parseSrc(tokens[pc + 3], s1);
+                if (dst.regType != D3DSPR_PREDICATE || dst.regNum >= 4) {
+                    outError = "SETP destination is not a supported predicate register";
+                    return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                }
+                SpvOp cmpOp = relopVecOp((instToken >> 16) & 0xF);
+                if (cmpOp == SpvOpNop) {
+                    outError = "Unsupported SETP comparison function";
+                    return SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
+                }
+                uint32_t v0 = emitLoadSrc(s0);
+                uint32_t v1 = emitLoadSrc(s1);
+                uint32_t cmp = b.allocId();
+                b.emitInst(b.functionDefinitions, cmpOp, { typeV4Bool, cmp, v0, v1 });
+                if (dst.writeMask == 0x0F) {
+                    b.emitInst(b.functionDefinitions, SpvOpStore, { predVars[dst.regNum], cmp });
+                } else {
+                    uint32_t oldVal = b.allocId();
+                    b.emitInst(b.functionDefinitions, SpvOpLoad, { typeV4Bool, oldVal, predVars[dst.regNum] });
+                    uint32_t comps[4];
+                    for (int i = 0; i < 4; ++i) {
+                        comps[i] = (dst.writeMask & (1 << i)) ? (uint32_t)(4 + i) : (uint32_t)i;
+                    }
+                    uint32_t merged = b.allocId();
+                    b.emitInst(b.functionDefinitions, SpvOpVectorShuffle, {
+                        typeV4Bool, merged, oldVal, cmp, comps[0], comps[1], comps[2], comps[3] });
+                    b.emitInst(b.functionDefinitions, SpvOpStore, { predVars[dst.regNum], merged });
+                }
+                break;
+            }
+            case D3DSIO_LOOP: {
+                ParsedDest aL;
+                ParsedSrc iSrc;
+                parseDest(tokens[pc + 1], aL);
+                parseSrc(tokens[pc + 2], iSrc);
+                (void)aL;
+                if (iSrc.regType != D3DSPR_CONSTINT) {
+                    outError = "LOOP operand is not an integer-constant register";
+                    return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                }
+                auto defiIt = defIntConstants.find(iSrc.regNum);
+                if (defiIt == defIntConstants.end()) {
+                    outError = "LOOP references an undefined integer constant";
+                    return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                }
+                uint32_t depth = 0;
+                for (const auto &f : ctrlStack) {
+                    if (f.isLoop) ++depth;
+                }
+                if (depth >= 8) {
+                    outError = "LOOP nesting deeper than 8 is not supported";
+                    return SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
+                }
+                CtrlFrame fr;
+                fr.isLoop = true;
+                fr.count = defiIt->second.values[0];
+                fr.start = defiIt->second.values[1];
+                fr.step = defiIt->second.values[2];
+                if (fr.count > 0 && fr.step == 0) {
+                    outError = "LOOP with a zero step and nonzero count never terminates";
+                    return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                }
+                fr.ctrVar = loopCtrVars[depth];
+                fr.idxVar = loopIdxVars[depth];
+                fr.headerLabel = b.allocId();
+                fr.mergeLabel = b.allocId();
+                fr.continueLabel = b.allocId();
+                uint32_t bodyLabel = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpStore, { fr.ctrVar, intConst(fr.start) });
+                b.emitInst(b.functionDefinitions, SpvOpStore, { fr.idxVar, const0_i });
+                b.emitInst(b.functionDefinitions, SpvOpBranch, { fr.headerLabel });
+                b.emitInst(b.functionDefinitions, SpvOpLabel, { fr.headerLabel });
+                /* The loop condition is evaluated at the top of the header
+                 * block, BEFORE OpLoopMerge: the merge instruction must be
+                 * the second-to-last instruction of its block, and the
+                 * continue block's back-edge must target this header. */
+                uint32_t idxVal = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpLoad, { typeInt, idxVal, fr.idxVar });
+                uint32_t cond = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpSLessThan, { typeBool, cond, idxVal, intConst(fr.count) });
+                b.emitInst(b.functionDefinitions, SpvOpLoopMerge, { fr.mergeLabel, fr.continueLabel, 0 });
+                b.emitInst(b.functionDefinitions, SpvOpBranchConditional, { cond, bodyLabel, fr.mergeLabel });
+                b.emitInst(b.functionDefinitions, SpvOpLabel, { bodyLabel });
+                ctrlStack.push_back(fr);
+                break;
+            }
+            case D3DSIO_ENDLOOP: {
+                if (ctrlStack.empty() || !ctrlStack.back().isLoop) {
+                    outError = "ENDLOOP without a matching LOOP";
+                    return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                }
+                CtrlFrame fr = ctrlStack.back();
+                ctrlStack.pop_back();
+                b.emitInst(b.functionDefinitions, SpvOpBranch, { fr.continueLabel });
+                b.emitInst(b.functionDefinitions, SpvOpLabel, { fr.continueLabel });
+                uint32_t ctrVal = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpLoad, { typeInt, ctrVal, fr.ctrVar });
+                uint32_t ctrNext = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpIAdd, { typeInt, ctrNext, ctrVal, intConst(fr.step) });
+                b.emitInst(b.functionDefinitions, SpvOpStore, { fr.ctrVar, ctrNext });
+                uint32_t idxVal = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpLoad, { typeInt, idxVal, fr.idxVar });
+                uint32_t idxNext = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpIAdd, { typeInt, idxNext, idxVal, intConst(1) });
+                b.emitInst(b.functionDefinitions, SpvOpStore, { fr.idxVar, idxNext });
+                b.emitInst(b.functionDefinitions, SpvOpBranch, { fr.headerLabel });
+                b.emitInst(b.functionDefinitions, SpvOpLabel, { fr.mergeLabel });
+                break;
+            }
+            case D3DSIO_TEXKILL: {
+                ParsedDest dst;
+                parseDest(tokens[pc + 1], dst);
+                if (isVS || major < 2 ||
+                    (dst.regType != D3DSPR_TEMP && dst.regType != D3DSPR_TEXTURE)) {
+                    outError = "TEXKILL requires a pixel shader temporary or texture register";
+                    return SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
+                }
+                ParsedSrc src{};
+                src.regType = dst.regType;
+                src.regNum = dst.regNum;
+                for (uint32_t i = 0; i < 4; ++i) src.swizzle[i] = i;
+                uint32_t value = emitLoadSrc(src);
+                uint32_t negatives = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpFOrdLessThan,
+                    {typeV4Bool, negatives, value, const0_v4});
+                // texkill tests the first three components, not the write mask.
+                // https://learn.microsoft.com/windows/win32/direct3dhlsl/texkill---ps
+                uint32_t cond = 0;
+                for (uint32_t i = 0; i < 3; ++i) {
+                    uint32_t component = b.allocId();
+                    b.emitInst(b.functionDefinitions, SpvOpCompositeExtract,
+                        {typeBool, component, negatives, i});
+                    if (!cond) cond = component;
+                    else {
+                        uint32_t combined = b.allocId();
+                        b.emitInst(b.functionDefinitions, SpvOpLogicalOr,
+                            {typeBool, combined, cond, component});
+                        cond = combined;
+                    }
+                }
+                uint32_t killLabel = b.allocId(), mergeLabel = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpSelectionMerge, {mergeLabel, 0});
+                b.emitInst(b.functionDefinitions, SpvOpBranchConditional,
+                    {cond, killLabel, mergeLabel});
+                b.emitInst(b.functionDefinitions, SpvOpLabel, {killLabel});
+                b.emitInst(b.functionDefinitions, SpvOpKill, {});
+                b.emitInst(b.functionDefinitions, SpvOpLabel, {mergeLabel});
+                break;
+            }
+            case D3DSIO_IFC: {
+                ParsedSrc s0, s1;
+                parseSrc(tokens[pc + 1], s0);
+                parseSrc(tokens[pc + 2], s1);
+                SpvOp cmpOp = relopVecOp((instToken >> 16) & 0xF);
+                if (cmpOp == SpvOpNop) {
+                    outError = "Unsupported IFC comparison function";
+                    return SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
+                }
+                uint32_t v0 = emitLoadSrc(s0);
+                uint32_t v1 = emitLoadSrc(s1);
+                /* IFC compares one component (post-swizzle component 0) of
+                 * each operand as a scalar condition. */
+                uint32_t cmpVec = b.allocId();
+                b.emitInst(b.functionDefinitions, cmpOp, { typeV4Bool, cmpVec, v0, v1 });
+                uint32_t cond = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpCompositeExtract, { typeBool, cond, cmpVec, 0 });
+                CtrlFrame fr;
+                fr.isLoop = false;
+                fr.mergeLabel = b.allocId();
+                fr.elseLabel = b.allocId();
+                uint32_t thenLabel = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpSelectionMerge, { fr.mergeLabel, 0 });
+                b.emitInst(b.functionDefinitions, SpvOpBranchConditional, { cond, thenLabel, fr.elseLabel });
+                b.emitInst(b.functionDefinitions, SpvOpLabel, { thenLabel });
+                ctrlStack.push_back(fr);
+                break;
+            }
+            case D3DSIO_IF: {
+                ParsedSrc s0;
+                parseSrc(tokens[pc + 1], s0);
+                if (s0.regType != D3DSPR_PREDICATE || s0.regNum >= 4) {
+                    outError = "IF on a non-predicate register is not supported";
+                    return SVGA3_VLKN_ERROR_UNSUPPORTED_SHADER;
+                }
+                uint32_t predVec = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpLoad, { typeV4Bool, predVec, predVars[s0.regNum] });
+                uint32_t cond = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpCompositeExtract, { typeBool, cond, predVec, s0.swizzle[0] });
+                CtrlFrame fr;
+                fr.isLoop = false;
+                fr.mergeLabel = b.allocId();
+                fr.elseLabel = b.allocId();
+                uint32_t thenLabel = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpSelectionMerge, { fr.mergeLabel, 0 });
+                b.emitInst(b.functionDefinitions, SpvOpBranchConditional, { cond, thenLabel, fr.elseLabel });
+                b.emitInst(b.functionDefinitions, SpvOpLabel, { thenLabel });
+                ctrlStack.push_back(fr);
+                break;
+            }
+            case D3DSIO_ELSE: {
+                if (ctrlStack.empty() || ctrlStack.back().isLoop || ctrlStack.back().elseSeen) {
+                    outError = "ELSE without a matching IF";
+                    return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                }
+                CtrlFrame &fr = ctrlStack.back();
+                b.emitInst(b.functionDefinitions, SpvOpBranch, { fr.mergeLabel });
+                b.emitInst(b.functionDefinitions, SpvOpLabel, { fr.elseLabel });
+                fr.elseSeen = true;
+                break;
+            }
+            case D3DSIO_ENDIF: {
+                if (ctrlStack.empty() || ctrlStack.back().isLoop) {
+                    outError = "ENDIF without a matching IF";
+                    return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                }
+                CtrlFrame fr = ctrlStack.back();
+                ctrlStack.pop_back();
+                b.emitInst(b.functionDefinitions, SpvOpBranch, { fr.mergeLabel });
+                if (!fr.elseSeen) {
+                    /* The branch-conditional's false edge targeted elseLabel;
+                     * with no ELSE body it is an empty fall-through block. */
+                    b.emitInst(b.functionDefinitions, SpvOpLabel, { fr.elseLabel });
+                    b.emitInst(b.functionDefinitions, SpvOpBranch, { fr.mergeLabel });
+                }
+                b.emitInst(b.functionDefinitions, SpvOpLabel, { fr.mergeLabel });
+                break;
+            }
+            case D3DSIO_BREAK: {
+                uint32_t mergeLabel = 0;
+                for (auto it = ctrlStack.rbegin(); it != ctrlStack.rend(); ++it) {
+                    if (it->isLoop) { mergeLabel = it->mergeLabel; break; }
+                }
+                if (mergeLabel == 0) {
+                    outError = "BREAK outside any loop";
+                    return SVGA3_VLKN_ERROR_INVALID_PARAM;
+                }
+                b.emitInst(b.functionDefinitions, SpvOpBranch, { mergeLabel });
+                /* Anything up to the enclosing construct's close is
+                 * unreachable; it still needs a well-formed block. */
+                uint32_t deadLabel = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpLabel, { deadLabel });
                 break;
             }
             case D3DSIO_ADD: {
@@ -1281,6 +2010,78 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 emitStoreDest(dst, res);
                 break;
             }
+            case D3DSIO_SLT: case D3DSIO_SGE: {
+                ParsedDest dst;
+                ParsedSrc s0, s1;
+                parseDest(tokens[pc + 1], dst);
+                parseSrc(tokens[pc + 2], s0);
+                parseSrc(tokens[pc + 3], s1);
+                uint32_t v0 = emitLoadSrc(s0);
+                uint32_t v1 = emitLoadSrc(s1);
+                /* Ordered component comparisons produce 1.0 or 0.0. */
+                uint32_t cmp = b.allocId();
+                b.emitInst(b.functionDefinitions, op == D3DSIO_SLT ? SpvOpFOrdLessThan : SpvOpFOrdGreaterThanEqual, { typeV4Bool, cmp, v0, v1 });
+                uint32_t res = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpSelect, { typeV4Float, res, cmp, const1_v4, const0_v4 });
+                emitStoreDest(dst, res);
+                break;
+            }
+            case D3DSIO_EXP: {
+                ParsedDest dst;
+                ParsedSrc s0;
+                parseDest(tokens[pc + 1], dst);
+                parseSrc(tokens[pc + 2], s0);
+                uint32_t v0 = emitLoadSrc(s0);
+                /* D3D EXP: 2^(src.x), replicated to all components */
+                uint32_t x0 = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpCompositeExtract, { typeFloat, x0, v0, 0 });
+                uint32_t ex = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpExtInst, { typeFloat, ex, glslSetId, GLSLstd450Exp2, x0 });
+                uint32_t res = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpCompositeConstruct, { typeV4Float, res, ex, ex, ex, ex });
+                emitStoreDest(dst, res);
+                break;
+            }
+            case D3DSIO_POW: {
+                ParsedDest dst;
+                ParsedSrc s0, s1;
+                parseDest(tokens[pc + 1], dst);
+                parseSrc(tokens[pc + 2], s0);
+                parseSrc(tokens[pc + 3], s1);
+                uint32_t v0 = emitLoadSrc(s0);
+                uint32_t v1 = emitLoadSrc(s1);
+                /* D3D POW: (src0.x)^(src1.x), replicated to all components */
+                uint32_t x0 = b.allocId();
+                uint32_t x1 = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpCompositeExtract, { typeFloat, x0, v0, 0 });
+                b.emitInst(b.functionDefinitions, SpvOpCompositeExtract, { typeFloat, x1, v1, 0 });
+                uint32_t pw = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpExtInst, { typeFloat, pw, glslSetId, GLSLstd450Pow, x0, x1 });
+                uint32_t res = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpCompositeConstruct, { typeV4Float, res, pw, pw, pw, pw });
+                emitStoreDest(dst, res);
+                break;
+            }
+            case D3DSIO_SINCOS: {
+                ParsedDest dst;
+                ParsedSrc s0;
+                parseDest(tokens[pc + 1], dst);
+                parseSrc(tokens[pc + 2], s0);
+                uint32_t v0 = emitLoadSrc(s0);
+                /* SM3 SINCOS: dest.x = cos(src.x), dest.y = sin(src.x);
+                 * z/w follow TGSI SCS (0.0, 1.0); the dest write mask
+                 * merge in emitStoreDest decides what actually lands. */
+                uint32_t x0 = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpCompositeExtract, { typeFloat, x0, v0, 0 });
+                uint32_t cv = b.allocId();
+                uint32_t sv = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpExtInst, { typeFloat, cv, glslSetId, GLSLstd450Cos, x0 });
+                b.emitInst(b.functionDefinitions, SpvOpExtInst, { typeFloat, sv, glslSetId, GLSLstd450Sin, x0 });
+                uint32_t res = b.allocId();
+                b.emitInst(b.functionDefinitions, SpvOpCompositeConstruct, { typeV4Float, res, cv, sv, const0_f, const1_f });
+                emitStoreDest(dst, res);
+                break;
+            }
             case D3DSIO_TEX: {
                 ParsedDest dst;
                 parseDest(tokens[pc + 1], dst);
@@ -1319,10 +2120,14 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
 
                 uint32_t sampled = b.allocId();
                 if (depthStage) {
-                    /* D3D tex of a depth map returns the fetched depth in every channel. */
-                    uint32_t drefResult = b.allocId();
+                    /* Non-comparison sampling returns a vector even for a
+                     * depth image. Extract red before replicating D3D depth. */
+                    uint32_t depthSample = b.allocId();
                     b.emitInst(b.functionDefinitions, SpvOpImageSampleImplicitLod,
-                               { typeFloat, drefResult, sampledImage, uv });
+                               { typeV4Float, depthSample, sampledImage, uv });
+                    uint32_t drefResult = b.allocId();
+                    b.emitInst(b.functionDefinitions, SpvOpCompositeExtract,
+                               { typeFloat, drefResult, depthSample, 0 });
                     b.emitInst(b.functionDefinitions, SpvOpCompositeConstruct,
                                { typeV4Float, sampled, drefResult, drefResult, drefResult, const1_f });
                 } else {
@@ -1347,10 +2152,16 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
         } else {
             switch (op) {
                 case D3DSIO_NOP: advance = 1; break;
+                case D3DSIO_SETP: advance = 4; break;
+                case D3DSIO_LOOP:
+                case D3DSIO_IFC: advance = 3; break;
+                case D3DSIO_TEXKILL: case D3DSIO_IF: advance = 2; break;
                 case D3DSIO_MOV:
                 case D3DSIO_RCP:
                 case D3DSIO_RSQ:
                 case D3DSIO_ABS:
+                case D3DSIO_EXP:
+                case D3DSIO_SINCOS:
                 case D3DSIO_FRC: advance = 3; break;
                 case D3DSIO_ADD:
                 case D3DSIO_SUB:
@@ -1359,6 +2170,8 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 case D3DSIO_DP4:
                 case D3DSIO_MIN:
                 case D3DSIO_MAX:
+                case D3DSIO_SLT: case D3DSIO_SGE:
+                case D3DSIO_POW:
                 case D3DSIO_M4x4: advance = 4; break;
                 case D3DSIO_TEX:
                     advance = destOnlyTex ? 2 : 4;
