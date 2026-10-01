@@ -56,10 +56,6 @@ int main() {
   printf("draw status=%d\n",
          svga3_vlkn_context_draw(d, 1, SVGA3D_PRIMITIVE_TRIANGLELIST, &decl, 1,
                                  &r, 1));
-  // Context fallback-image initialization must not run inside another pass.
-  bool contextDuringDraw = svga3_vlkn_context_create(d, 99) == SVGA3_VLKN_SUCCESS;
-  contextDuringDraw &= d->backend->validationErrors() == 0;
-  contextDuringDraw &= svga3_vlkn_context_destroy(d, 99) == SVGA3_VLKN_SUCCESS;
   for (auto &v : verts)
     v[0] += 1;
   svga3_vlkn_surface_dma_upload(d, 2, 0, &box, verts, sizeof(verts));
@@ -72,7 +68,7 @@ int main() {
         (x < 32 ? left : right)++;
   printf("red pixels left=%u right=%u (expected left>0 right=0)\n", left,
          right);
-  bool correct = contextDuringDraw && left > 0 && right == 0;
+  bool correct = left > 0 && right == 0;
   SVGA3dSize compressedSize{4, 4, 1};
   correct &=
       svga3_vlkn_surface_define(d, 3, SVGA3D_SURFACE_HINT_TEXTURE, SVGA3D_DXT1,
@@ -90,6 +86,14 @@ int main() {
   printf("compressed texture block roundtrip and attachment rejection: %s\n",
          correct ? "PASS" : "FAIL");
   // The guest adapter must use block rows as well as the direct DMA API.
+  // Keep this after the buffer-overwrite assertion: context construction
+  // flushes, so inserting it before that assertion would mask its regression.
+  correct &= svga3_vlkn_context_draw(d, 1, SVGA3D_PRIMITIVE_TRIANGLELIST,
+                                      &decl, 1, &r, 1) == SVGA3_VLKN_SUCCESS;
+  correct &= svga3_vlkn_context_create(d, 99) == SVGA3_VLKN_SUCCESS;
+  correct &= d->backend->validationErrors() == 0;
+  correct &= svga3_vlkn_context_destroy(d, 99) == SVGA3_VLKN_SUCCESS;
+  printf("context initialization after queued draw: %s\n", correct ? "PASS" : "FAIL");
   SVGA3dSize bcSize{8, 8, 1};
   correct &=
       svga3_vlkn_surface_define(d, 20, SVGA3D_SURFACE_HINT_TEXTURE, SVGA3D_DXT1,
