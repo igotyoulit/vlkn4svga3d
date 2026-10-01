@@ -85,6 +85,60 @@ int main() {
              SVGA3_VLKN_ERROR_UNSUPPORTED_FORMAT;
   printf("compressed texture block roundtrip and attachment rejection: %s\n",
          correct ? "PASS" : "FAIL");
+  // The guest adapter must use block rows as well as the direct DMA API.
+  SVGA3dSize bcSize{8, 8, 1};
+  correct &=
+      svga3_vlkn_surface_define(d, 20, SVGA3D_SURFACE_HINT_TEXTURE, SVGA3D_DXT1,
+                                &bcSize, 1) == SVGA3_VLKN_SUCCESS;
+  correct &=
+      svga3_vlkn_surface_define(d, 21, SVGA3D_SURFACE_HINT_TEXTURE, SVGA3D_DXT1,
+                                &compressedSize, 1) == SVGA3_VLKN_SUCCESS;
+  uint8_t blocks[32], bcRead[32]{};
+  for (unsigned i = 0; i < 32; ++i)
+    blocks[i] = uint8_t(i + 1);
+  SVGA3dGuestImage guest{};
+  guest.pitch = 16;
+  SVGA3dSurfaceImageId image{20, 0, 0};
+  SVGA3dCopyBox bcBox{};
+  bcBox.w = 8;
+  bcBox.h = 8;
+  bcBox.d = 1;
+  correct &= d->surfaceMgr->surfaceDMA(guest, image, SVGA3D_WRITE_HOST_VRAM,
+                                       &bcBox, 1, nullptr, blocks,
+                                       sizeof(blocks)) == SVGA3_VLKN_SUCCESS;
+  correct &= svga3_vlkn_surface_dma_download(d, 20, 0, nullptr, bcRead, 16) ==
+             SVGA3_VLKN_SUCCESS;
+  correct &= memcmp(blocks, bcRead, 32) == 0;
+  correct &= d->surfaceMgr->surfaceDMA(guest, image, SVGA3D_WRITE_HOST_VRAM,
+                                       &bcBox, 1, nullptr, blocks,
+                                       31) == SVGA3_VLKN_ERROR_INVALID_PARAM;
+  image.sid = 21;
+  bcBox.w = 4;
+  bcBox.h = 4;
+  bcBox.srcx = 4;
+  bcBox.srcy = 4;
+  correct &=
+      d->surfaceMgr->surfaceDMA(guest, image, SVGA3D_WRITE_HOST_VRAM, &bcBox, 1,
+                                nullptr, blocks, 32) == SVGA3_VLKN_SUCCESS;
+  correct &= svga3_vlkn_surface_dma_download(d, 21, 0, nullptr, bcRead, 8) ==
+             SVGA3_VLKN_SUCCESS;
+  correct &= memcmp(blocks + 24, bcRead, 8) == 0;
+  std::vector<uint8_t> guestPage(4096, 0xcd);
+  memcpy(guestPage.data(), blocks, 32);
+  correct &= d->guestMem->setFramebuffer(guestPage.data(), 0, guestPage.size(),
+                                         8, 8, 32, 4) == SVGA3_VLKN_SUCCESS;
+  guest.ptr.gmrId = SVGA_GMR_FRAMEBUFFER;
+  correct &=
+      d->surfaceMgr->surfaceDMA(guest, image, SVGA3D_WRITE_HOST_VRAM, &bcBox, 1,
+                                d->guestMem.get()) == SVGA3_VLKN_SUCCESS;
+  memset(guestPage.data(), 0xcd, guestPage.size());
+  correct &=
+      d->surfaceMgr->surfaceDMA(guest, image, SVGA3D_READ_HOST_VRAM, &bcBox, 1,
+                                d->guestMem.get()) == SVGA3_VLKN_SUCCESS;
+  correct &= memcmp(guestPage.data() + 24, blocks + 24, 8) == 0 &&
+             guestPage[23] == 0xcd && guestPage[32] == 0xcd;
+  printf("compressed guest/FIFO adapter and exact buffer bounds: %s\n",
+         correct ? "PASS" : "FAIL");
   SVGA3dSize depthSize{64, 64, 1};
   correct &= svga3_vlkn_surface_define(d, 5, 0, SVGA3D_Z_D16, &depthSize, 1) ==
              SVGA3_VLKN_SUCCESS;
