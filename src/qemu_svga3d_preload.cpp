@@ -1034,9 +1034,10 @@ asm(
     "  movl %ebx, %esi\n"
     "  movl (%rsp), %edx\n"
     "  movl 4(%rsp), %ecx\n"
-    "  subq $8, %rsp\n"
+    // This is a jump from inside QEMU's VNC handler, not a function entry.
+    // RSP is already 16-byte aligned (the preceding QEMU MOVAPS uses it).
+    // CALL alone gives the C callee its required RSP % 16 == 8 alignment.
     "  call my_vnc_pointer_event\n"
-    "  addq $8, %rsp\n"
     "  movq vnc_pointer_cont(%rip), %rax\n"
     "  jmp *%rax\n"
 );
