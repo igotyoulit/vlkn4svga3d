@@ -210,12 +210,13 @@ $(LIB_DIR):
 $(DATA_DIR):
 	mkdir -p $(DATA_DIR)
 
-test: $(ORACLE_TARGET) $(VLKN_TEST_TARGET) $(BIN_DIR)/test_preload_fifo
+test: $(ORACLE_TARGET) $(VLKN_TEST_TARGET) $(BIN_DIR)/test_preload_fifo $(DX_TEST_TARGET)
 	@echo "=== Running Oracle Reference Verification ==="
 	./$(ORACLE_TARGET) --test
 	@echo "\n=== Running SVGA3=VLKN Product Verification ==="
 	./$(VLKN_TEST_TARGET)
 	./$(BIN_DIR)/test_preload_fifo
+	./$(DX_TEST_TARGET)
 
 test-oracle: $(ORACLE_TARGET)
 	./$(ORACLE_TARGET) --test
