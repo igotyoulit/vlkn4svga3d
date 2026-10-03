@@ -3,6 +3,7 @@
  */
 
 #include "svga3_device.h"
+#include "svga3_dx.h"
 #include <algorithm>
 #include <cstring>
 #include <iostream>
@@ -854,6 +855,11 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
         }
 
         default:
+            /* DX path owns its command range; unknown DX commands fail
+             * closed inside svga3_dx_dispatch. D3D9 cases above are untouched. */
+            if (cmd >= SVGA_3D_CMD_DX_BASE && cmd < SVGA_3D_CMD_DX_MAX) {
+                return svga3_dx_dispatch(dev, cmd, payload, payloadSize, bytesRead);
+            }
             if (cmd >= SVGA_3D_CMD_BASE && cmd < SVGA_3D_CMD_FUTURE_MAX) {
                 /* Skip unrecognized 3D command gracefully when bounded by header */
                 *bytesRead = payloadSize;
