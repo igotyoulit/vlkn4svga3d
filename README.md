@@ -6,7 +6,7 @@ Experimental SVGA3D to Vulkan library and QEMU integration prototype. Internal n
 
 ## Status
 
-Work in progress. This is not a finished virtual GPU. This is not a drop-in VMware replacement. Minecraft has reached an in-game world in the PlayBook guest. That is one guest milestone. It does not imply broad compatibility.
+Work in progress. This is not a finished virtual GPU. This is not a drop-in VMware replacement.
 
 ## Lab adapter
 
