@@ -476,16 +476,9 @@ static void ensure_vlkn_device(void *s) {
             vram, width, height, pitch, bpp, vram_size);
 
     svga3_vlkn_device_set_framebuffer(g_vlknDev, vram, reg_value(s, SVGA_REG_FB_START), vram_size, width, height, pitch, bpp / 8);
-    static Svga3HostAdapter preloadAdapter = {
-        nullptr, /* opaque set below */
-        nullptr, /* guestRamMap: core uses registered RAM blocks */
-        nullptr, /* guestRamRead */
-        nullptr, /* guestRamWrite */
-        nullptr, /* present: core default */
-        vlkn_display_update_cb,
-        nullptr, /* fenceSync: core default */
-    };
+    Svga3HostAdapter preloadAdapter{};
     preloadAdapter.opaque = s;
+    preloadAdapter.displayUpdate = vlkn_display_update_cb;
     svga3_vlkn_device_set_host_adapter(g_vlknDev, &preloadAdapter);
 
     g_vlkn_initialized = true;

@@ -19,9 +19,7 @@ static inline Svga3HostAdapter fake_host_adapter(
     adapter.guestRamMap = 0;
     adapter.guestRamRead = 0;
     adapter.guestRamWrite = 0;
-    adapter.present = 0;
     adapter.displayUpdate = displayUpdate;
-    adapter.fenceSync = 0;
     return adapter;
 }
 

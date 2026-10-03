@@ -51,7 +51,9 @@ cd vlkn4svga3d
 make -j4 all
 ```
 
-Outputs include `lib/libsvga3_vlkn.a`, `lib/libqemu_svga3d.so`, and test executables under `bin/`. Public interfaces are in `include/svga3_vlkn.h` and `include/qemu_vmsvga.h`. Link consumers with the static library, `-ldl`, and `-pthread`.
+Outputs include `lib/libsvga3_vlkn.a`, `lib/libqemu_svga3d.so`, and test executables under `bin/`. Public interfaces are in `include/svga3_vlkn.h` and `include/qemu_vmsvga.h`. Link core consumers with `libsvga3_vlkn.a`, `-ldl`, and `-pthread`. The QEMU device harness additionally links `libsvga3_qemu_adapter.a` before the core library.
+
+Host integrations register a `Svga3HostAdapter` with `svga3_vlkn_device_set_host_adapter`, replacing the former guest-memory and display callback setters. The core copies the table; its opaque host state must remain valid until detached or device destruction. RAM map/read/write and display notifications cross this boundary. Rendering, presentation copies and fence completion remain core responsibilities. Callbacks run under core locks and must not reenter device APIs.
 
 Make generates header dependency files for compiled objects, so header edits rebuild affected objects.
 

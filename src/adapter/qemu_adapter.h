@@ -18,10 +18,8 @@ extern "C" {
 
 /* Build a Svga3HostAdapter for the QEMU device. The opaque pointer is the
  * QemuVmsvgaDevice instance. */
-const Svga3HostAdapter *qemu_adapter_for_device(void *qemuDevice);
+Svga3HostAdapter qemu_adapter_for_device(void *qemuDevice);
 
-/* Release adapter resources. */
-void qemu_adapter_shutdown(void);
 
 #ifdef __cplusplus
 }

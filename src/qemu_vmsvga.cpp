@@ -131,7 +131,8 @@ bool QemuVmsvgaDevice::init(bool enableValidation, bool forceMock)
     uint32_t bpp = m_regs[SVGA_REG_BITS_PER_PIXEL] ? (m_regs[SVGA_REG_BITS_PER_PIXEL] / 8) : 4;
 
     svga3_vlkn_device_set_framebuffer(m_vlknDev, m_fbMem.data(), m_fbGpa, m_fbSize, w, h, pitch, bpp);
-    svga3_vlkn_device_set_host_adapter(m_vlknDev, qemu_adapter_for_device(this));
+    const auto adapter = qemu_adapter_for_device(this);
+    svga3_vlkn_device_set_host_adapter(m_vlknDev, &adapter);
     return true;
 }
 
@@ -178,7 +179,8 @@ void QemuVmsvgaDevice::reset()
     if (m_vlknDev) {
         svga3_vlkn_device_reset(m_vlknDev);
         svga3_vlkn_device_set_framebuffer(m_vlknDev, m_fbMem.data(), m_fbGpa, m_fbSize, 1024, 768, 1024 * 4, 4);
-        svga3_vlkn_device_set_host_adapter(m_vlknDev, qemu_adapter_for_device(this));
+        const auto adapter = qemu_adapter_for_device(this);
+    svga3_vlkn_device_set_host_adapter(m_vlknDev, &adapter);
     }
 }
 
