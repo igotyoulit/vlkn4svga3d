@@ -1,3 +1,22 @@
+/* Issue #11 — this file is a single-build lab tool, not a production path.
+ *
+ * The constructor below binary-patches a RUNNING QEMU process (mprotect +
+ * indirect JMP hooks at hardcoded RVAs). It must NEVER be deployed as a
+ * global LD_PRELOAD: it only arms when the host process is qemu-system* AND
+ * the process image's NT_GNU_BUILD_ID is on the explicit allowlist below.
+ * Unallowlisted QEMU processes _exit(78) before patching. Other processes
+ * do not arm this adapter.
+ *
+ * Each allowlist entry pairs ONE build-id with the RVA set further down.
+ * Those RVAs are per-build; adding a build means re-verifying EVERY ADDR_*
+ * against that exact binary. Never extend the list from a guess.
+ *
+ * Validation layers: on for debug builds, off for release builds, with the
+ * SVGA3_VLKN_VALIDATE env var able to force either way ("1"/"0").
+ * Portrait dimension hacks only apply with SVGA3_VLKN_GUEST_PROFILE set to
+ * the explicit profile name. The framebuffer GPA always comes from the
+ * device's SVGA_REG_FB_START register, never a hardcoded constant.
+ */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -170,6 +189,54 @@ static std::mutex g_vlkn_mutex;
 static bool portrait_profile_enabled() {
     const char *profile = getenv("SVGA3_VLKN_GUEST_PROFILE");
     return profile && strcmp(profile, "playbook-portrait") == 0;
+}
+
+/* Explicit build-id allowlist for the binary-patch path. See the file-top
+ * policy comment: one entry = one (build-id, RVA-set) pair. */
+struct PreloadBuildEntry {
+    const char *label;
+    unsigned char build_id[20];
+};
+static const PreloadBuildEntry kPreloadBuildAllowlist[] = {
+    { "qemu-system-x86_64 10.1.2 (owner lab build)",
+      { 0x2e,0x87,0x0e,0x40,0x0e,0x16,0x92,0xf5,
+        0xf5,0xa5,0x4d,0xa8,0x97,0xd1,0xdc,0x15,
+        0x2b,0x18,0x72,0x78 } },
+};
+
+static bool preload_build_id_allowed(const unsigned char *id, size_t len) {
+    if (!id || len != sizeof(kPreloadBuildAllowlist[0].build_id)) return false;
+    for (const auto &entry : kPreloadBuildAllowlist) {
+        if (!memcmp(id, entry.build_id, sizeof(entry.build_id))) return true;
+    }
+    return false;
+}
+
+/* Stable lowercase hex for refusal diagnostics: the operator must be able to
+ * see WHICH build was refused before allowlisting it in a future build. */
+static bool preload_format_build_id(const unsigned char *id, size_t len,
+                                    char *out, size_t out_len) {
+    static const char *hexd = "0123456789abcdef";
+    if (!id || !out || out_len == 0 || len > (out_len - 1) / 2) return false;
+    for (size_t i = 0; i < len; ++i) {
+        out[2 * i] = hexd[id[i] >> 4];
+        out[2 * i + 1] = hexd[id[i] & 15];
+    }
+    out[len * 2] = '\0';
+    return true;
+}
+
+/* Explicit env wins; otherwise debug builds request validation and release
+ * (NDEBUG) builds do not. Missing requested validation is an initialization error. */
+static bool preload_validation_requested() {
+    const char *v = getenv("SVGA3_VLKN_VALIDATE");
+    if (v && strcmp(v, "1") == 0) return true;
+    if (v && strcmp(v, "0") == 0) return false;
+#ifdef NDEBUG
+    return false;
+#else
+    return true;
+#endif
 }
 
 static SVGAFifoCmdDefineGMRFB g_display_gmrfb = {};
@@ -446,8 +513,7 @@ static void ensure_vlkn_device(void *s) {
     cfg.apiVersion = VK_API_VERSION_1_0;
     cfg.stagingBufferSize = 64 * 1024 * 1024;
     cfg.forceMockBackend = false;
-    const char *validate = getenv("SVGA3_VLKN_VALIDATE");
-    cfg.enableValidationLayers = validate && strcmp(validate, "1") == 0;
+    cfg.enableValidationLayers = preload_validation_requested();
 
     g_vlknDev = svga3_vlkn_device_create(&cfg);
     if (!g_vlknDev) {
@@ -1121,7 +1187,8 @@ extern "C" void vnc_pointer_hook(void);
 
 static uintptr_t qemu_base = 0;
 static bool supported_build = false;
-static const unsigned char expected_build[] = {0x2e,0x87,0x0e,0x40,0x0e,0x16,0x92,0xf5,0xf5,0xa5,0x4d,0xa8,0x97,0xd1,0xdc,0x15,0x2b,0x18,0x72,0x78};
+static unsigned char observed_build_id[64] = {0};
+static size_t observed_build_id_len = 0;
 
 static int phdr_callback(struct dl_phdr_info *info, size_t size, void *data) {
     (void)size; (void)data;
@@ -1136,8 +1203,13 @@ static int phdr_callback(struct dl_phdr_info *info, size_t size, void *data) {
                 size_t ns=((size_t)n->n_namesz+3)&~(size_t)3, ds=((size_t)n->n_descsz+3)&~(size_t)3;
                 p+=sizeof(*n);
                 if (ns>(size_t)(end-p) || ds>(size_t)(end-p)-ns) break;
-                if (n->n_type==NT_GNU_BUILD_ID && n->n_namesz==4 && !memcmp(p,"GNU",4) &&
-                    n->n_descsz==sizeof(expected_build) && !memcmp(p+ns,expected_build,sizeof(expected_build))) supported_build=true;
+                if (n->n_type==NT_GNU_BUILD_ID && n->n_namesz==4 && !memcmp(p,"GNU",4)) {
+                    if (n->n_descsz <= sizeof(observed_build_id)) {
+                        memcpy(observed_build_id, p+ns, n->n_descsz);
+                        observed_build_id_len = n->n_descsz;
+                    }
+                    if (preload_build_id_allowed(p+ns, n->n_descsz)) supported_build=true;
+                }
                 p+=ns+ds;
             }
         }
@@ -1159,7 +1231,14 @@ static void svga3d_init(void) {
     dl_iterate_phdr(phdr_callback, NULL);
     log_msg("[libqemu_svga3d] Loaded in QEMU! qemu_base=0x%lx\n", (unsigned long)qemu_base);
     if (!qemu_base || !supported_build) {
-        fprintf(stderr, "[libqemu_svga3d] ERROR: unsupported QEMU build; refusing unsafe patch!\n");
+        char hex[129] = {0};
+        const char *seen = "<none>";
+        if (observed_build_id_len &&
+            preload_format_build_id(observed_build_id, observed_build_id_len,
+                                    hex, sizeof(hex))) {
+            seen = hex;
+        }
+        fprintf(stderr, "[libqemu_svga3d] ERROR: unsupported QEMU build (build-id %s); refusing unsafe patch!\n", seen);
         _exit(78);
     }
 
