@@ -41,6 +41,7 @@ enum SpvOp {
     SpvOpConstantFalse = 42,
     SpvOpConstant = 43,
     SpvOpConstantComposite = 44,
+    SpvOpSpecConstant = 50,
     SpvOpFunction = 54,
     SpvOpFunctionEnd = 56,
     SpvOpVariable = 59,
@@ -65,6 +66,8 @@ enum SpvOp {
     SpvOpConvertSToF = 109,
     SpvOpDot = 148,
     SpvOpSelect = 169,
+    SpvOpIEqual = 170,
+    SpvOpINotEqual = 171,
     SpvOpSLessThan = 177,
     SpvOpFOrdEqual = 180,
     SpvOpFOrdNotEqual = 182,
@@ -73,6 +76,7 @@ enum SpvOp {
     SpvOpFOrdLessThanEqual = 188,
     SpvOpFOrdGreaterThanEqual = 190,
     SpvOpLogicalOr = 166,
+    SpvOpLogicalAnd = 167,
     SpvOpLogicalNot = 168,
     SpvOpLoopMerge = 246,
     SpvOpSelectionMerge = 247,
@@ -114,6 +118,7 @@ enum SpvStorageClass {
 };
 
 enum SpvDecoration {
+    SpvDecorationSpecId = 1,
     SpvDecorationBlock = 2,
     SpvDecorationRowMajor = 4,
     SpvDecorationColMajor = 5,

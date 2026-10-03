@@ -19,6 +19,8 @@
 #include "svga3_vlkn.h"
 #include "svga3_device.h"
 #include "vlkn_backend.h"
+#include "svga3_context.h"
+#include "svga3_surface.h"
 
 #include <iostream>
 #include <vector>
@@ -1030,7 +1032,202 @@ int main() {
         }
     }
 
-    /* Clean Teardown */
+    /* --------------------------------------------------------------------------
+     * SCENE 9: Fixed-Function Alpha Testing Emulation via Specialization Constants
+     * -------------------------------------------------------------------------- */
+    std::cout << "\n--- Scene 9: Fixed-Function Alpha Testing Emulation ---" << std::endl;
+    {
+        const uint32_t CID = 90;
+        const uint32_t SID_RT = 91;
+        const uint32_t SID_TEX = 92;
+        const uint32_t SID_VB = 93;
+
+        svga3_vlkn_context_create(dev, CID);
+
+        SVGA3dSize rtSz = { RT_W, RT_H, 1 };
+        svga3_vlkn_surface_define(dev, SID_RT, SVGA3D_SURFACE_HINT_RENDERTARGET, SVGA3D_A8R8G8B8, &rtSz, 1);
+        svga3_vlkn_context_set_render_target(dev, CID, SVGA3D_RT_COLOR0, SID_RT, 0, 0);
+
+        SVGA3dRect vp = { 0, 0, RT_W, RT_H };
+        svga3_vlkn_context_set_viewport(dev, CID, &vp);
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_CULLMODE, SVGA3D_FACE_NONE);
+
+        float matIdent[16] = {
+            1.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f
+        };
+        for (int r = 0; r < 4; ++r) {
+            uint32_t rowValues[4];
+            memcpy(rowValues, &matIdent[r * 4], sizeof(float) * 4);
+            svga3_vlkn_context_set_shader_const(dev, CID, r, SVGA3D_SHADERTYPE_VS, SVGA3D_CONST_TYPE_FLOAT, rowValues);
+        }
+
+        /* Identity tint (1, 1, 1, 1) */
+        float tintOne[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        uint32_t tVal[4];
+        memcpy(tVal, tintOne, sizeof(tintOne));
+        svga3_vlkn_context_set_shader_const(dev, CID, 0, SVGA3D_SHADERTYPE_PS, SVGA3D_CONST_TYPE_FLOAT, tVal);
+
+        svga3_vlkn_context_define_shader(dev, CID, 1, SVGA3D_SHADERTYPE_VS, vs1Bytecode, sizeof(vs1Bytecode)/4);
+        svga3_vlkn_context_define_shader(dev, CID, 1, SVGA3D_SHADERTYPE_PS, ps1Bytecode, sizeof(ps1Bytecode)/4);
+        svga3_vlkn_context_set_shader(dev, CID, SVGA3D_SHADERTYPE_VS, 1);
+        svga3_vlkn_context_set_shader(dev, CID, SVGA3D_SHADERTYPE_PS, 1);
+
+        /* Create 2x1 Texture Surface: Left=Red (A=0.2), Right=Green (A=0.8) */
+        SVGA3dSize texSz = { 2, 1, 1 };
+        svga3_vlkn_surface_define(dev, SID_TEX, SVGA3D_SURFACE_HINT_TEXTURE, SVGA3D_A8R8G8B8, &texSz, 1);
+        svga3_vlkn_context_set_texture(dev, CID, 0, SID_TEX);
+        svga3_vlkn_context_set_texture_stage_state(dev, CID, 0, SVGA3D_TS_MINFILTER, SVGA3D_TEX_FILTER_NEAREST);
+        svga3_vlkn_context_set_texture_stage_state(dev, CID, 0, SVGA3D_TS_MAGFILTER, SVGA3D_TEX_FILTER_NEAREST);
+
+        uint32_t texData[2] = {
+            0x33FF0000, /* Left: Red, Alpha = ~0.2 */
+            0xCC00FF00  /* Right: Green, Alpha = ~0.8 */
+        };
+        SVGA3dBox tBox = { 0, 0, 0, 2, 1, 1 };
+        svga3_vlkn_surface_dma_upload(dev, SID_TEX, 0, &tBox, texData, sizeof(texData));
+
+        Vertex quadVerts[6] = {
+            { -1.0f,  1.0f, 0.5f,  0.0f, 0.0f },
+            {  1.0f,  1.0f, 0.5f,  1.0f, 0.0f },
+            {  1.0f, -1.0f, 0.5f,  1.0f, 1.0f },
+            { -1.0f,  1.0f, 0.5f,  0.0f, 0.0f },
+            {  1.0f, -1.0f, 0.5f,  1.0f, 1.0f },
+            { -1.0f, -1.0f, 0.5f,  0.0f, 1.0f }
+        };
+        SVGA3dSize vbSz = { sizeof(quadVerts), 1, 1 };
+        svga3_vlkn_surface_define(dev, SID_VB, SVGA3D_SURFACE_HINT_VERTEXBUFFER, SVGA3D_BUFFER, &vbSz, 1);
+        SVGA3dBox bBox = { 0, 0, 0, sizeof(quadVerts), 1, 1 };
+        svga3_vlkn_surface_dma_upload(dev, SID_VB, 0, &bBox, quadVerts, sizeof(quadVerts));
+
+        decls[0].array.surfaceId = SID_VB;
+        decls[1].array.surfaceId = SID_VB;
+        SVGA3dPrimitiveRange r1 = { SVGA3D_PRIMITIVE_TRIANGLELIST, 2, {}, 0, 0 };
+
+        /* 1. Draw with Alpha Test Enabled: GREATER than 0.5 */
+        float alphaRef = 0.5f;
+        uint32_t alphaRefBits;
+        memcpy(&alphaRefBits, &alphaRef, sizeof(float));
+
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_ALPHATESTENABLE, 1);
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_ALPHAFUNC, SVGA3D_CMP_GREATER);
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_ALPHAREF, alphaRefBits);
+
+        /* Clear background to Blue (0, 0, 255) */
+        svga3_vlkn_context_clear(dev, CID, SVGA3D_CLEAR_COLOR, 0xFF0000FF, 1.0f, 0, nullptr, 0);
+        svga3_vlkn_context_draw(dev, CID, SVGA3D_PRIMITIVE_TRIANGLELIST, decls, 2, &r1, 1);
+        svga3_vlkn_device_wait_idle(dev);
+
+        std::vector<Pixel> fbAlphaOn(RT_W * RT_H);
+        svga3_vlkn_surface_dma_download(dev, SID_RT, 0, nullptr, fbAlphaOn.data(), RT_W * 4);
+
+        /* Left half (u=0.25, A=0.2 < 0.5) must be discarded -> untouched Blue (0, 0, 255) */
+        Pixel pLeftOn = fbAlphaOn[(RT_H / 2) * RT_W + (RT_W / 4)];
+        TEST_CHECK(pixelMatches(pLeftOn, 0, 0, 255, 255), "Scene 9 (Alpha Test ON): Left half discarded, background Blue preserved");
+
+        /* Right half (u=0.75, A=0.8 > 0.5) must pass -> Green (0, 255, 0) */
+        Pixel pRightOn = fbAlphaOn[(RT_H / 2) * RT_W + (3 * RT_W / 4)];
+        TEST_CHECK(pixelMatches(pRightOn, 0, 255, 0, 204), "Scene 9 (Alpha Test ON): Right half passed, Green rendered");
+
+        savePPM("artifacts/scene9_alpha_on.ppm", fbAlphaOn.data(), RT_W, RT_H);
+
+        /* 2. Draw with Alpha Test Disabled: Both halves should render */
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_ALPHATESTENABLE, 0);
+        svga3_vlkn_context_clear(dev, CID, SVGA3D_CLEAR_COLOR, 0xFF0000FF, 1.0f, 0, nullptr, 0);
+        svga3_vlkn_context_draw(dev, CID, SVGA3D_PRIMITIVE_TRIANGLELIST, decls, 2, &r1, 1);
+        svga3_vlkn_device_wait_idle(dev);
+
+        std::vector<Pixel> fbAlphaOff(RT_W * RT_H);
+        svga3_vlkn_surface_dma_download(dev, SID_RT, 0, nullptr, fbAlphaOff.data(), RT_W * 4);
+
+        /* Left half (Red) must now overwrite Blue */
+        Pixel pLeftOff = fbAlphaOff[(RT_H / 2) * RT_W + (RT_W / 4)];
+        TEST_CHECK(pixelMatches(pLeftOff, 255, 0, 0, 51), "Scene 9 (Alpha Test OFF): Left half drawn, Red rendered");
+
+        savePPM("artifacts/scene9_alpha_off.ppm", fbAlphaOff.data(), RT_W, RT_H);
+
+        /* Exercise every SVGA comparison mode against alpha values below and
+         * above the reference. Equality must reject both at this reference. */
+        const bool expectedLeft[8] = {false, true, false, true, false, true, false, true};
+        const bool expectedRight[8] = {false, false, false, false, true, true, true, true};
+        for (uint32_t func = SVGA3D_CMP_NEVER; func <= SVGA3D_CMP_ALWAYS; ++func) {
+            svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_ALPHATESTENABLE, 1);
+            svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_ALPHAFUNC, func);
+            TEST_CHECK(svga3_vlkn_context_clear(dev, CID, SVGA3D_CLEAR_COLOR, 0xFF0000FF,
+                1.0f, 0, nullptr, 0) == SVGA3_VLKN_SUCCESS, "Alpha comparison clear succeeds");
+            TEST_CHECK(svga3_vlkn_context_draw(dev, CID, SVGA3D_PRIMITIVE_TRIANGLELIST,
+                decls, 2, &r1, 1) == SVGA3_VLKN_SUCCESS, "Alpha comparison draw succeeds");
+            std::vector<Pixel> pixels(RT_W * RT_H);
+            TEST_CHECK(svga3_vlkn_surface_dma_download(dev, SID_RT, 0, nullptr,
+                pixels.data(), RT_W * 4) == SVGA3_VLKN_SUCCESS, "Alpha comparison readback succeeds");
+            Pixel left = pixels[(RT_H / 2) * RT_W + (RT_W / 4)];
+            Pixel right = pixels[(RT_H / 2) * RT_W + (3 * RT_W / 4)];
+            TEST_CHECK(expectedLeft[func - 1] ? pixelMatches(left,255,0,0,51) :
+                pixelMatches(left,0,0,255,255), "Alpha comparison preserves or draws left pixels");
+            TEST_CHECK(expectedRight[func - 1] ? pixelMatches(right,0,255,0,204) :
+                pixelMatches(right,0,0,255,255), "Alpha comparison preserves or draws right pixels");
+        }
+
+        /* Discarded fragments must not write depth or stencil. First mark
+         * only the opaque half in stencil, then use that mask to select pixels. */
+        const uint32_t SID_DS = 94;
+        TEST_CHECK(svga3_vlkn_surface_define(dev, SID_DS, SVGA3D_SURFACE_HINT_DEPTHSTENCIL,
+            SVGA3D_Z_D24S8, &rtSz, 1) == SVGA3_VLKN_SUCCESS, "Create alpha depth/stencil target");
+        svga3_vlkn_context_set_render_target(dev, CID, SVGA3D_RT_DEPTH, SID_DS, 0, 0);
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_ZENABLE, 1);
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_ZWRITEENABLE, 1);
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_STENCILENABLE, 1);
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_STENCILFUNC, SVGA3D_CMP_ALWAYS);
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_STENCILREF, 1);
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_STENCILPASS, SVGA3D_STENCILOP_REPLACE);
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_ALPHATESTENABLE, 1);
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_ALPHAFUNC, SVGA3D_CMP_GREATER);
+        TEST_CHECK(svga3_vlkn_context_clear(dev, CID,
+            static_cast<SVGA3dClearFlag>(SVGA3D_CLEAR_COLOR | SVGA3D_CLEAR_DEPTH | SVGA3D_CLEAR_STENCIL),
+            0xFF0000FF, 1.0f, 0, nullptr, 0) == SVGA3_VLKN_SUCCESS, "Clear alpha depth/stencil target");
+        TEST_CHECK(svga3_vlkn_context_draw(dev, CID, SVGA3D_PRIMITIVE_TRIANGLELIST,
+            decls, 2, &r1, 1) == SVGA3_VLKN_SUCCESS, "Draw alpha-filtered stencil mask");
+        svga3_vlkn_context_clear(dev, CID, SVGA3D_CLEAR_COLOR, 0xFF0000FF, 1.0f, 0, nullptr, 0);
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_ALPHATESTENABLE, 0);
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_STENCILFUNC, SVGA3D_CMP_EQUAL);
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_STENCILWRITEMASK, 0);
+        svga3_vlkn_context_draw(dev, CID, SVGA3D_PRIMITIVE_TRIANGLELIST, decls, 2, &r1, 1);
+        std::vector<Pixel> maskPixels(RT_W * RT_H);
+        svga3_vlkn_surface_dma_download(dev, SID_RT, 0, nullptr, maskPixels.data(), RT_W * 4);
+        TEST_CHECK(pixelMatches(maskPixels[(RT_H/2)*RT_W+RT_W/4],0,0,255,255),
+            "Alpha-discarded fragments leave stencil clear");
+        TEST_CHECK(pixelMatches(maskPixels[(RT_H/2)*RT_W+3*RT_W/4],0,255,0,204),
+            "Stencil reference and replacement preserve accepted fragments");
+        svga3_vlkn_context_set_render_state(dev, CID, SVGA3D_RS_STENCILENABLE, 0);
+        for (auto &vertex : quadVerts) vertex.z = 0.75f;
+        svga3_vlkn_surface_dma_upload(dev, SID_VB, 0, &bBox, quadVerts, sizeof(quadVerts));
+        svga3_vlkn_context_draw(dev, CID, SVGA3D_PRIMITIVE_TRIANGLELIST, decls, 2, &r1, 1);
+        std::vector<Pixel> depthPixels(RT_W * RT_H);
+        svga3_vlkn_surface_dma_download(dev, SID_RT, 0, nullptr, depthPixels.data(), RT_W * 4);
+        TEST_CHECK(pixelMatches(depthPixels[(RT_H/2)*RT_W+RT_W/4],255,0,0,51),
+            "Alpha-discarded fragments leave depth available for farther geometry");
+        TEST_CHECK(pixelMatches(depthPixels[(RT_H/2)*RT_W+3*RT_W/4],0,255,0,204),
+            "Accepted fragments block farther geometry with their depth");
+
+        /* Clean up Scene 9 */
+        svga3_vlkn_context_destroy(dev, CID);
+        svga3_vlkn_surface_destroy(dev, SID_DS);
+        svga3_vlkn_surface_destroy(dev, SID_RT);
+        svga3_vlkn_surface_destroy(dev, SID_TEX);
+        svga3_vlkn_surface_destroy(dev, SID_VB);
+    }
+
+    /* Keep the backend alive long enough to check messages emitted while
+     * resources and the Vulkan device are destroyed, not just while drawing. */
+    TEST_CHECK(dev->backend->validationErrors() == 0 && dev->backend->validationWarnings() == 0,
+        "Rendering completes without validation errors or warnings");
+    dev->contextMgr->clear();
+    dev->surfaceMgr->clear();
+    dev->backend->shutdown();
+    TEST_CHECK(dev->backend->validationErrors() == 0 && dev->backend->validationWarnings() == 0,
+        "Resource and device teardown remain validation clean");
     svga3_vlkn_device_destroy(dev);
     std::cout << "\n  [PASS] Clean device destruction completed" << std::endl;
 

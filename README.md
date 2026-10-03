@@ -8,7 +8,7 @@ An experimental SVGA3D-to-Vulkan rendering library and QEMU integration prototyp
 
 The preload adapter supports one allowlisted QEMU build and checks instruction bytes before patching. Use it only for the designated VM; never configure global `LD_PRELOAD`. The tested Proxmox VM runs QEMU as `qemu119` and guest graphics as `svga3d`.
 
-Set `SVGA3_VLKN_VALIDATE=1` to request Vulkan validation layers; initialization fails if they cannot be activated. Portrait mode overrides require `SVGA3_VLKN_GUEST_PROFILE=playbook-portrait`; normal guests use their requested mode. Framebuffer GPA comes from the device register. Application-context centering is disabled by default; the old heuristic is available only with `SVGA3_VLKN_LEGACY_CLIENT_PRESENT=1`. Guest-RAM discovery still uses a lab-only mapping heuristic; official QEMU integration remains follow-up work.
+Set `SVGA3_VLKN_VALIDATE=1` to request Vulkan validation layers; initialization fails if they cannot be activated. Portrait mode overrides require `SVGA3_VLKN_GUEST_PROFILE=playbook-portrait`; normal guests use their requested mode. Framebuffer GPA comes from the device register. Screen-object scanout follows the guest backing-store offset, dimensions, and pitch. Application-context centering and implicit surface mirroring have been removed. Guest-RAM discovery still uses a lab-only mapping heuristic; official QEMU integration remains follow-up work.
 
 ## What is included
 

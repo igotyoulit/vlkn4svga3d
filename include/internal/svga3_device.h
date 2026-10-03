@@ -37,7 +37,7 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
                                   size_t *bytesRead);
 
 /* Present rendered client window surfaces to framebuffer */
-void svga3_vlkn_present_client_surfaces(Svga3VlknDevice *dev, const char *reason);
+Svga3VlknStatus svga3_vlkn_present_client_surfaces(Svga3VlknDevice *dev, const char *reason);
 
 } // namespace svga3_vlkn
 

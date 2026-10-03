@@ -813,6 +813,15 @@ Svga3VlknStatus svga3_vlkn_device_set_framebuffer(
     return dev->guestMem->setFramebuffer(fbHva, fbGpa, fbSize, width, height, pitch, bpp);
 }
 
+Svga3VlknStatus svga3_vlkn_device_set_scanout_offset(
+    Svga3VlknDevice *dev,
+    uint32_t scanoutOffset)
+{
+    if (!dev || !dev->guestMem) return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    std::lock_guard<std::mutex> lock(dev->mutex);
+    return dev->guestMem->setScanoutOffset(scanoutOffset);
+}
+
 Svga3VlknStatus svga3_vlkn_gmr_define(
     Svga3VlknDevice *dev,
     uint32_t gmrId,

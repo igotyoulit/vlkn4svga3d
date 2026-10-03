@@ -49,6 +49,14 @@ struct FramebufferInfo {
     uint32_t height = 0;
     uint32_t pitch = 0;
     uint32_t bpp = 4;
+    uint32_t scanoutOffset = 0;
+
+    uint8_t* scanoutHva() const {
+        return (hva && scanoutOffset < size) ? (hva + scanoutOffset) : hva;
+    }
+    size_t scanoutSize() const {
+        return (size > scanoutOffset) ? (size - scanoutOffset) : size;
+    }
 };
 
 class GuestMemoryManager {
@@ -77,7 +85,9 @@ public:
                                   uint32_t width,
                                   uint32_t height,
                                   uint32_t pitch,
-                                  uint32_t bpp);
+                                  uint32_t bpp,
+                                  uint32_t scanoutOffset = 0);
+    Svga3VlknStatus setScanoutOffset(uint32_t offset);
     const FramebufferInfo& getFramebuffer() const { return m_fb; }
 
     /* GMR Management */

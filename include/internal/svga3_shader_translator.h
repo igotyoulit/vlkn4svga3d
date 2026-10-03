@@ -25,7 +25,8 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType type,
                                             std::vector<uint32_t> &outSpirv,
                                             std::string &outError,
                                             uint32_t *outInputMask = nullptr,
-                                            uint32_t depthSamplerMask = 0);
+                                            uint32_t depthSamplerMask = 0,
+                                            bool *outHasBytecodeKill = nullptr);
 
 } // namespace svga3_vlkn
 

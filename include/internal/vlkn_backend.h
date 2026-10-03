@@ -48,6 +48,15 @@ public:
     /* Command buffer management */
     VkCommandBuffer getActiveCommandBuffer();
     Svga3VlknStatus flushCommandBuffer();
+    bool cmdBufferRecording() const { return m_cmdBufferRecording; }
+    uint64_t recordingSerial() const { return m_recordingSerial; }
+    void retireBuffer(VkBuffer buffer, VkDeviceMemory memory, void *mapped, uint64_t serial, size_t budgetBytes);
+    void cleanupRetiredBuffers(bool forceAll = false);
+
+    /* Render pass execution with state tracking and safety guard */
+    bool isRenderPassActive() const { return m_renderPassActive; }
+    void cmdBeginRenderPass(VkCommandBuffer cb, const VkRenderPassBeginInfo *pBegin, VkSubpassContents contents);
+    void cmdEndRenderPass(VkCommandBuffer cb);
 
     /* Accessors */
     VlknDispatchTable& dispatch() { return m_dispatch; }
@@ -118,7 +127,18 @@ private:
     VkCommandBuffer m_cmdBuffer;
     bool m_cmdBufferRecording;
     bool m_cmdBufferPending;
+    bool m_renderPassActive;
     uint64_t m_completedSubmissionSerial;
+    uint64_t m_recordingSerial;
+
+    struct RetiredBuffer {
+        VkBuffer buffer;
+        VkDeviceMemory memory;
+        void *mapped;
+        uint64_t serial;
+        size_t budgetBytes;
+    };
+    std::vector<RetiredBuffer> m_retiredBuffers;
 
     VkDescriptorPool m_descriptorPool;
 

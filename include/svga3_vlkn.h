@@ -366,6 +366,11 @@ Svga3VlknStatus svga3_vlkn_device_set_framebuffer(
     uint32_t bpp
 );
 
+Svga3VlknStatus svga3_vlkn_device_set_scanout_offset(
+    Svga3VlknDevice *dev,
+    uint32_t scanoutOffset
+);
+
 Svga3VlknStatus svga3_vlkn_gmr_define(
     Svga3VlknDevice *dev,
     uint32_t gmrId,

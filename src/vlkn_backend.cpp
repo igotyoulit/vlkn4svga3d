@@ -38,7 +38,9 @@ VlknBackend::VlknBackend()
     , m_cmdBuffer(VK_NULL_HANDLE)
     , m_cmdBufferRecording(false)
     , m_cmdBufferPending(false)
+    , m_renderPassActive(false)
     , m_completedSubmissionSerial(0)
+    , m_recordingSerial(0)
     , m_descriptorPool(VK_NULL_HANDLE)
     , m_debugMessenger(VK_NULL_HANDLE)
     , m_validationErrors(0)
@@ -101,6 +103,7 @@ Svga3VlknStatus VlknBackend::init(const Svga3VlknConfig *config) {
 
 void VlknBackend::shutdown() {
     waitIdle();
+    cleanupRetiredBuffers(true);
 
     for (auto &rp : m_renderPasses) {
         if (rp.renderPass) {
@@ -170,8 +173,9 @@ Svga3VlknStatus VlknBackend::waitIdle() {
             return SVGA3_VLKN_ERROR_DEVICE_LOST;
         }
         if (m_cmdBufferPending) {
-            ++m_completedSubmissionSerial;
+            m_completedSubmissionSerial = m_recordingSerial;
             m_cmdBufferPending = false;
+            cleanupRetiredBuffers(false);
             if (m_cmdBuffer && m_dispatch.vkResetCommandBuffer) {
                 res = m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
                 if (res != VK_SUCCESS) {
@@ -405,13 +409,13 @@ Svga3VlknStatus VlknBackend::initDevice(const Svga3VlknConfig *config) {
 
     /* Create Descriptor Pool for shader uniform buffers and texture samplers */
     VkDescriptorPoolSize poolSizes[] = {
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1024 },
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2048 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024 * 8 }
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4096 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 8192 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096 * 8 }
     };
     VkDescriptorPoolCreateInfo descPoolInfo = {};
     descPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    descPoolInfo.maxSets = 1024;
+    descPoolInfo.maxSets = 4096;
     descPoolInfo.poolSizeCount = 3;
     descPoolInfo.pPoolSizes = poolSizes;
     descPoolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -664,8 +668,60 @@ VkCommandBuffer VlknBackend::getActiveCommandBuffer() {
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         m_dispatch.vkBeginCommandBuffer(m_cmdBuffer, &beginInfo);
         m_cmdBufferRecording = true;
+        ++m_recordingSerial;
     }
     return m_cmdBuffer;
+}
+
+void VlknBackend::retireBuffer(VkBuffer buffer, VkDeviceMemory memory, void *mapped, uint64_t serial, size_t budgetBytes) {
+    if (buffer == VK_NULL_HANDLE && memory == VK_NULL_HANDLE) return;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_retiredBuffers.push_back({buffer, memory, mapped, serial, budgetBytes});
+}
+
+void VlknBackend::cleanupRetiredBuffers(bool forceAll) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto it = m_retiredBuffers.begin(); it != m_retiredBuffers.end(); ) {
+        if (forceAll || it->serial <= m_completedSubmissionSerial) {
+            if (it->mapped && it->memory && m_dispatch.vkUnmapMemory) {
+                m_dispatch.vkUnmapMemory(m_device, it->memory);
+            }
+            if (it->buffer && m_dispatch.vkDestroyBuffer) {
+                m_dispatch.vkDestroyBuffer(m_device, it->buffer, nullptr);
+            }
+            if (it->memory && m_dispatch.vkFreeMemory) {
+                m_dispatch.vkFreeMemory(m_device, it->memory, nullptr);
+            }
+            m_budgets.releaseSurfaceBytes(it->budgetBytes);
+            it = m_retiredBuffers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void VlknBackend::cmdBeginRenderPass(VkCommandBuffer cb, const VkRenderPassBeginInfo *pBegin, VkSubpassContents contents) {
+    if (m_renderPassActive) {
+        log_msg("[libqemu_svga3d] WARNING: cmdBeginRenderPass called while render pass active; ending previous\n");
+        m_dispatch.vkCmdEndRenderPass(cb);
+        m_renderPassActive = false;
+    }
+    m_dispatch.vkCmdBeginRenderPass(cb, pBegin, contents);
+    m_renderPassActive = true;
+}
+
+void VlknBackend::cmdEndRenderPass(VkCommandBuffer cb) {
+    if (!m_renderPassActive) {
+        log_msg("[libqemu_svga3d] WARNING: cmdEndRenderPass called while NO render pass active; skipping to prevent crash\n");
+        return;
+    }
+    if (!m_cmdBufferRecording) {
+        log_msg("[libqemu_svga3d] WARNING: cmdEndRenderPass called while command buffer not recording; skipping\n");
+        m_renderPassActive = false;
+        return;
+    }
+    m_dispatch.vkCmdEndRenderPass(cb);
+    m_renderPassActive = false;
 }
 
 Svga3VlknStatus VlknBackend::flushCommandBuffer() {
@@ -685,10 +741,16 @@ Svga3VlknStatus VlknBackend::flushCommandBuffer() {
         if (!m_cmdBufferRecording) return SVGA3_VLKN_SUCCESS;
     }
 
+    if (m_renderPassActive) {
+        m_dispatch.vkCmdEndRenderPass(m_cmdBuffer);
+        m_renderPassActive = false;
+    }
+
     VkResult res = m_dispatch.vkEndCommandBuffer(m_cmdBuffer);
     if (res != VK_SUCCESS) {
         log_msg("[libqemu_svga3d] vkEndCommandBuffer error: %d\n", res);
         m_cmdBufferRecording = false;
+        m_renderPassActive = false;
         VkResult resetRes = m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
         if (resetRes != VK_SUCCESS)
             log_msg("[libqemu_svga3d] vkResetCommandBuffer error after end failure: %d\n", resetRes);
@@ -717,8 +779,9 @@ Svga3VlknStatus VlknBackend::flushCommandBuffer() {
          * establishes completion; resetting it here would race the GPU. */
         return SVGA3_VLKN_ERROR_DEVICE_LOST;
     }
-    ++m_completedSubmissionSerial;
+    m_completedSubmissionSerial = m_recordingSerial;
     m_cmdBufferPending = false;
+    cleanupRetiredBuffers(false);
     res = m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
     if (res != VK_SUCCESS) {
         log_msg("[libqemu_svga3d] vkResetCommandBuffer error: %d\n", res);

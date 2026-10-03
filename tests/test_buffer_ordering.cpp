@@ -224,6 +224,23 @@ int main() {
   std::vector<uint32_t> solid(64, 0xff123456), small(16, 0xffabcdef), read(64);
   correct &= svga3_vlkn_surface_dma_upload(d, 6, 0, nullptr, solid.data(),
                                            32) == SVGA3_VLKN_SUCCESS;
+  // Widening the sampled mip view must preserve the view referenced by an
+  // earlier queued draw and its cached descriptor set.
+  correct &= svga3_vlkn_context_set_texture(d, 1, 0, 6) == SVGA3_VLKN_SUCCESS;
+  correct &= svga3_vlkn_context_set_texture_stage_state(
+                 d, 1, 0, SVGA3D_TS_MIPFILTER, SVGA3D_TEX_FILTER_NONE) == SVGA3_VLKN_SUCCESS;
+  correct &= svga3_vlkn_context_draw(d, 1, SVGA3D_PRIMITIVE_TRIANGLELIST,
+                                     &decl, 1, &r, 1) == SVGA3_VLKN_SUCCESS;
+  correct &= svga3_vlkn_context_set_texture_stage_state(
+                 d, 1, 0, SVGA3D_TS_MIPFILTER, SVGA3D_TEX_FILTER_NEAREST) == SVGA3_VLKN_SUCCESS;
+  correct &= svga3_vlkn_context_draw(d, 1, SVGA3D_PRIMITIVE_TRIANGLELIST,
+                                     &decl, 1, &r, 1) == SVGA3_VLKN_SUCCESS;
+  correct &= svga3_vlkn_device_wait_idle(d) == SVGA3_VLKN_SUCCESS;
+  correct &= svga3_vlkn_surface_dma_download(d, 1, 0, nullptr, pixels.data(),
+                                             64 * 4) == SVGA3_VLKN_SUCCESS;
+  correct &= pixels[48 * 64 + 40] == solid[0];
+  correct &= d->backend->validationErrors() == 0 && d->backend->validationWarnings() == 0;
+  printf("sampled mip view survives queued draws: %s\n", correct ? "PASS" : "FAIL");
   correct &= svga3_vlkn_surface_dma_upload(d, 6, 1, nullptr, small.data(),
                                            16) == SVGA3_VLKN_SUCCESS;
   correct &= svga3_vlkn_surface_dma_download(d, 6, 0, nullptr, read.data(),

@@ -43,6 +43,9 @@
 #define ADDR_PCIVMSVGA_REALIZE_SIZE1 0x470716
 #define ADDR_PCIVMSVGA_REALIZE_SIZE2 0x470735
 #define ADDR_VMSVGA_UPDATE_RECT_FLUSH 0x471100
+#define ADDR_CREATE_DISPLAY_SURFACE   0x3ae8d0
+#define ADDR_REPLACE_DISPLAY_SURFACE  0x3af4e0
+#define ADDR_DPY_GFX_UPDATE           0x3b0650
 #define ADDR_VMSVGA_FIFO_RUN          0x4712f0
 #define ADDR_VMSVGA_IO_OPS            0x1965840
 #define ADDR_VMSVGA_IO_READ           0x470860
@@ -127,6 +130,15 @@ struct vmsvga_rect_s {
 
 /* Function Pointers for QEMU Originals */
 static void (*orig_update_rect_flush)(void *s) = NULL;
+static void *(*orig_create_display_surface)(int, int, uint32_t, int, uint8_t *) = NULL;
+static void (*orig_replace_display_surface)(void *, void *) = NULL;
+static void (*orig_dpy_gfx_update)(void *, int, int, int, int) = NULL;
+static bool g_screen_scanout_active = false;
+static bool g_screen_deactivated = false;
+static uint32_t g_screen_scanout_offset = 0;
+static uint32_t g_screen_scanout_width = 0;
+static uint32_t g_screen_scanout_height = 0;
+static uint32_t g_screen_scanout_pitch = 0;
 static uint64_t (*orig_io_read)(void *opaque, uint64_t addr, unsigned size) = NULL;
 static void (*orig_io_write)(void *opaque, uint64_t addr, uint64_t data, unsigned size) = NULL;
 static void (*orig_input_update_buttons)(void *con, uint32_t *map, uint32_t old, uint32_t newm) = NULL;
@@ -203,11 +215,94 @@ static void set_qemu_reg_value(void *s, int index, uint32_t value) {
     *reg = saved;
 }
 
+/* Screen-object backing storage is explicitly reserved by the guest for
+ * scanout. Bind it through QEMU's display API, never by editing Pixman fields
+ * or mirroring into VRAM zero, which can contain unrelated guest buffers. */
+static bool bind_screen_scanout(void *s, uint32_t width, uint32_t height,
+                                uint32_t pitch, uint32_t gmrId, uint32_t offset) {
+    const uint32_t vramSize = reg_value(s, SVGA_REG_VRAM_SIZE);
+    uint8_t *vram = *(uint8_t **)((char *)s + 8);
+    void *con = *(void **)((char *)s + 0xa40);
+    if (!vram || !con || !orig_create_display_surface || !orig_replace_display_surface ||
+        gmrId != SVGA_GMR_FRAMEBUFFER || (offset & 4095) || !width || !height ||
+        width > INT32_MAX || height > INT32_MAX || pitch > INT32_MAX || (pitch & 3) ||
+        (uint64_t)width * 4 > pitch || offset >= vramSize ||
+        (uint64_t)pitch * height > vramSize - offset) return false;
+    if (g_vlknDev) {
+        if (svga3_vlkn_device_set_framebuffer(g_vlknDev, vram,
+                reg_value(s, SVGA_REG_FB_START), vramSize, width, height, pitch, 4) != SVGA3_VLKN_SUCCESS ||
+            svga3_vlkn_device_set_scanout_offset(g_vlknDev, offset) != SVGA3_VLKN_SUCCESS) return false;
+    }
+    constexpr uint32_t PIXMAN_X8R8G8B8 = 0x20020888;
+    void *surface = orig_create_display_surface(width, height, PIXMAN_X8R8G8B8, pitch, vram + offset);
+    if (!surface) return false;
+    orig_replace_display_surface(con, surface);
+    g_screen_scanout_offset = offset;
+    g_screen_scanout_width = width;
+    g_screen_scanout_height = height;
+    g_screen_scanout_pitch = pitch;
+    g_screen_scanout_active = true;
+    g_screen_deactivated = false;
+    log_msg("[libqemu_svga3d] Screen scanout: %ux%u pitch=%u backingOffset=0x%x\n",
+            width, height, pitch, offset);
+    return true;
+}
+
+static void unbind_screen_scanout(void *s, bool blank) {
+    if (!g_screen_scanout_active && !g_screen_deactivated) return;
+    const uint32_t width = reg_value(s, SVGA_REG_WIDTH);
+    const uint32_t height = reg_value(s, SVGA_REG_HEIGHT);
+    const uint32_t pitch = reg_value(s, SVGA_REG_BYTES_PER_LINE);
+    const uint32_t size = reg_value(s, SVGA_REG_VRAM_SIZE);
+    uint8_t *vram = *(uint8_t **)((char *)s + 8);
+    void *con = *(void **)((char *)s + 0xa40);
+    g_screen_scanout_active = false;
+    g_screen_deactivated = blank;
+    g_screen_scanout_offset = 0;
+    g_screen_scanout_width = 0;
+    g_screen_scanout_height = 0;
+    g_screen_scanout_pitch = 0;
+    if (!vram || !con || !width || !height || width > INT32_MAX || height > INT32_MAX ||
+        pitch > INT32_MAX || (uint64_t)width * 4 > pitch || (uint64_t)pitch * height > size ||
+        !orig_create_display_surface || !orig_replace_display_surface) return;
+    /* NULL data asks QEMU to allocate its own blank display buffer. Legacy
+     * modes return to their ordinary framebuffer through the same API. */
+    void *surface = orig_create_display_surface(width, height, 0x20020888, pitch, blank ? nullptr : vram);
+    if (surface) orig_replace_display_surface(con, surface);
+    *reinterpret_cast<int *>((char *)s + OFFSET_REDRAW_FIFO_LAST) = 0;
+    if (g_vlknDev) {
+        svga3_vlkn_device_set_framebuffer(g_vlknDev, vram, reg_value(s, SVGA_REG_FB_START),
+                                         size, width, height, pitch, 4);
+    }
+}
+
+extern "C" void my_vmsvga_update_rect_flush(void *s) {
+    if (!g_screen_scanout_active && !g_screen_deactivated) {
+        if (orig_update_rect_flush) orig_update_rect_flush(s);
+        return;
+    }
+    int *last = (int *)((char *)s + OFFSET_REDRAW_FIFO_LAST);
+    auto *rects = reinterpret_cast<vmsvga_rect_s *>((char *)s + OFFSET_REDRAW_FIFO);
+    void *con = *(void **)((char *)s + 0xa40);
+    if (*last < 0 || *last > 512 || !con || !orig_dpy_gfx_update) return;
+    const uint32_t width = g_screen_scanout_active ? g_screen_scanout_width : reg_value(s, SVGA_REG_WIDTH);
+    const uint32_t height = g_screen_scanout_active ? g_screen_scanout_height : reg_value(s, SVGA_REG_HEIGHT);
+    for (int i = 0; i < *last; ++i) {
+        const auto &r = rects[i];
+        if (r.x < 0 || r.y < 0 || r.w <= 0 || r.h <= 0 ||
+            (uint64_t)r.x + r.w > width || (uint64_t)r.y + r.h > height) continue;
+        /* Pixels already occupy the screen's backing store. QEMU's legacy
+         * flush would incorrectly copy unrelated VRAM-zero bytes over them. */
+        orig_dpy_gfx_update(con, r.x, r.y, r.w, r.h);
+    }
+    *last = 0;
+}
+
 static void redraw(void *s, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     int *last = (int *)((char *)s + OFFSET_REDRAW_FIFO_LAST);
     struct vmsvga_rect_s *rects = (struct vmsvga_rect_s *)((char *)s + OFFSET_REDRAW_FIFO);
     if (*last < 0 || *last > 512) return;
-    if (*last == 512 && orig_update_rect_flush) orig_update_rect_flush(s);
+    if (*last == 512) my_vmsvga_update_rect_flush(s);
     if (*last < 512) rects[(*last)++] = (struct vmsvga_rect_s){(int)x, (int)y, (int)w, (int)h};
 }
 
@@ -244,7 +339,7 @@ static bool blit_gmrfb_to_legacy(void *s,
                                  int32_t left, int32_t top,
                                  int32_t right, int32_t bottom,
                                  uint32_t screen_id) {
-    if (!s || (screen_id != 0 && screen_id != SVGA_ID_INVALID) || !g_display_gmrfb_defined ||
+    if (!s || g_screen_deactivated || (screen_id != 0 && screen_id != SVGA_ID_INVALID) || !g_display_gmrfb_defined ||
         g_display_gmrfb.ptr.gmrId != SVGA_GMR_FRAMEBUFFER ||
         g_display_gmrfb.format.s.bitsPerPixel != 32 ||
         g_display_gmrfb.format.s.colorDepth != 24 ||
@@ -252,9 +347,9 @@ static bool blit_gmrfb_to_legacy(void *s,
         return false;
     }
 
-    uint32_t width = reg_value(s, SVGA_REG_WIDTH);
-    uint32_t height = reg_value(s, SVGA_REG_HEIGHT);
-    uint32_t dst_pitch = reg_value(s, SVGA_REG_BYTES_PER_LINE);
+    uint32_t width = g_screen_scanout_active ? g_screen_scanout_width : reg_value(s, SVGA_REG_WIDTH);
+    uint32_t height = g_screen_scanout_active ? g_screen_scanout_height : reg_value(s, SVGA_REG_HEIGHT);
+    uint32_t dst_pitch = g_screen_scanout_active ? g_screen_scanout_pitch : reg_value(s, SVGA_REG_BYTES_PER_LINE);
     uint32_t vram_size = reg_value(s, SVGA_REG_VRAM_SIZE);
     uint8_t *vram = *(uint8_t **)((char *)s + 8);
     const uint32_t src_pitch = g_display_gmrfb.bytesPerLine;
@@ -278,9 +373,23 @@ static bool blit_gmrfb_to_legacy(void *s,
     uint64_t row_bytes = (uint64_t)(x1 - x0) * 4;
     if (sx < 0 || sy < 0 || (uint64_t)sx * 4 + row_bytes > src_pitch) return false;
 
+    /* Validate the complete transfer before writing even its first row. */
+    const uint64_t rows = y1 - y0;
+    if (src_base >= vram_size || (uint64_t)sy > (vram_size - src_base) / src_pitch) return false;
+    const uint64_t firstSrc = src_base + (uint64_t)sy * src_pitch + (uint64_t)sx * 4;
+    const uint64_t firstDst = (g_screen_scanout_active ? g_screen_scanout_offset : 0) +
+                              (uint64_t)y0 * dst_pitch + (uint64_t)x0 * 4;
+    if (firstSrc >= vram_size || firstDst >= vram_size ||
+        rows - 1 > (vram_size - firstSrc) / src_pitch ||
+        rows - 1 > (vram_size - firstDst) / dst_pitch) return false;
+    const uint64_t lastSrc = firstSrc + (rows - 1) * src_pitch;
+    const uint64_t lastDst = firstDst + (rows - 1) * dst_pitch;
+    if (row_bytes > vram_size - lastSrc || row_bytes > vram_size - lastDst) return false;
+
     for (int64_t row = 0; row < y1 - y0; ++row) {
         uint64_t src_offset = src_base + (uint64_t)(sy + row) * src_pitch + (uint64_t)sx * 4;
-        uint64_t dst_offset = (uint64_t)(y0 + row) * dst_pitch + (uint64_t)x0 * 4;
+        uint64_t dst_offset = (g_screen_scanout_active ? g_screen_scanout_offset : 0) +
+                              (uint64_t)(y0 + row) * dst_pitch + (uint64_t)x0 * 4;
         if (src_offset > vram_size || row_bytes > vram_size - src_offset ||
             dst_offset > vram_size || row_bytes > vram_size - dst_offset) {
             return false;
@@ -446,7 +555,8 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
     uint32_t cur_p = reg_value(s, SVGA_REG_BYTES_PER_LINE);
     if (!cur_p) cur_p = cur_w * 4;
     static uint32_t s_last_w = 0, s_last_h = 0, s_last_p = 0;
-    if (g_vlknDev && (cur_w != s_last_w || cur_h != s_last_h || cur_p != s_last_p)) {
+    if (g_vlknDev && !g_screen_scanout_active &&
+        (cur_w != s_last_w || cur_h != s_last_h || cur_p != s_last_p)) {
         s_last_w = cur_w; s_last_h = cur_h; s_last_p = cur_p;
         uint32_t bpp = reg_value(s, SVGA_REG_BITS_PER_PIXEL);
         if (!bpp) bpp = 32;
@@ -454,6 +564,8 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
         if (!vram_sz) vram_sz = 128 * 1024 * 1024;
         uint8_t *vram = *(uint8_t **)((char *)s + 8);
         svga3_vlkn_device_set_framebuffer(g_vlknDev, vram, reg_value(s, SVGA_REG_FB_START), vram_sz, cur_w, cur_h, cur_p, bpp / 8);
+        if (g_screen_scanout_active)
+            svga3_vlkn_device_set_scanout_offset(g_vlknDev, g_screen_scanout_offset);
         log_msg("[libqemu_svga3d] Display mode synchronized: w=%u h=%u pitch=%u bpp=%u\n", cur_w, cur_h, cur_p, bpp);
     }
 
@@ -526,61 +638,10 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
 
         if (cmd == SVGA_CMD_UPDATE || cmd == SVGA_CMD_UPDATE_VERBOSE) {
             redraw(s, P(1), P(2), P(3), P(4));
-            if (g_vlknDev && g_vlknDev->surfaceMgr && g_vlknDev->guestMem) {
-                /* Serialize with the FIFO thread: getSurface returns an
-                 * unlocked raw pointer, so the surface must not be
-                 * destroyed concurrently. */
-                std::lock_guard<std::mutex> devLock(g_vlknDev->mutex);
-                svga3_vlkn::VlknSurface *surf1 = g_vlknDev->surfaceMgr->getSurface(1);
-                if (surf1) {
-                    const auto &fb = g_vlknDev->guestMem->getFramebuffer();
-                    if (fb.hva && fb.width && fb.height) {
-                        uint32_t ux = P(1), uy = P(2), uw = P(3), uh = P(4);
-                        if (ux < fb.width && uy < fb.height && uw > 0 && uh > 0) {
-                            SVGA3dBox box = { ux, uy, 0, std::min(uw, fb.width - ux), std::min(uh, fb.height - uy), 1 };
-                            const uint8_t *src = fb.hva + uy * fb.pitch + ux * (fb.bpp ? fb.bpp : 4);
-                            if (g_vlknDev->contextMgr) g_vlknDev->contextMgr->endAllRenderPasses();
-                            surf1->dmaUpload(0, &box, src, fb.pitch);
-                        }
-                    }
-                }
-            }
         } else if (cmd == SVGA_CMD_RECT_FILL) {
             draw_rect(s, false, P(1), 0, 0, P(2), P(3), P(4), P(5));
-            if (g_vlknDev && g_vlknDev->surfaceMgr && g_vlknDev->guestMem) {
-                std::lock_guard<std::mutex> devLock(g_vlknDev->mutex);
-                svga3_vlkn::VlknSurface *surf1 = g_vlknDev->surfaceMgr->getSurface(1);
-                if (surf1) {
-                    const auto &fb = g_vlknDev->guestMem->getFramebuffer();
-                    if (fb.hva && fb.width && fb.height) {
-                        uint32_t fx = P(2), fy = P(3), fw = P(4), fh = P(5);
-                        if (fx < fb.width && fy < fb.height && fw > 0 && fh > 0) {
-                            SVGA3dBox box = { fx, fy, 0, std::min(fw, fb.width - fx), std::min(fh, fb.height - fy), 1 };
-                            const uint8_t *src = fb.hva + fy * fb.pitch + fx * (fb.bpp ? fb.bpp : 4);
-                            if (g_vlknDev->contextMgr) g_vlknDev->contextMgr->endAllRenderPasses();
-                            surf1->dmaUpload(0, &box, src, fb.pitch);
-                        }
-                    }
-                }
-            }
         } else if (cmd == SVGA_CMD_RECT_COPY) {
             draw_rect(s, true, 0, P(1), P(2), P(3), P(4), P(5), P(6));
-            if (g_vlknDev && g_vlknDev->surfaceMgr && g_vlknDev->guestMem) {
-                std::lock_guard<std::mutex> devLock(g_vlknDev->mutex);
-                svga3_vlkn::VlknSurface *surf1 = g_vlknDev->surfaceMgr->getSurface(1);
-                if (surf1) {
-                    const auto &fb = g_vlknDev->guestMem->getFramebuffer();
-                    if (fb.hva && fb.width && fb.height) {
-                        uint32_t cx = P(3), cy = P(4), cw = P(5), ch = P(6);
-                        if (cx < fb.width && cy < fb.height && cw > 0 && ch > 0) {
-                            SVGA3dBox box = { cx, cy, 0, std::min(cw, fb.width - cx), std::min(ch, fb.height - cy), 1 };
-                            const uint8_t *src = fb.hva + cy * fb.pitch + cx * (fb.bpp ? fb.bpp : 4);
-                            if (g_vlknDev->contextMgr) g_vlknDev->contextMgr->endAllRenderPasses();
-                            surf1->dmaUpload(0, &box, src, fb.pitch);
-                        }
-                    }
-                }
-            }
         } else if (cmd == SVGA_CMD_FENCE) {
             static uint32_t fence_count = 0;
             fence_count++;
@@ -588,16 +649,18 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
                 log_msg("[libqemu_svga3d] SVGA_CMD_FENCE #%u: fence_id=%u\n", fence_count, P(1));
             }
             if (g_vlknDev) {
-                /* Mesa waits on this fence after a window swap. Present the
-                 * surfaces drawn since the previous fence before signalling. */
-                svga3_vlkn::svga3_vlkn_present_client_surfaces(g_vlknDev, "fence");
+                /* Complete all preceding GPU work before acknowledging the
+                 * guest fence, including commands for offscreen targets. */
+                if (svga3_vlkn::svga3_vlkn_present_client_surfaces(g_vlknDev, "fence") != SVGA3_VLKN_SUCCESS)
+                    goto done;
             }
             if (min >= 28) fifo[SVGA_FIFO_FENCE] = P(1);
         } else if (cmd == SVGA_CMD_ESCAPE) {
             /* Video overlay no-ops */
         } else if (cmd == SVGA_CMD_DEFINE_SCREEN) {
             uint32_t structSize = P(1);
-            if (structSize >= sizeof(uint32_t) * 5) {
+            if (structSize < sizeof(SVGAScreenObject)) goto unsupported;
+            if (structSize >= sizeof(SVGAScreenObject)) {
                 uint32_t screenId = P(2);
                 uint32_t flags = P(3);
                 uint32_t sw = P(4);
@@ -606,8 +669,11 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
                 int32_t sy = (int32_t)P(7);
                 log_msg("[libqemu_svga3d] DEFINE_SCREEN: id=%u flags=0x%x size=%ux%u pos=(%d,%d)\n",
                         screenId, flags, sw, sh, sx, sy);
+                if (screenId == 0 && (flags & SVGA_SCREEN_DEACTIVATE)) unbind_screen_scanout(s, true);
                 if (sw > 0 && sh > 0 && !(flags & SVGA_SCREEN_DEACTIVATE)) {
-                    uint32_t pitch = (structSize >= sizeof(uint32_t) * 9) ? P(10) : 0;
+                    uint32_t pitch = P(10);
+                    if (screenId == 0 && !bind_screen_scanout(s, sw, sh, pitch, P(8), P(9)))
+                        goto unsupported;
                     if (screenId == 0) {
                         /*
                          * This shim consumes screen-object commands instead
@@ -628,10 +694,12 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
                         uint32_t vram_sz = reg_value(s, SVGA_REG_VRAM_SIZE);
                         if (!vram_sz) vram_sz = 128 * 1024 * 1024;
                         svga3_vlkn_device_set_framebuffer(g_vlknDev, vram, reg_value(s, SVGA_REG_FB_START), vram_sz, sw, sh, pitch, 4);
+                        svga3_vlkn_device_set_scanout_offset(g_vlknDev, g_screen_scanout_offset);
                     }
                 }
             }
         } else if (cmd == SVGA_CMD_DESTROY_SCREEN) {
+            if (P(1) == 0) unbind_screen_scanout(s, true);
             log_msg("[libqemu_svga3d] DESTROY_SCREEN: id=%u\n", P(1));
         } else if (cmd == SVGA_CMD_DEFINE_GMRFB) {
             g_display_gmrfb.ptr.gmrId = P(1);
@@ -660,8 +728,8 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
             }
             if (copied &&
                 right > left && bottom > top) {
-                uint32_t width = reg_value(s, SVGA_REG_WIDTH);
-                uint32_t height = reg_value(s, SVGA_REG_HEIGHT);
+                uint32_t width = g_screen_scanout_active ? g_screen_scanout_width : reg_value(s, SVGA_REG_WIDTH);
+                uint32_t height = g_screen_scanout_active ? g_screen_scanout_height : reg_value(s, SVGA_REG_HEIGHT);
                 int32_t x0 = std::max<int32_t>(left, 0);
                 int32_t y0 = std::max<int32_t>(top, 0);
                 int32_t x1 = std::min<int32_t>(right, width);
@@ -676,7 +744,7 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
         } else if ((cmd >= SVGA_3D_CMD_BASE && cmd < SVGA_3D_CMD_FUTURE_MAX) ||
                    cmd == SVGA_CMD_DEFINE_GMR2 || cmd == SVGA_CMD_REMAP_GMR2) {
             ensure_vlkn_device(s);
-            if (g_vlknDev) {
+            if (g_vlknDev && !(g_screen_deactivated && cmd == SVGA_3D_CMD_BLIT_SURFACE_TO_SCREEN)) {
                 size_t packetBytes = words * 4;
                 size_t bytesConsumed = 0;
                 static uint32_t total_3d = 0;
@@ -693,7 +761,8 @@ extern "C" void my_vmsvga_fifo_run(void *s) {
                  * path parsed live guest memory. Cap the snapshot: the
                  * packet length was validated against available words. */
                 size_t wordsToCopy = packetBytes / 4;
-                std::vector<uint32_t> packetWords(wordsToCopy);
+                thread_local std::vector<uint32_t> packetWords;
+                packetWords.resize(wordsToCopy);
                 if (stop + packetBytes <= max) {
                     memcpy(packetWords.data(), (const uint8_t *)fifo + stop, wordsToCopy * 4);
                 } else {
@@ -726,7 +795,7 @@ unsupported:
 
 done:
     *(int *)((char *)s + OFFSET_SYNCING) = 0;
-    if (orig_update_rect_flush) orig_update_rect_flush(s);
+    my_vmsvga_update_rect_flush(s);
 }
 
 extern "C" uint64_t my_vmsvga_io_read(void *opaque, uint64_t addr, unsigned size) {
@@ -831,6 +900,7 @@ extern "C" void my_vmsvga_io_write(void *opaque, uint64_t addr, uint64_t data, u
             return;
         case SVGA_REG_ENABLE:
         case SVGA_REG_BYTES_PER_LINE:
+        case SVGA_REG_BITS_PER_PIXEL:
         case SVGA_REG_WIDTH:
         case SVGA_REG_HEIGHT: {
             if (portrait_profile_enabled() && index == SVGA_REG_WIDTH && data == 768) {
@@ -841,6 +911,7 @@ extern "C" void my_vmsvga_io_write(void *opaque, uint64_t addr, uint64_t data, u
                 data = SCREEN_H;
             }
             orig_io_write(opaque, addr, data, size);
+            unbind_screen_scanout(s, false);
             if (g_vlknDev && *(int *)((char *)s + OFFSET_ENABLE)) {
                 uint32_t w = reg_value(s, SVGA_REG_WIDTH);
                 uint32_t h = reg_value(s, SVGA_REG_HEIGHT);
@@ -855,6 +926,8 @@ extern "C" void my_vmsvga_io_write(void *opaque, uint64_t addr, uint64_t data, u
                     if (!bpp) bpp = 32;
                     if (!vram_sz) vram_sz = 128 * 1024 * 1024;
                     svga3_vlkn_device_set_framebuffer(g_vlknDev, vram, reg_value(s, SVGA_REG_FB_START), vram_sz, w, h, p, bpp / 8);
+                    if (g_screen_scanout_active)
+                        svga3_vlkn_device_set_scanout_offset(g_vlknDev, g_screen_scanout_offset);
                 }
             }
             return;
@@ -1087,6 +1160,9 @@ static void svga3d_init(void) {
         _exit(78);
     }
 
+    const unsigned char expected_flush[]={0x41,0x57,0x41,0x56,0x49,0x89,0xfe,0x41,0x55,0x41,0x54,0x55,0x53,0x48,0x83,0xec,0x28};
+    const unsigned char expected_create[]={0xf3,0x0f,0x1e,0xfa,0x41,0x57,0x41,0x89,0xcf};
+    const unsigned char expected_replace[]={0xf3,0x0f,0x1e,0xfa,0x41,0x56,0x41,0x55,0x49,0x89,0xf5};
     const unsigned char expected1[]={0xb9,0,0,1,0};
     const unsigned char expected2[]={0x41,0xc7,0x86,0x38,0x16,1,0,0,0,1,0};
     const unsigned char expected_fifo[]={0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x55,0x53,0x4c,0x8d,0x9c,0x24};
@@ -1095,7 +1171,10 @@ static void svga3d_init(void) {
     const unsigned char expected_abs[]={0xf3,0x0f,0x1e,0xfa,0x53,0x48,0x63,0xc9,0x4d,0x63,0xc0,0xb8};
     const unsigned char expected_sync[]={0xf3,0x0f,0x1e,0xfa,0x48,0x83,0xec,0x08,0xe8};
     const unsigned char expected_ptr[]={0x49,0x8b,0x87,0xa0,0x51,0x01,0x00,0xf3,0x0f,0x7e,0x24,0x24,0x48,0x8b};
-    if (memcmp((void *)(qemu_base+ADDR_PCIVMSVGA_REALIZE_SIZE1),expected1,sizeof(expected1)) ||
+    if (memcmp((void *)(qemu_base+ADDR_VMSVGA_UPDATE_RECT_FLUSH),expected_flush,sizeof(expected_flush)) ||
+        memcmp((void *)(qemu_base+ADDR_CREATE_DISPLAY_SURFACE),expected_create,sizeof(expected_create)) ||
+        memcmp((void *)(qemu_base+ADDR_REPLACE_DISPLAY_SURFACE),expected_replace,sizeof(expected_replace)) ||
+        memcmp((void *)(qemu_base+ADDR_PCIVMSVGA_REALIZE_SIZE1),expected1,sizeof(expected1)) ||
         memcmp((void *)(qemu_base+ADDR_PCIVMSVGA_REALIZE_SIZE2),expected2,sizeof(expected2)) ||
         memcmp((void *)(qemu_base+ADDR_VMSVGA_FIFO_RUN),expected_fifo,sizeof(expected_fifo)) ||
         memcmp((void *)(qemu_base+ADDR_QEMU_INPUT_UPDATE_BUTTONS),expected_btn,sizeof(expected_btn)) ||
@@ -1122,7 +1201,14 @@ static void svga3d_init(void) {
     }
 
     /* 2. Resolve original update_rect_flush */
-    orig_update_rect_flush = (void (*)(void *))(qemu_base + ADDR_VMSVGA_UPDATE_RECT_FLUSH);
+    orig_update_rect_flush = (void (*)(void *))make_orig_tramp(qemu_base + ADDR_VMSVGA_UPDATE_RECT_FLUSH, 17, -1, 0);
+    if (!orig_update_rect_flush) { fprintf(stderr,"SVGA shim: display trampoline allocation failed\n"); _exit(78); }
+    orig_create_display_surface = (void *(*)(int,int,uint32_t,int,uint8_t *))(qemu_base + ADDR_CREATE_DISPLAY_SURFACE);
+    orig_replace_display_surface = (void (*)(void *,void *))(qemu_base + ADDR_REPLACE_DISPLAY_SURFACE);
+    orig_dpy_gfx_update = (void (*)(void *,int,int,int,int))(qemu_base + ADDR_DPY_GFX_UPDATE);
+    uintptr_t flushPage = (qemu_base + ADDR_VMSVGA_UPDATE_RECT_FLUSH) & ~uintptr_t(0xfff);
+    if (mprotect((void *)flushPage, 4096, PROT_READ | PROT_WRITE | PROT_EXEC)) _exit(78);
+    install_abs_jmp(qemu_base + ADDR_VMSVGA_UPDATE_RECT_FLUSH, (void *)my_vmsvga_update_rect_flush);
 
     /* 3. Hook vmsvga_fifo_run with a 14-byte indirect jump */
     uintptr_t page_fifo = (qemu_base + ADDR_VMSVGA_FIFO_RUN) & ~0xFFF;
