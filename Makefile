@@ -76,9 +76,9 @@ QEMU_TEST_TARGET = $(BIN_DIR)/test_qemu_integration
 DX_TEST_TARGET = $(BIN_DIR)/test_dx_path
 LIB_QEMU_SVGA3D = $(LIB_DIR)/libqemu_svga3d.so
 
-.PHONY: all clean test test-oracle test-vlkn test-real-vulkan test-shader-translation test-shader test-guest-mem test-verified-rendering test-presentation test-qemu test-piglit harness-loop acceptance dump
+.PHONY: preload-lab all clean test test-oracle test-vlkn test-real-vulkan test-shader-translation test-shader test-guest-mem test-verified-rendering test-presentation test-qemu test-piglit harness-loop acceptance dump
 
-all: $(DX_TEST_TARGET) $(BIN_DIR)/test_preload_fifo $(BIN_DIR)/test_buffer_ordering $(ORACLE_TARGET) $(VLKN_LIB) $(QEMU_ADAPTER_LIB) $(LIB_QEMU_SVGA3D) $(VLKN_TEST_TARGET) $(REAL_VULKAN_TEST_TARGET) $(SHADER_TRANSLATION_TEST_TARGET) $(TRANSLATOR_NOVULKAN_TEST_TARGET) $(SHADER_TEST_TARGET) $(GUEST_MEM_TEST_TARGET) $(VERIFIED_RENDERING_TEST_TARGET) $(PRESENTATION_TEST_TARGET) $(QEMU_TEST_TARGET) $(MALFORMED_INPUT_TEST_TARGET)
+all: $(DX_TEST_TARGET) $(BIN_DIR)/test_preload_fifo $(BIN_DIR)/test_preload_fence $(BIN_DIR)/test_buffer_ordering $(ORACLE_TARGET) $(VLKN_LIB) $(QEMU_ADAPTER_LIB) $(VLKN_TEST_TARGET) $(REAL_VULKAN_TEST_TARGET) $(SHADER_TRANSLATION_TEST_TARGET) $(TRANSLATOR_NOVULKAN_TEST_TARGET) $(SHADER_TEST_TARGET) $(GUEST_MEM_TEST_TARGET) $(VERIFIED_RENDERING_TEST_TARGET) $(PRESENTATION_TEST_TARGET) $(QEMU_TEST_TARGET) $(MALFORMED_INPUT_TEST_TARGET)
 
 # Oracle Binary
 $(ORACLE_TARGET): $(ORACLE_OBJS) | $(BIN_DIR) $(DATA_DIR)
@@ -226,12 +226,13 @@ $(LIB_DIR):
 $(DATA_DIR):
 	mkdir -p $(DATA_DIR)
 
-test: $(ORACLE_TARGET) $(VLKN_TEST_TARGET) $(BIN_DIR)/test_preload_fifo $(DX_TEST_TARGET)
+test: $(DX_TEST_TARGET) $(ORACLE_TARGET) $(VLKN_TEST_TARGET) $(BIN_DIR)/test_preload_fifo $(BIN_DIR)/test_preload_fence
 	@echo "=== Running Oracle Reference Verification ==="
 	./$(ORACLE_TARGET) --test
 	@echo "\n=== Running SVGA3=VLKN Product Verification ==="
 	./$(VLKN_TEST_TARGET)
 	./$(BIN_DIR)/test_preload_fifo
+	./$(BIN_DIR)/test_preload_fence
 	./$(DX_TEST_TARGET)
 
 test-oracle: $(ORACLE_TARGET)
@@ -257,4 +258,12 @@ $(DX_TEST_TARGET): tests/test_dx_path.cpp $(VLKN_LIB) | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) $< -L$(LIB_DIR) -lsvga3_vlkn -ldl -o $@
 
 $(BIN_DIR)/test_preload_fifo: tests/test_preload_fifo.cpp src/qemu_svga3d_preload.cpp $(VLKN_LIB) | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) $< -L$(LIB_DIR) -lsvga3_vlkn -ldl -o $@
+
+# Issue #11: the binary-patch lab adapter is a single-build lab tool. It is
+# NOT part of the default build; build it explicitly for the designated VM
+# only, and never configure it as a global LD_PRELOAD.
+preload-lab: $(LIB_QEMU_SVGA3D)
+
+$(BIN_DIR)/test_preload_fence: tests/test_preload_fence.cpp src/qemu_svga3d_preload.cpp $(VLKN_LIB) | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) $< -L$(LIB_DIR) -lsvga3_vlkn -ldl -o $@

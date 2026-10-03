@@ -6,9 +6,9 @@ An experimental SVGA3D-to-Vulkan rendering library and QEMU integration prototyp
 
 ## QEMU lab adapter
 
-The preload adapter supports one allowlisted QEMU build and checks instruction bytes before patching. Use it only for the designated VM; never configure global `LD_PRELOAD`. The tested Proxmox VM runs QEMU as `qemu119` and guest graphics as `svga3d`.
+The preload adapter supports one allowlisted QEMU build and checks instruction bytes before patching. A build-ID mismatch exits with code 78 and logs the observed ID. Build it explicitly with `make preload-lab`; it is excluded from `make all`. Use it only for the designated VM; never configure global `LD_PRELOAD`. The tested Proxmox VM runs QEMU as `qemu119` and guest graphics as `svga3d`.
 
-Set `SVGA3_VLKN_VALIDATE=1` to request Vulkan validation layers; initialization fails if they cannot be activated. Portrait mode overrides require `SVGA3_VLKN_GUEST_PROFILE=playbook-portrait`; normal guests use their requested mode. Framebuffer GPA comes from the device register. Screen-object scanout follows the guest backing-store offset, dimensions, and pitch. Application-context centering and implicit surface mirroring have been removed. Guest-RAM discovery still uses a lab-only mapping heuristic; official QEMU integration remains follow-up work.
+`SVGA3_VLKN_VALIDATE=1` requests Vulkan validation layers and `=0` disables them. Without an override, debug builds request validation and release builds (`NDEBUG`) do not. Initialization fails if requested validation cannot be activated. Portrait mode overrides require `SVGA3_VLKN_GUEST_PROFILE=playbook-portrait`; normal guests use their requested mode. Framebuffer GPA comes from the device register. Screen-object scanout follows the guest backing-store offset, dimensions, and pitch. Application-context centering and implicit surface mirroring have been removed. Guest-RAM discovery still uses a lab-only mapping heuristic; official QEMU integration remains follow-up work.
 
 ## What is included
 
@@ -51,7 +51,7 @@ cd vlkn4svga3d
 make -j4 all
 ```
 
-Outputs include `lib/libsvga3_vlkn.a`, `lib/libqemu_svga3d.so`, and test executables under `bin/`. Public interfaces are in `include/svga3_vlkn.h` and `include/qemu_vmsvga.h`. Link core consumers with `libsvga3_vlkn.a`, `-ldl`, and `-pthread`. The QEMU device harness additionally links `libsvga3_qemu_adapter.a` before the core library.
+Outputs include `lib/libsvga3_vlkn.a`, `lib/libsvga3_qemu_adapter.a`, and test executables under `bin/`. Build `lib/libqemu_svga3d.so` separately with `make preload-lab`. Public interfaces are in `include/svga3_vlkn.h` and `include/qemu_vmsvga.h`. Link core consumers with `libsvga3_vlkn.a`, `-ldl`, and `-pthread`. The QEMU device harness additionally links `libsvga3_qemu_adapter.a` before the core library.
 
 Host integrations register a `Svga3HostAdapter` with `svga3_vlkn_device_set_host_adapter`, replacing the former guest-memory and display callback setters. The core copies the table; its opaque host state must remain valid until detached or device destruction. RAM map/read/write and display notifications cross this boundary. Rendering, presentation copies and fence completion remain core responsibilities. Callbacks run under core locks and must not reenter device APIs.
 
@@ -155,6 +155,7 @@ What each suite proves:
 | --- | --- |
 | `test_translator_novulkan` | D3D9→SPIR-V translation without a Vulkan ICD; optional `spirv-val` (prints SKIP, not PASS, when unavailable); SPIR-V value-flow assertions that shader inputs actually reach the declared outputs (not just decorations) |
 | `test_preload_fifo` | Actual preload FIFO walker on a synthetic QEMU state, without patching a process: batches exceeding 8192 commands, ring wrap, producer notification races, incomplete packets and final fences |
+| `test_preload_fence` | Exact build-ID allowlist, refusal diagnostics, validation policy and portrait-profile gate |
 | `test_buffer_ordering` | Strict Vulkan validation through teardown; queued buffers/constants, compressed FIFO/GMR transfers, sampler retirement, mip/image ordering, depth sampling and shader pixel regressions |
 | `test_shader_translation` | Translation plus real Vulkan shader-module creation; malformed/unsupported bytecode rejected; `_SAT` handling |
 | `test_real_vulkan` | Real device init and bit-exact buffer upload/download; no mock fallback |
