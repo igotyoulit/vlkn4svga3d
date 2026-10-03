@@ -13,111 +13,15 @@ extern "C" void log_msg(const char *fmt, ...);
 
 namespace svga3_vlkn {
 
-static void blitClientSurfaceToFramebuffer(Svga3VlknDevice *dev, uint32_t cid, uint32_t sid, const char *reason) {
-    /* Legacy application guessing can overwrite a correctly positioned guest
-     * window. Normal scanout follows explicit guest presentation commands. */
-    const char *legacy = std::getenv("SVGA3_VLKN_LEGACY_CLIENT_PRESENT");
-    if (!legacy || std::strcmp(legacy, "1") != 0) return;
-    if (!dev || !dev->guestMem || !dev->surfaceMgr || sid == 0 || sid == SVGA3D_INVALID_ID) return;
-    VlknSurface *surf = dev->surfaceMgr->getSurface(sid);
-    /* Cursors are 64 or smaller. A window can be as small as the OpenGL test. */
-    if (!surf || surf->width() < 128 || surf->height() < 128 || surf->isDepthStencil()) return;
-
-    if (dev->contextMgr) dev->contextMgr->endAllRenderPasses();
-
-    const auto &fb = dev->guestMem->getFramebuffer();
-    if (!fb.hva || fb.width == 0 || fb.height == 0) return;
-
-    const void *mapped = nullptr;
-    size_t rowPitch = 0;
-    std::unique_lock<std::mutex> lock;
-    bool reused = false;
-    if (surf->hasReadback(surf->width(), surf->height())) {
-        mapped = surf->readbackData();
-        rowPitch = surf->readbackPitch();
-        reused = true;
-    } else {
-        Svga3VlknStatus stDown = surf->dmaDownloadToStaging(0, nullptr, &mapped, &rowPitch, lock);
-        if (stDown != SVGA3_VLKN_SUCCESS || !mapped) return;
+Svga3VlknStatus svga3_vlkn_present_client_surfaces(Svga3VlknDevice *dev, const char *) {
+    if (!dev || !dev->backend) return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    /* Fences complete all queued work, including offscreen/depth-only draws.
+     * Scanout follows the guest's explicit presentation commands. */
+    if (dev->contextMgr) {
+        dev->contextMgr->endAllRenderPasses();
+        dev->contextMgr->collectPendingWindowPresents();
     }
-
-    uint32_t surfW = surf->width();
-    uint32_t surfH = surf->height();
-    uint32_t dstX = (fb.width > surfW) ? (fb.width - surfW) / 2 : 0;
-    uint32_t dstY = (fb.height > surfH) ? (fb.height - surfH) / 2 : 0;
-    uint32_t copyW = std::min(surfW, fb.width - dstX);
-    uint32_t copyH = std::min(surfH, fb.height - dstY);
-    uint32_t dstBpp = fb.bpp ? fb.bpp : 4;
-    uint32_t dstPitch = fb.pitch ? fb.pitch : (fb.width * dstBpp);
-    size_t bytesPerPixel = std::min(dstBpp, 4u);
-    size_t rowBytes = copyW * bytesPerPixel;
-
-    const uint8_t *src = static_cast<const uint8_t*>(mapped);
-    uint32_t centerPixel = 0;
-    if (copyW > 0 && copyH > 0 && bytesPerPixel == 4) {
-        const uint32_t *midRow = reinterpret_cast<const uint32_t*>(src + (copyH / 2) * rowPitch);
-        centerPixel = midRow[copyW / 2];
-    }
-
-    uint32_t p0 = (bytesPerPixel == 4) ? *reinterpret_cast<const uint32_t*>(src) : 0;
-    bool isBlank = ((centerPixel & 0x00FFFFFF) == 0) &&
-                   ((p0 & 0x00FFFFFF) == 0) &&
-                   is_buffer_all_black_or_zero(mapped, copyW, copyH, rowPitch, bytesPerPixel);
-    if (isBlank) {
-        static uint32_t blank_client_warn = 0;
-        if (blank_client_warn++ < 5 || (blank_client_warn % 500) == 0) {
-            log_msg("[libqemu_svga3d] Client blit (%s, cid=%u): sid=%u is completely blank/zero, preserving fb.hva\n",
-                    reason, cid, sid);
-        }
-        return;
-    }
-
-    for (uint32_t y = 0; y < copyH; ++y) {
-        /* 64-bit offset: the old 32-bit product wrapped for large pitches.
-         * Abort the blit rather than writing outside the framebuffer. */
-        uint64_t dstOff = ((uint64_t)dstY + y) * dstPitch + (uint64_t)dstX * dstBpp;
-        if (dstOff > fb.size || rowBytes > fb.size - dstOff) {
-            return;
-        }
-        uint8_t *dst = fb.hva + (size_t)dstOff;
-        memcpy(dst, src + y * rowPitch, rowBytes);
-    }
-    if (!reused) surf->storeReadback(surfW, surfH, rowPitch, mapped);
-
-    dev->guestMem->notifyDisplayUpdate(dstX, dstY, copyW, copyH);
-
-    if (lock.owns_lock()) lock.unlock();
-
-    static uint32_t blit_count = 0;
-    blit_count++;
-    if (blit_count <= 10 || (blit_count % 50) == 0) {
-        log_msg("[libqemu_svga3d] Client blit #%u (%s, cid=%u): sid=%u (%ux%u) to fb.hva at (%u,%u), centerPx=0x%08x\n",
-                blit_count, reason, cid, sid, copyW, copyH, dstX, dstY, centerPixel);
-    }
-}
-
-void svga3_vlkn_present_client_surfaces(Svga3VlknDevice *dev, const char *reason) {
-    if (!dev) return;
-
-    /* Close active passes before readback. A pending window readback submits
-     * the draw and copy together, so flushing here would add a queue-idle per
-     * frame before the readback's own queue-idle. */
-    if (dev->contextMgr) dev->contextMgr->endAllRenderPasses();
-
-    if (!dev->contextMgr || !dev->surfaceMgr || !dev->guestMem) return;
-    auto pending = dev->contextMgr->collectPendingWindowPresents();
-    for (const auto &item : pending) {
-        blitClientSurfaceToFramebuffer(dev, item.first, item.second, reason);
-    }
-
-    /* The readback normally flushed the command buffer. This also completes
-     * work submitted on paths that have no window surface to read back. */
-    if (dev->backend) {
-        Svga3VlknStatus fst = dev->backend->flushCommandBuffer();
-        if (fst != SVGA3_VLKN_SUCCESS) {
-            log_msg("[libqemu_svga3d] present_client_surfaces: flush failed (%d)\n", (int)fst);
-        }
-    }
+    return dev->backend->flushCommandBuffer();
 }
 
 Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
@@ -272,16 +176,6 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
             const auto *pCmd = reinterpret_cast<const SVGA3dCmdDestroyContext*>(payload);
             log_msg("[libqemu_svga3d] CONTEXT_DESTROY: cid=%u\n", pCmd->cid);
 
-            if (pCmd->cid != 246 && dev->contextMgr) {
-                VlknContext *ctx = dev->contextMgr->getContext(pCmd->cid);
-                if (ctx) {
-                    const RenderTargetBinding *curRt = ctx->getRenderTarget(SVGA3D_RT_COLOR0);
-                    if (curRt && curRt->sid != 0 && curRt->sid != SVGA3D_INVALID_ID) {
-                        blitClientSurfaceToFramebuffer(dev, pCmd->cid, curRt->sid, "context_destroy");
-                    }
-                }
-            }
-
             Svga3VlknStatus st = dev->contextMgr->destroyContext(pCmd->cid);
             *bytesRead = sizeof(SVGA3dCmdDestroyContext);
             return st;
@@ -327,20 +221,6 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
             if (cur_srt <= 5 || (cur_srt % 500) == 0) {
                 log_msg("[libqemu_svga3d] SETRENDERTARGET (cid=%u #%u): type=%u, target.sid=%u, face=%u, mip=%u\n",
                         pCmd->cid, cur_srt, pCmd->type, pCmd->target.sid, pCmd->target.face, pCmd->target.mipmap);
-            }
-
-            /* Detect double-buffered client window surface swap on application context */
-            if (!is_246 && pCmd->type == SVGA3D_RT_COLOR0 && dev->guestMem && dev->surfaceMgr) {
-                const RenderTargetBinding *curRt = ctx->getRenderTarget(SVGA3D_RT_COLOR0);
-                uint32_t oldSid = curRt ? curRt->sid : 0;
-                uint32_t newSid = pCmd->target.sid;
-                if (oldSid != 0 && oldSid != SVGA3D_INVALID_ID && oldSid != newSid) {
-                    VlknSurface *oldSurf = dev->surfaceMgr->getSurface(oldSid);
-                    if (oldSurf && oldSurf->width() >= 320 && oldSurf->height() >= 240 && !oldSurf->isDepthStencil()) {
-                        blitClientSurfaceToFramebuffer(dev, pCmd->cid, oldSid, "swap");
-                        ctx->resetDrawnToWindow();
-                    }
-                }
             }
 
             Svga3VlknStatus st = ctx->setRenderTarget(
@@ -503,6 +383,7 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
                 return SVGA3_VLKN_ERROR_INVALID_COMMAND_BUFFER;
             }
             const auto *pCmd = reinterpret_cast<const SVGA3dCmdClear*>(payload);
+            dev->contextMgr->endAllRenderPassesExcept(pCmd->cid);
             size_t offset = sizeof(SVGA3dCmdClear);
 
             VlknContext *ctx = dev->contextMgr->getContext(pCmd->cid);
@@ -539,6 +420,7 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
                 return SVGA3_VLKN_ERROR_INVALID_COMMAND_BUFFER;
             }
             const auto *pCmd = reinterpret_cast<const SVGA3dCmdDrawPrimitives*>(payload);
+            dev->contextMgr->endAllRenderPassesExcept(pCmd->cid);
             size_t offset = sizeof(SVGA3dCmdDrawPrimitives);
 
             VlknContext *ctx = dev->contextMgr->getContext(pCmd->cid);
@@ -595,18 +477,6 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
                             i, ranges[i].primType, ranges[i].primitiveCount,
                             ranges[i].indexArray.surfaceId, ranges[i].indexArray.offset,
                             ranges[i].indexArray.stride, ranges[i].indexBias);
-                }
-            }
-
-            if (is_246) {
-                if (dev->contextMgr) dev->contextMgr->endAllRenderPasses();
-                const auto &fb = dev->guestMem->getFramebuffer();
-                if (fb.hva && fb.width && fb.height) {
-                    VlknSurface *surf1 = dev->surfaceMgr->getSurface(1);
-                    if (surf1) {
-                        SVGA3dBox box = { 0, 0, 0, std::min(fb.width, surf1->width()), std::min(fb.height, surf1->height()), 1 };
-                        surf1->dmaUpload(0, &box, fb.hva, fb.pitch);
-                    }
                 }
             }
 

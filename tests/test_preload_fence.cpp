@@ -36,6 +36,8 @@ int main() {
     CHECK(strcmp(hex, "2e870e400e1692f5f5a54da897d1dc152b187278") == 0);
     CHECK(!preload_format_build_id(kGoodBuildId, sizeof(kGoodBuildId), hex, 40)); // too small
 
+    CHECK(!preload_format_build_id(kGoodBuildId, SIZE_MAX, hex, sizeof(hex)));
+
     // 3. Validation policy: explicit env wins; debug builds validate.
     setenv("SVGA3_VLKN_VALIDATE", "1", 1);
     CHECK(preload_validation_requested());

@@ -96,6 +96,7 @@ typedef struct VlknDispatchTable {
     PFN_vkCmdBindIndexBuffer                 vkCmdBindIndexBuffer;
     PFN_vkCmdDraw                            vkCmdDraw;
     PFN_vkCmdDrawIndexed                     vkCmdDrawIndexed;
+    PFN_vkCmdClearColorImage                 vkCmdClearColorImage;
     PFN_vkCmdClearAttachments                vkCmdClearAttachments;
     PFN_vkCmdPipelineBarrier                 vkCmdPipelineBarrier;
     PFN_vkCmdCopyBuffer                      vkCmdCopyBuffer;

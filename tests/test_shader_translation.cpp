@@ -245,6 +245,77 @@ int main() {
                    "Mesa-style DCL/TEMP VS translates (DCL output routing)");
     }
 
+    /* Alpha test specialization constants and OpKill emission in Fragment Shaders */
+    {
+        bool hasKill = true;
+        std::vector<uint32_t> alphaSpirv;
+        std::string alphaErr;
+        auto alphaSt = svga3_vlkn::svga3_translate_shader_d3d9(
+            SVGA3D_SHADERTYPE_PS, psBytecode,
+            sizeof(psBytecode)/sizeof(uint32_t), alphaSpirv, alphaErr,
+            nullptr, 0, &hasKill);
+        TEST_CHECK(alphaSt == SVGA3_VLKN_SUCCESS, "Alpha test PS translation succeeds");
+        TEST_CHECK(!hasKill, "Plain PS hasBytecodeKill is false");
+
+        bool foundSpecId0 = false, foundSpecId1 = false, foundSpecId2 = false;
+        bool foundKill = false;
+        for (size_t i = 5; i < alphaSpirv.size();) {
+            uint32_t word = alphaSpirv[i];
+            uint32_t wordCount = word >> 16;
+            uint32_t opcode = word & 0xFFFF;
+            if (opcode == 71 /* SpvOpDecorate */ && wordCount >= 4) {
+                uint32_t dec = alphaSpirv[i + 2];
+                uint32_t val = alphaSpirv[i + 3];
+                if (dec == 1 /* SpecId */) {
+                    if (val == 0) foundSpecId0 = true;
+                    if (val == 1) foundSpecId1 = true;
+                    if (val == 2) foundSpecId2 = true;
+                }
+            } else if (opcode == 252 /* SpvOpKill */) {
+                foundKill = true;
+            }
+            if (wordCount == 0) break;
+            i += wordCount;
+        }
+        TEST_CHECK(foundSpecId0 && foundSpecId1 && foundSpecId2,
+                   "SPIR-V declares SpecId 0, 1, and 2 for alpha test");
+        TEST_CHECK(foundKill, "SPIR-V includes conditional OpKill for alpha testing");
+
+        /* Verify pipeline creation with specialization constants on real Vulkan */
+        VkShaderModule alphaModule = VK_NULL_HANDLE;
+        smInfo.codeSize = alphaSpirv.size() * sizeof(uint32_t);
+        smInfo.pCode = alphaSpirv.data();
+        res = backend->dispatch().vkCreateShaderModule(backend->device(), &smInfo, nullptr, &alphaModule);
+        TEST_CHECK(res == VK_SUCCESS, "Create VkShaderModule from alpha test SPIR-V");
+        backend->dispatch().vkDestroyShaderModule(backend->device(), alphaModule, nullptr);
+
+        /* Bytecode with texkill */
+        const uint32_t killPsBytecode[] = {
+            0xFFFF0300, /* ps_3_0 */
+            (31) | (2 << 24), /* DCL */
+            0x80000000 | 10,  /* Usage: COLOR 0 */
+            0x80000000 | (1 << 28) | 0 | (0xF << 16), /* v0 */
+            (1) | (2 << 24),  /* MOV r0, v0 */
+            0x80000000 | (0 << 28) | 0 | (0xF << 16), /* r0 */
+            0x80000000 | (1 << 28) | 0 | (0xE4 << 16), /* v0 */
+            (65) | (1 << 24), /* TEXKILL */
+            0x80000000 | (0 << 28) | 0 | (0xF << 16), /* r0 */
+            (1) | (2 << 24),  /* MOV oC0, r0 */
+            0x80000000 | (2 << 28) | 0 | (0xF << 16),  /* oC0 */
+            0x80000000 | (0 << 28) | 0 | (0xE4 << 16), /* r0 */
+            0x0000FFFF        /* END */
+        };
+        bool hasBytecodeKill = false;
+        std::vector<uint32_t> killSpirv;
+        std::string killErr;
+        auto killSt = svga3_vlkn::svga3_translate_shader_d3d9(
+            SVGA3D_SHADERTYPE_PS, killPsBytecode,
+            sizeof(killPsBytecode)/sizeof(uint32_t), killSpirv, killErr,
+            nullptr, 0, &hasBytecodeKill);
+        TEST_CHECK(killSt == SVGA3_VLKN_SUCCESS, "texkill PS translation succeeds");
+        TEST_CHECK(hasBytecodeKill, "texkill PS sets hasBytecodeKill to true");
+    }
+
     /* Cleanup */
     backend->dispatch().vkDestroyShaderModule(backend->device(), vsModule, nullptr);
     backend->dispatch().vkDestroyShaderModule(backend->device(), psModule, nullptr);
