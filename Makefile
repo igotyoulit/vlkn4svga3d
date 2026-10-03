@@ -66,7 +66,7 @@ PRESENTATION_TEST_TARGET = $(BIN_DIR)/test_presentation
 QEMU_TEST_TARGET = $(BIN_DIR)/test_qemu_integration
 LIB_QEMU_SVGA3D = $(LIB_DIR)/libqemu_svga3d.so
 
-.PHONY: all clean test test-oracle test-vlkn test-real-vulkan test-shader-translation test-shader test-guest-mem test-verified-rendering test-presentation test-qemu test-piglit harness-loop acceptance dump
+.PHONY: preload-lab all clean test test-oracle test-vlkn test-real-vulkan test-shader-translation test-shader test-guest-mem test-verified-rendering test-presentation test-qemu test-piglit harness-loop acceptance dump
 
 all: $(BIN_DIR)/test_preload_fifo $(BIN_DIR)/test_preload_fence $(BIN_DIR)/test_buffer_ordering $(ORACLE_TARGET) $(VLKN_LIB) $(VLKN_TEST_TARGET) $(REAL_VULKAN_TEST_TARGET) $(SHADER_TRANSLATION_TEST_TARGET) $(TRANSLATOR_NOVULKAN_TEST_TARGET) $(SHADER_TEST_TARGET) $(GUEST_MEM_TEST_TARGET) $(VERIFIED_RENDERING_TEST_TARGET) $(PRESENTATION_TEST_TARGET) $(QEMU_TEST_TARGET) $(MALFORMED_INPUT_TEST_TARGET)
 

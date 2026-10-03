@@ -153,6 +153,7 @@ What each suite proves:
 | --- | --- |
 | `test_translator_novulkan` | D3D9→SPIR-V translation without a Vulkan ICD; optional `spirv-val` (prints SKIP, not PASS, when unavailable); SPIR-V value-flow assertions that shader inputs actually reach the declared outputs (not just decorations) |
 | `test_preload_fifo` | Actual preload FIFO walker on a synthetic QEMU state, without patching a process: batches exceeding 8192 commands, ring wrap, producer notification races, incomplete packets and final fences |
+| `test_preload_fence` | Exact build-ID allowlist, refusal diagnostics, validation policy and portrait-profile gate |
 | `test_buffer_ordering` | Strict Vulkan validation through teardown; queued buffers/constants, compressed FIFO/GMR transfers, sampler retirement, mip/image ordering, depth sampling and shader pixel regressions |
 | `test_shader_translation` | Translation plus real Vulkan shader-module creation; malformed/unsupported bytecode rejected; `_SAT` handling |
 | `test_real_vulkan` | Real device init and bit-exact buffer upload/download; no mock fallback |
