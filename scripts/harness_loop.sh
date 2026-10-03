@@ -74,6 +74,7 @@ HARNESS_TIMEOUT="${HARNESS_TIMEOUT:-900}"
 ICD_FREE_SUITES=( test_translator_novulkan test_preload_fifo test_preload_fence )
 LAVAPIPE_SUITES=(
     test_buffer_ordering
+    test_dx_path
     test_shader_translation
     test_real_vulkan
     test_svga3_vlkn

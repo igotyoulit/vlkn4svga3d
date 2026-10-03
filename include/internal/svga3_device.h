@@ -12,12 +12,16 @@
 #include "svga3_guest_mem.h"
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 
 struct Svga3VlknDevice {
     std::unique_ptr<svga3_vlkn::VlknBackend> backend;
     std::unique_ptr<svga3_vlkn::VlknSurfaceManager> surfaceMgr;
     std::unique_ptr<svga3_vlkn::VlknContextManager> contextMgr;
     std::unique_ptr<svga3_vlkn::GuestMemoryManager> guestMem;
+
+    std::unordered_set<uint32_t> dxContexts;
+    size_t dxContextLimit = 256;
 
     Svga3VlknStats stats;
     std::mutex mutex;

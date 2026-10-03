@@ -47,6 +47,7 @@ VLKN_OBJS = \
     $(BUILD_DIR)/svga3_surface.o \
     $(BUILD_DIR)/svga3_context.o \
     $(BUILD_DIR)/svga3_fifo.o \
+    $(BUILD_DIR)/svga3_dx.o \
     $(BUILD_DIR)/svga3_device.o \
     $(BUILD_DIR)/svga3_shader_translator.o \
     $(BUILD_DIR)/svga3_guest_mem.o \
@@ -64,11 +65,12 @@ MALFORMED_INPUT_TEST_TARGET = $(BIN_DIR)/test_malformed_inputs
 VERIFIED_RENDERING_TEST_TARGET = $(BIN_DIR)/test_verified_rendering
 PRESENTATION_TEST_TARGET = $(BIN_DIR)/test_presentation
 QEMU_TEST_TARGET = $(BIN_DIR)/test_qemu_integration
+DX_TEST_TARGET = $(BIN_DIR)/test_dx_path
 LIB_QEMU_SVGA3D = $(LIB_DIR)/libqemu_svga3d.so
 
 .PHONY: preload-lab all clean test test-oracle test-vlkn test-real-vulkan test-shader-translation test-shader test-guest-mem test-verified-rendering test-presentation test-qemu test-piglit harness-loop acceptance dump
 
-all: $(BIN_DIR)/test_preload_fifo $(BIN_DIR)/test_preload_fence $(BIN_DIR)/test_buffer_ordering $(ORACLE_TARGET) $(VLKN_LIB) $(VLKN_TEST_TARGET) $(REAL_VULKAN_TEST_TARGET) $(SHADER_TRANSLATION_TEST_TARGET) $(TRANSLATOR_NOVULKAN_TEST_TARGET) $(SHADER_TEST_TARGET) $(GUEST_MEM_TEST_TARGET) $(VERIFIED_RENDERING_TEST_TARGET) $(PRESENTATION_TEST_TARGET) $(QEMU_TEST_TARGET) $(MALFORMED_INPUT_TEST_TARGET)
+all: $(DX_TEST_TARGET) $(BIN_DIR)/test_preload_fifo $(BIN_DIR)/test_preload_fence $(BIN_DIR)/test_buffer_ordering $(ORACLE_TARGET) $(VLKN_LIB) $(VLKN_TEST_TARGET) $(REAL_VULKAN_TEST_TARGET) $(SHADER_TRANSLATION_TEST_TARGET) $(TRANSLATOR_NOVULKAN_TEST_TARGET) $(SHADER_TEST_TARGET) $(GUEST_MEM_TEST_TARGET) $(VERIFIED_RENDERING_TEST_TARGET) $(PRESENTATION_TEST_TARGET) $(QEMU_TEST_TARGET) $(MALFORMED_INPUT_TEST_TARGET)
 
 # Oracle Binary
 $(ORACLE_TARGET): $(ORACLE_OBJS) | $(BIN_DIR) $(DATA_DIR)
@@ -102,7 +104,10 @@ $(BUILD_DIR)/svga3_surface.o: src/svga3_surface.cpp include/internal/svga3_surfa
 $(BUILD_DIR)/svga3_context.o: src/svga3_context.cpp include/internal/svga3_context.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) -c $< -o $@
 
-$(BUILD_DIR)/svga3_fifo.o: src/svga3_fifo.cpp include/internal/svga3_device.h | $(BUILD_DIR)
+$(BUILD_DIR)/svga3_fifo.o: src/svga3_fifo.cpp include/internal/svga3_device.h include/internal/svga3_dx.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) -c $< -o $@
+
+$(BUILD_DIR)/svga3_dx.o: src/svga3_dx.cpp include/internal/svga3_dx.h include/internal/svga3_device.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) -c $< -o $@
 
 $(BUILD_DIR)/svga3_device.o: src/svga3_device.cpp include/internal/svga3_device.h | $(BUILD_DIR)
@@ -205,13 +210,14 @@ $(LIB_DIR):
 $(DATA_DIR):
 	mkdir -p $(DATA_DIR)
 
-test: $(ORACLE_TARGET) $(VLKN_TEST_TARGET) $(BIN_DIR)/test_preload_fifo $(BIN_DIR)/test_preload_fence
+test: $(DX_TEST_TARGET) $(ORACLE_TARGET) $(VLKN_TEST_TARGET) $(BIN_DIR)/test_preload_fifo $(BIN_DIR)/test_preload_fence
 	@echo "=== Running Oracle Reference Verification ==="
 	./$(ORACLE_TARGET) --test
 	@echo "\n=== Running SVGA3=VLKN Product Verification ==="
 	./$(VLKN_TEST_TARGET)
 	./$(BIN_DIR)/test_preload_fifo
 	./$(BIN_DIR)/test_preload_fence
+	./$(DX_TEST_TARGET)
 
 test-oracle: $(ORACLE_TARGET)
 	./$(ORACLE_TARGET) --test
@@ -230,6 +236,9 @@ clean:
 -include $(wildcard $(BUILD_DIR)/*.d)
 
 $(BIN_DIR)/test_buffer_ordering: tests/test_buffer_ordering.cpp $(VLKN_LIB) | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) $< -L$(LIB_DIR) -lsvga3_vlkn -ldl -o $@
+
+$(DX_TEST_TARGET): tests/test_dx_path.cpp $(VLKN_LIB) | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) $< -L$(LIB_DIR) -lsvga3_vlkn -ldl -o $@
 
 $(BIN_DIR)/test_preload_fifo: tests/test_preload_fifo.cpp src/qemu_svga3d_preload.cpp $(VLKN_LIB) | $(BIN_DIR)
