@@ -904,30 +904,6 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
         if (ensSt != SVGA3_VLKN_SUCCESS) return ensSt;
     }
 
-    /* Transition image to TRANSFER_DST_OPTIMAL */
-    VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
-
-    VkImageMemoryBarrier barrier = {};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.srcAccessMask = m_currentLayout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.oldLayout = m_currentLayout;
-    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.image = m_image;
-    barrier.subresourceRange.aspectMask = m_isDepthStencil ?
-        (VK_IMAGE_ASPECT_DEPTH_BIT | (svga3_format_has_stencil(m_svgaFormat) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = m_mipLevels;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = m_arrayLayers;
-
-    m_backend->dispatch().vkCmdPipelineBarrier(
-        cb,
-        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &barrier
-    );
-
     /* Allocate staging buffer space: bump-allocate the persistent buffer so
      * consecutive uploads batch without a queue idle each. Flush only when
      * the range would be reused (bump overflow) or when a reader runs. */
@@ -1031,6 +1007,32 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
         }
         return SVGA3_VLKN_SUCCESS;
     }
+
+    /* Allocation may submit and reset the command buffer on arena wrap.
+     * Acquire the recording buffer only after allocation and host writes. */
+    /* Transition image to TRANSFER_DST_OPTIMAL */
+    VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
+
+    VkImageMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = m_currentLayout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.oldLayout = m_currentLayout;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.image = m_image;
+    barrier.subresourceRange.aspectMask = m_isDepthStencil ?
+        (VK_IMAGE_ASPECT_DEPTH_BIT | (svga3_format_has_stencil(m_svgaFormat) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = m_mipLevels;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = m_arrayLayers;
+
+    m_backend->dispatch().vkCmdPipelineBarrier(
+        cb,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier
+    );
 
     /* Record buffer to image copy */
     VkBufferImageCopy region = {};
