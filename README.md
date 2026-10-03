@@ -1,4 +1,4 @@
-<img src="docs/logo.svg" width="100%" alt="VLKN4SVGA3D">
+<img src="docs/logo.svg" width="1200" alt="VLKN4SVGA3D">
 
 # vlkn4svga3d
 
