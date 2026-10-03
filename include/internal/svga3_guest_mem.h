@@ -70,12 +70,8 @@ public:
     void clearRamBlocks();
     void clear();
 
-    /* QEMU Integration Callbacks */
-    void setCallbacks(void *opaque,
-                      Svga3GpaToHvaFn gpaToHva,
-                      Svga3DmaReadFn dmaRead,
-                      Svga3DmaWriteFn dmaWrite);
-    void setDisplayCallback(void *opaque, Svga3DisplayUpdateFn displayUpdate);
+    /* Host Adapter (replaces the old QEMU-specific callbacks) */
+    void setAdapter(const Svga3HostAdapter *adapter);
     void notifyDisplayUpdate(int32_t x, int32_t y, int32_t w, int32_t h);
 
     /* Framebuffer Mapping (BAR1) */
@@ -122,13 +118,8 @@ private:
     std::unordered_map<uint32_t, GuestMemoryRegion> m_gmrs;
     FramebufferInfo m_fb;
 
-    void *m_cbOpaque = nullptr;
-    Svga3GpaToHvaFn m_gpaToHva = nullptr;
-    Svga3DmaReadFn  m_dmaRead = nullptr;
-    Svga3DmaWriteFn m_dmaWrite = nullptr;
-
-    void *m_displayOpaque = nullptr;
-    Svga3DisplayUpdateFn m_displayUpdate = nullptr;
+    Svga3HostAdapter m_adapter{};
+    bool m_hasAdapter = false;
 };
 
 } // namespace svga3_vlkn

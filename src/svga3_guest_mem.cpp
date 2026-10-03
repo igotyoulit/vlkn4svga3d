@@ -85,30 +85,23 @@ void GuestMemoryManager::clear() {
     m_gmrs.clear();
 }
 
-void GuestMemoryManager::setCallbacks(void *opaque,
-                                      Svga3GpaToHvaFn gpaToHva,
-                                      Svga3DmaReadFn dmaRead,
-                                      Svga3DmaWriteFn dmaWrite)
+void GuestMemoryManager::setAdapter(const Svga3HostAdapter *adapter)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    m_cbOpaque = opaque;
-    m_gpaToHva = gpaToHva;
-    m_dmaRead  = dmaRead;
-    m_dmaWrite = dmaWrite;
-}
-
-void GuestMemoryManager::setDisplayCallback(void *opaque, Svga3DisplayUpdateFn displayUpdate)
-{
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_displayOpaque = opaque;
-    m_displayUpdate = displayUpdate;
+    if (adapter) {
+        m_adapter = *adapter;
+        m_hasAdapter = true;
+    } else {
+        m_adapter = Svga3HostAdapter{};
+        m_hasAdapter = false;
+    }
 }
 
 void GuestMemoryManager::notifyDisplayUpdate(int32_t x, int32_t y, int32_t w, int32_t h)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_displayUpdate && w > 0 && h > 0) {
-        m_displayUpdate(m_displayOpaque, x, y, w, h);
+    if (m_hasAdapter && m_adapter.displayUpdate && w > 0 && h > 0) {
+        m_adapter.displayUpdate(m_adapter.opaque, x, y, w, h);
     }
 }
 
@@ -596,18 +589,18 @@ bool GuestMemoryManager::readPhysicalLocked(uint64_t gpa, void *dstHost, size_t 
         return true;
     }
 
-    /* 3. Translation callback */
-    if (m_gpaToHva) {
-        void *hva = m_gpaToHva(m_cbOpaque, gpa, size, false);
+    /* 3. Host adapter translation */
+    if (m_hasAdapter && m_adapter.guestRamMap) {
+        void *hva = m_adapter.guestRamMap(m_adapter.opaque, gpa, size, false);
         if (hva) {
             memcpy(dstHost, hva, size);
             return true;
         }
     }
 
-    /* 4. Direct DMA read callback */
-    if (m_dmaRead) {
-        return m_dmaRead(m_cbOpaque, gpa, dstHost, size);
+    /* 4. Host adapter direct read */
+    if (m_hasAdapter && m_adapter.guestRamRead) {
+        return m_adapter.guestRamRead(m_adapter.opaque, gpa, dstHost, size);
     }
 
     return false;
@@ -630,18 +623,18 @@ bool GuestMemoryManager::writePhysicalLocked(uint64_t gpa, const void *srcHost, 
         return true;
     }
 
-    /* 3. Translation callback */
-    if (m_gpaToHva) {
-        void *hva = m_gpaToHva(m_cbOpaque, gpa, size, true);
+    /* 3. Host adapter translation */
+    if (m_hasAdapter && m_adapter.guestRamMap) {
+        void *hva = m_adapter.guestRamMap(m_adapter.opaque, gpa, size, true);
         if (hva) {
             memcpy(hva, srcHost, size);
             return true;
         }
     }
 
-    /* 4. Direct DMA write callback */
-    if (m_dmaWrite) {
-        return m_dmaWrite(m_cbOpaque, gpa, srcHost, size);
+    /* 4. Host adapter direct write */
+    if (m_hasAdapter && m_adapter.guestRamWrite) {
+        return m_adapter.guestRamWrite(m_adapter.opaque, gpa, srcHost, size);
     }
 
     return false;
@@ -657,8 +650,8 @@ void* GuestMemoryManager::gpaToHva(uint64_t gpa, size_t size, bool isWrite) {
     if (m_fb.hva && rangeWithin(gpa, size, m_fb.gpa, m_fb.size)) {
         return m_fb.hva + (gpa - m_fb.gpa);
     }
-    if (m_gpaToHva) {
-        return m_gpaToHva(m_cbOpaque, gpa, size, isWrite);
+    if (m_hasAdapter && m_adapter.guestRamMap) {
+        return m_adapter.guestRamMap(m_adapter.opaque, gpa, size, isWrite);
     }
     return nullptr;
 }
