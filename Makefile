@@ -41,6 +41,8 @@ ORACLE_OBJS = \
     $(BUILD_DIR)/svga3d-oracle.o
 
 # SVGA3=VLKN Engine Objects
+# Core rendering library: FIFO decode, surfaces, contexts, shader
+# translation, Vulkan backend. No QEMU code, no QEMU headers.
 VLKN_OBJS = \
     $(BUILD_DIR)/vlkn_dispatch.o \
     $(BUILD_DIR)/vlkn_backend.o \
@@ -50,8 +52,14 @@ VLKN_OBJS = \
     $(BUILD_DIR)/svga3_dx.o \
     $(BUILD_DIR)/svga3_device.o \
     $(BUILD_DIR)/svga3_shader_translator.o \
-    $(BUILD_DIR)/svga3_guest_mem.o \
-    $(BUILD_DIR)/qemu_vmsvga.o
+    $(BUILD_DIR)/svga3_guest_mem.o
+
+# QEMU host adapter: QEMU device emulation + Svga3HostAdapter glue.
+# Adding another VM host means a new adapter file, not core edits.
+QEMU_ADAPTER_OBJS = \
+    $(BUILD_DIR)/qemu_vmsvga.o \
+    $(BUILD_DIR)/qemu_adapter.o
+QEMU_ADAPTER_LIB = $(LIB_DIR)/libsvga3_qemu_adapter.a
 
 ORACLE_TARGET = $(BIN_DIR)/svga3d-oracle
 VLKN_LIB = $(LIB_DIR)/libsvga3_vlkn.a
@@ -70,7 +78,7 @@ LIB_QEMU_SVGA3D = $(LIB_DIR)/libqemu_svga3d.so
 
 .PHONY: preload-lab all clean test test-oracle test-vlkn test-real-vulkan test-shader-translation test-shader test-guest-mem test-verified-rendering test-presentation test-qemu test-piglit harness-loop acceptance dump
 
-all: $(DX_TEST_TARGET) $(BIN_DIR)/test_preload_fifo $(BIN_DIR)/test_preload_fence $(BIN_DIR)/test_buffer_ordering $(ORACLE_TARGET) $(VLKN_LIB) $(VLKN_TEST_TARGET) $(REAL_VULKAN_TEST_TARGET) $(SHADER_TRANSLATION_TEST_TARGET) $(TRANSLATOR_NOVULKAN_TEST_TARGET) $(SHADER_TEST_TARGET) $(GUEST_MEM_TEST_TARGET) $(VERIFIED_RENDERING_TEST_TARGET) $(PRESENTATION_TEST_TARGET) $(QEMU_TEST_TARGET) $(MALFORMED_INPUT_TEST_TARGET)
+all: $(DX_TEST_TARGET) $(BIN_DIR)/test_preload_fifo $(BIN_DIR)/test_preload_fence $(BIN_DIR)/test_buffer_ordering $(ORACLE_TARGET) $(VLKN_LIB) $(QEMU_ADAPTER_LIB) $(VLKN_TEST_TARGET) $(REAL_VULKAN_TEST_TARGET) $(SHADER_TRANSLATION_TEST_TARGET) $(TRANSLATOR_NOVULKAN_TEST_TARGET) $(SHADER_TEST_TARGET) $(GUEST_MEM_TEST_TARGET) $(VERIFIED_RENDERING_TEST_TARGET) $(PRESENTATION_TEST_TARGET) $(QEMU_TEST_TARGET) $(MALFORMED_INPUT_TEST_TARGET)
 
 # Oracle Binary
 $(ORACLE_TARGET): $(ORACLE_OBJS) | $(BIN_DIR) $(DATA_DIR)
@@ -90,6 +98,8 @@ $(BUILD_DIR)/svga3d-oracle.o: tools/svga3d-oracle.cpp tools/include/svga3d_table
 
 # SVGA3=VLKN Library
 $(VLKN_LIB): $(VLKN_OBJS) | $(LIB_DIR)
+	# Recreate: ar rcs alone retains QEMU members from pre-split builds.
+	rm -f $@
 	ar rcs $@ $(VLKN_OBJS)
 
 $(BUILD_DIR)/vlkn_dispatch.o: src/vlkn_dispatch.cpp include/internal/vlkn_dispatch.h | $(BUILD_DIR)
@@ -122,6 +132,12 @@ $(BUILD_DIR)/svga3_guest_mem.o: src/svga3_guest_mem.cpp include/internal/svga3_g
 $(BUILD_DIR)/qemu_vmsvga.o: src/qemu_vmsvga.cpp include/qemu_vmsvga.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) -c $< -o $@
 
+$(BUILD_DIR)/qemu_adapter.o: src/adapter/qemu_adapter.cpp src/adapter/qemu_adapter.h include/qemu_vmsvga.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) -c $< -o $@
+
+$(QEMU_ADAPTER_LIB): $(QEMU_ADAPTER_OBJS) | $(LIB_DIR)
+	ar rcs $@ $(QEMU_ADAPTER_OBJS)
+
 # SVGA3=VLKN Test Suite
 $(VLKN_TEST_TARGET): tests/test_svga3_vlkn.cpp $(VLKN_LIB) | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) $< -L$(LIB_DIR) -lsvga3_vlkn -ldl -o $@
@@ -150,8 +166,8 @@ $(VERIFIED_RENDERING_TEST_TARGET): tests/test_verified_rendering.cpp $(VLKN_LIB)
 $(PRESENTATION_TEST_TARGET): tests/test_presentation.cpp $(VLKN_LIB) | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) $< -L$(LIB_DIR) -lsvga3_vlkn -ldl -o $@
 
-$(QEMU_TEST_TARGET): tests/test_qemu_integration.cpp $(VLKN_LIB) | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) $< -L$(LIB_DIR) -lsvga3_vlkn -ldl -o $@
+$(QEMU_TEST_TARGET): tests/test_qemu_integration.cpp $(VLKN_LIB) $(QEMU_ADAPTER_LIB) | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES_VLKN) $< -L$(LIB_DIR) -lsvga3_qemu_adapter -lsvga3_vlkn -ldl -o $@
 
 $(LIB_QEMU_SVGA3D): src/qemu_svga3d_preload.cpp $(VLKN_LIB) | $(LIB_DIR)
 	$(CXX) $(CXXFLAGS) -shared -I. $(INCLUDES_VLKN) $< -L$(LIB_DIR) -Wl,--whole-archive -lsvga3_vlkn -Wl,--no-whole-archive -static-libstdc++ -static-libgcc -ldl -lpthread -o $@

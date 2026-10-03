@@ -542,7 +542,10 @@ static void ensure_vlkn_device(void *s) {
             vram, width, height, pitch, bpp, vram_size);
 
     svga3_vlkn_device_set_framebuffer(g_vlknDev, vram, reg_value(s, SVGA_REG_FB_START), vram_size, width, height, pitch, bpp / 8);
-    svga3_vlkn_device_set_display_callback(g_vlknDev, s, vlkn_display_update_cb);
+    Svga3HostAdapter preloadAdapter{};
+    preloadAdapter.opaque = s;
+    preloadAdapter.displayUpdate = vlkn_display_update_cb;
+    svga3_vlkn_device_set_host_adapter(g_vlknDev, &preloadAdapter);
 
     g_vlkn_initialized = true;
     log_msg("[libqemu_svga3d] SVGA3=VLKN Vulkan hardware 3D engine initialized successfully!\n");

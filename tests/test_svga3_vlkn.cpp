@@ -10,6 +10,7 @@
 #include "vlkn_dispatch.h"
 #include "svga3d_reference.h"
 #include "svga3d_tables.h"
+#include "fake_host_adapter.h"
 #include <iostream>
 #include <vector>
 #include <string>
@@ -1812,8 +1813,9 @@ static void TestPresentAlwaysCopies() {
                                                  fb.size() * sizeof(uint32_t),
                                                  128, 128, 128 * 4, 4) == SVGA3_VLKN_SUCCESS,
                "Register framebuffer for present contract");
-    TEST_CHECK(svga3_vlkn_device_set_display_callback(dev, nullptr, countDisplayUpdate) == SVGA3_VLKN_SUCCESS,
-               "Register display update counter");
+    Svga3HostAdapter adapter = fake_host_adapter(countDisplayUpdate, nullptr);
+    TEST_CHECK(svga3_vlkn_device_set_host_adapter(dev, &adapter) == SVGA3_VLKN_SUCCESS,
+               "Register display update counter via host adapter");
     SVGA3dSize size = {128, 128, 1};
     TEST_CHECK(svga3_vlkn_surface_define(dev, 42, 0, SVGA3D_A8R8G8B8, &size, 1) == SVGA3_VLKN_SUCCESS,
                "Define presentable surface");
