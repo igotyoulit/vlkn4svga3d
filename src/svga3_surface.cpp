@@ -882,41 +882,51 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
         ensureViewMipLevels(mipLevel + 1);
     }
 
-    /* Transition image to TRANSFER_DST_OPTIMAL */
-    VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
+    /* Validate the linear shadow-copy range BEFORE recording anything: a
+     * failure here must not leave a half-recorded barrier in the open
+     * command buffer with m_currentLayout unchanged. */
+    const bool doLinearShadowCopy = (mipLevel == 0 && m_buffer && m_bufferMemory && !compressed);
+    if (doLinearShadowCopy) {
+        /* 64-bit: (bx+bw) wrapped in 32-bit, undersizing the buffer. */
+        uint64_t bxw = (uint64_t)bx + bw;
+        uint64_t bzw = (uint64_t)bz + bd;
+        uint64_t byh = (uint64_t)by + bh;
+        uint64_t maxOffset64 = 0;
+        bool ov = (bd == 0 || bzw == 0) ||
+                  __builtin_mul_overflow(bzw - 1, (uint64_t)mip.height, &maxOffset64) ||
+                  __builtin_add_overflow(maxOffset64, byh - (bh ? 1 : 0), &maxOffset64) ||
+                  __builtin_mul_overflow(maxOffset64, (uint64_t)mip.rowPitch, &maxOffset64) ||
+                  __builtin_add_overflow(maxOffset64, bxw * bpp, &maxOffset64);
+        if (ov || maxOffset64 > SVGA3_MAX_DMA_BYTES) {
+            return SVGA3_VLKN_ERROR_INVALID_PARAM;
+        }
+        Svga3VlknStatus ensSt = ensureBufferSize((size_t)maxOffset64);
+        if (ensSt != SVGA3_VLKN_SUCCESS) return ensSt;
+    }
 
-    VkImageMemoryBarrier barrier = {};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.srcAccessMask = m_currentLayout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.oldLayout = m_currentLayout;
-    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.image = m_image;
-    barrier.subresourceRange.aspectMask = m_isDepthStencil ?
-        (VK_IMAGE_ASPECT_DEPTH_BIT | (svga3_format_has_stencil(m_svgaFormat) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = m_mipLevels;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = m_arrayLayers;
-
-    m_backend->dispatch().vkCmdPipelineBarrier(
-        cb,
-        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &barrier
-    );
-
-    /* Allocate staging buffer space */
+    /* Allocate staging buffer space: bump-allocate the persistent buffer so
+     * consecutive uploads batch without a queue idle each. Flush only when
+     * the range would be reused (bump overflow) or when a reader runs. */
     VkBuffer stagingBuf = VK_NULL_HANDLE;
     VkDeviceMemory stagingMem = VK_NULL_HANDLE;
     void *mapped = nullptr;
+    VkDeviceSize stagingOffset = 0;
     std::unique_lock<std::mutex> stagingLock;
     bool usingPersistentStaging = false;
 
     if (totalBytes <= m_backend->stagingSize() && m_backend->stagingBuffer() && m_backend->stagingMapped()) {
         stagingLock = std::unique_lock<std::mutex>(m_backend->stagingMutex());
+        stagingOffset = m_backend->stagingAlloc(totalBytes);
+        if (stagingOffset == VlknBackend::kStagingAllocFailed) {
+            /* Range would be reused: flush to retire pending ranges, retry. */
+            Svga3VlknStatus fst = m_backend->flushCommandBuffer();
+            if (fst != SVGA3_VLKN_SUCCESS) return fst;
+            stagingOffset = m_backend->stagingAlloc(totalBytes);
+            if (stagingOffset == VlknBackend::kStagingAllocFailed)
+                return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+        }
         stagingBuf = m_backend->stagingBuffer();
-        mapped = m_backend->stagingMapped();
+        mapped = m_backend->stagingMappedAt(stagingOffset);
         usingPersistentStaging = true;
     } else {
         Svga3VlknStatus st = m_backend->createBuffer(
@@ -950,23 +960,9 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
         }
     }
 
-    /* Also copy into vertex/index backing VkBuffer */
-    if (mipLevel == 0 && m_buffer && m_bufferMemory && !compressed) {
-        /* 64-bit: (bx+bw) wrapped in 32-bit, undersizing the buffer. */
-        uint64_t bxw = (uint64_t)bx + bw;
-        uint64_t bzw = (uint64_t)bz + bd;
-        uint64_t byh = (uint64_t)by + bh;
-        uint64_t maxOffset64 = 0;
-        bool ov = (bd == 0 || bzw == 0) ||
-                  __builtin_mul_overflow(bzw - 1, (uint64_t)mip.height, &maxOffset64) ||
-                  __builtin_add_overflow(maxOffset64, byh - (bh ? 1 : 0), &maxOffset64) ||
-                  __builtin_mul_overflow(maxOffset64, (uint64_t)mip.rowPitch, &maxOffset64) ||
-                  __builtin_add_overflow(maxOffset64, bxw * bpp, &maxOffset64);
-        if (ov || maxOffset64 > SVGA3_MAX_DMA_BYTES) {
-            return SVGA3_VLKN_ERROR_INVALID_PARAM;
-        }
-        Svga3VlknStatus ensSt = ensureBufferSize((size_t)maxOffset64);
-        if (ensSt != SVGA3_VLKN_SUCCESS) return ensSt;
+    /* Also copy into vertex/index backing VkBuffer (range validated above,
+     * before any command was recorded). */
+    if (doLinearShadowCopy) {
         if (m_buffer && m_bufferMemory) {
             void *bufMapped = m_bufferMapped;
             bool needUnmap = false;
@@ -1012,9 +1008,35 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
         return SVGA3_VLKN_SUCCESS;
     }
 
+    /* Allocation may submit and reset the command buffer on arena wrap.
+     * Acquire the recording buffer only after allocation and host writes. */
+    /* Transition image to TRANSFER_DST_OPTIMAL */
+    VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
+
+    VkImageMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = m_currentLayout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.oldLayout = m_currentLayout;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.image = m_image;
+    barrier.subresourceRange.aspectMask = m_isDepthStencil ?
+        (VK_IMAGE_ASPECT_DEPTH_BIT | (svga3_format_has_stencil(m_svgaFormat) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = m_mipLevels;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = m_arrayLayers;
+
+    m_backend->dispatch().vkCmdPipelineBarrier(
+        cb,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier
+    );
+
     /* Record buffer to image copy */
     VkBufferImageCopy region = {};
-    region.bufferOffset = 0;
+    region.bufferOffset = usingPersistentStaging ? stagingOffset : 0;
     region.bufferRowLength = 0;
     region.bufferImageHeight = 0;
     region.imageSubresource.aspectMask = m_isDepthStencil ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1046,12 +1068,16 @@ Svga3VlknStatus VlknSurface::dmaUpload(uint32_t mipLevel,
     );
 
     m_currentLayout = barrier.newLayout;
-    Svga3VlknStatus flushSt = m_backend->flushCommandBuffer();
-
     if (!usingPersistentStaging) {
+        /* Temporary buffer: must complete before it can be destroyed. */
+        Svga3VlknStatus flushSt = m_backend->flushCommandBuffer();
         m_backend->destroyBuffer(stagingBuf, stagingMem);
+        return flushSt;
     }
-    return flushSt;
+    /* Persistent staging: leave the copy unflushed. The next reader (present,
+     * blit readback, guest readback, SVGA_CMD_FENCE) or a bump-overflow flush
+     * submits it in order, so pixel order is unchanged. */
+    return SVGA3_VLKN_SUCCESS;
 }
 
 Svga3VlknStatus VlknSurface::dmaDownloadToStaging(uint32_t mipLevel,
@@ -1098,6 +1124,17 @@ Svga3VlknStatus VlknSurface::dmaDownloadToStaging(uint32_t mipLevel,
 
     std::unique_lock<std::mutex> lock(m_backend->stagingMutex());
 
+    /* Bump-allocate the download range. This is a reader: the flush below
+     * submits any pending uploads first, in order, then this copy. */
+    VkDeviceSize stagingOffset = m_backend->stagingAlloc(totalBytes);
+    if (stagingOffset == VlknBackend::kStagingAllocFailed) {
+        Svga3VlknStatus fst = m_backend->flushCommandBuffer();
+        if (fst != SVGA3_VLKN_SUCCESS) return fst;
+        stagingOffset = m_backend->stagingAlloc(totalBytes);
+        if (stagingOffset == VlknBackend::kStagingAllocFailed)
+            return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+    }
+
     VkCommandBuffer cb = m_backend->getActiveCommandBuffer();
 
     /* Transition image to TRANSFER_SRC_OPTIMAL */
@@ -1123,7 +1160,7 @@ Svga3VlknStatus VlknSurface::dmaDownloadToStaging(uint32_t mipLevel,
     );
 
     VkBufferImageCopy region = {};
-    region.bufferOffset = 0;
+    region.bufferOffset = stagingOffset;
     region.bufferRowLength = 0;
     region.bufferImageHeight = 0;
     region.imageSubresource.aspectMask = m_isDepthStencil ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1169,7 +1206,7 @@ Svga3VlknStatus VlknSurface::dmaDownloadToStaging(uint32_t mipLevel,
         return flushSt;
     }
 
-    *outMappedData = m_backend->stagingMapped();
+    *outMappedData = m_backend->stagingMappedAt(stagingOffset);
     *outRowPitch = copyRowBytes;
     outLock = std::move(lock);
 

@@ -5,6 +5,51 @@
 #include <vector>
 #define DST(t, n) (0x800f0000u | (((t) & 7) << 28) | (((t) & 24) << 8) | (n))
 #define SRC(t, n) (0x80e40000u | (((t) & 7) << 28) | (((t) & 24) << 8) | (n))
+static bool staging_wrap_regression() {
+  Svga3VlknConfig cfg{};
+  cfg.apiVersion = VK_API_VERSION_1_1;
+  cfg.enableValidationLayers = true;
+  cfg.stagingBufferSize = 128;
+  auto *d = svga3_vlkn_device_create(&cfg);
+  if (!d) return false;
+  bool ok = svga3_vlkn_context_create(d, 1) == SVGA3_VLKN_SUCCESS;
+  SVGA3dSize size{4, 4, 1};
+  for (unsigned sid = 1; sid <= 3; ++sid)
+    ok &= svga3_vlkn_surface_define(d, sid, SVGA3D_SURFACE_HINT_TEXTURE,
+                                   SVGA3D_A8R8G8B8, &size, 1) == SVGA3_VLKN_SUCCESS;
+  // Two uploads fill the arena; the third must retire them before reusing it.
+  for (unsigned sid = 1; sid <= 3; ++sid) {
+    uint32_t pixels[16];
+    for (auto &pixel : pixels) pixel = 0xff000000u | sid * 0x123456u;
+    ok &= svga3_vlkn_surface_dma_upload(d, sid, 0, nullptr, pixels, 16) == SVGA3_VLKN_SUCCESS;
+    ok &= d->backend->recordingSerial() > d->backend->completedSubmissionSerial();
+  }
+  for (unsigned sid = 1; sid <= 3; ++sid) {
+    uint32_t pixels[16]{};
+    ok &= svga3_vlkn_surface_dma_download(d, sid, 0, nullptr, pixels, 16) == SVGA3_VLKN_SUCCESS;
+    for (auto pixel : pixels) ok &= pixel == (0xff000000u | sid * 0x123456u);
+  }
+  // Initialization must preserve queued texture data even when no arena space remains.
+  for (unsigned sid = 1; sid <= 2; ++sid) {
+    uint32_t pixels[16];
+    for (auto &pixel : pixels) pixel = 0xffabcdefu + sid;
+    ok &= svga3_vlkn_surface_dma_upload(d, sid, 0, nullptr, pixels, 16) == SVGA3_VLKN_SUCCESS;
+  }
+  ok &= svga3_vlkn_context_create(d, 2) == SVGA3_VLKN_SUCCESS;
+  for (unsigned sid = 1; sid <= 2; ++sid) {
+    uint32_t pixels[16]{};
+    ok &= svga3_vlkn_surface_dma_download(d, sid, 0, nullptr, pixels, 16) == SVGA3_VLKN_SUCCESS;
+    for (auto pixel : pixels) ok &= pixel == 0xffabcdefu + sid;
+  }
+  d->contextMgr->clear();
+  d->surfaceMgr->clear();
+  ok &= d->backend->waitIdle() == SVGA3_VLKN_SUCCESS;
+  d->backend->shutdown();
+  ok &= d->backend->validationErrors() == 0 && d->backend->validationWarnings() == 0;
+  svga3_vlkn_device_destroy(d);
+  printf("staging wrap and context initialization: %s\n", ok ? "PASS" : "FAIL");
+  return ok;
+}
 int main() {
   Svga3VlknConfig cfg{};
   cfg.apiVersion = VK_API_VERSION_1_1;
@@ -409,5 +454,6 @@ int main() {
   correct &= d->backend->validationErrors() == 0 &&
              d->backend->validationWarnings() == 0;
   svga3_vlkn_device_destroy(d);
+  correct &= staging_wrap_regression();
   return correct ? 0 : 1;
 }
