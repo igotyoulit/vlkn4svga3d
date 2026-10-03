@@ -8,7 +8,7 @@ Experimental SVGA3D-to-Vulkan rendering library and QEMU integration prototype. 
 
 The renderer handles a subset of legacy D3D9-style commands and shaders. Shader, format and guest compatibility remain incomplete. DX context lifecycle bookkeeping is isolated from legacy contexts; DX rendering is unsupported and no DX capability is advertised.
 
-VM119 runs Debian with Mesa 22.3.6 and exposes OpenGL 2.1 through SVGA3D. The October 3 Piglit baseline found pixel failures and Intel GPU device loss; 30 of the 146 planned hardware cases never ran. The llvmpipe reference passed all 146. See [validation evidence](VALIDATION.md) for counts and limits.
+VM119 runs Debian with Mesa 22.3.6 and exposes OpenGL 2.1 through SVGA3D. The October 3 Piglit comparison attempted all 146 cases: SVGA passed 64, failed 70, skipped five and timed out seven; llvmpipe passed all 146. Five GPU hangs required VM recovery between cases. See [validation evidence](VALIDATION.md) for the method and limits.
 
 ## Build
 

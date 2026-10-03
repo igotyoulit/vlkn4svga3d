@@ -1,5 +1,35 @@
 # Validation
 
+## PR review and matched VM benchmarks — 2026-10-03
+
+Reviewed PRs #18, #22, #23, #24 and #25 on the combined source. Fixed staging-wrap command ordering and context initialization, corrected VMware DX opcodes and isolated context bookkeeping, tested copied host-adapter tables and RAM boundaries, removed stale QEMU members from the core archive, and tested the explicit preload build fence. DX rendering remains unsupported.
+
+A fresh combined build passed all 14 host harness suites on lavapipe with SPIRV-Tools, `make test` (including 3,635 mock assertions), and all seven Piglit reporting tests. The final release adapter matched the binary installed in VM119: `9270408e8e3cf467481a6163652ebde3ca6d70ed11376a98b4d8c69a4bbcc46e`.
+
+Matched glmark2 checks used an 800×600 window, `vblank_mode=0`, a 0.5-second warmup per scene, and three runs with one-second scenes. The baseline scores were 549/556/556; final scores were 558/556/555. Both medians were **556**. Each validation run reported 27 successes and six unknown results; terrain lacked vertex texture fetch support. These short runs show no measured performance regression, but unknown results are not pixel correctness passes and this is not a sustained-load benchmark.
+
+Build, test and benchmark logs are in `artifacts/pr-review-20261003/`, including `final-harness.log`, `final-mock.log`, `final-python.log` and `vm-bench/`. These artifacts are excluded from Git.
+
+## Final isolated Piglit comparison — 2026-10-03
+
+The combined renderer was tested against the same 146-case quick-profile selection, GLX backend and 60-second per-case timeout as the baseline below. The guest package versions stayed unchanged. The installed renderer hash matched the release adapter above throughout all six execution epochs. Each hardware case ran in a separate Piglit invocation followed by a small glmark2 health probe unless a new kernel GPU hang had already been detected. A lost device triggered VM recovery before the next case.
+
+| Outcome | SVGA3D | Guest llvmpipe |
+| --- | ---: | ---: |
+| Pass | 64 | 146 |
+| Fail | 70 | 0 |
+| Skip | 5 | 0 |
+| Timeout | 7 | 0 |
+| Not run | 0 | 0 |
+
+These are top-level cases. The llvmpipe reference also reported 309 passing subtests. All 53 cases that passed in the earlier baseline still passed. The first 112 hardware outcomes matched that baseline; newly reached cases expose additional failures and are not evidence of new regressions.
+
+Five cases reproduced kernel i915 GPU hangs and required VM recovery: `fbo-alphatest-formats`, `fbo-blending-formats`, `fbo-colormask-formats`, `copyteximage 2d` and `texsubimage`. The other two timeouts were cube mip-level selection checks whose subsequent health probes passed. Hardware correctness and graphics stability remain incomplete. Separate invocations and recovery epochs allow independent coverage of the whole plan; they do not establish continuous-run stability.
+
+The evidence coordinator initially stopped after recovery because the guest cleared its temporary directory on reboot. It was corrected to recreate that directory and resume from preserved local results. The manifest retains this interruption; completed raw Piglit results were not rewritten or rerun.
+
+Evidence is in `artifacts/pr-review-20261003/piglit-final-isolated/` (filterable HTML report, exact plan, raw per-case results, health probes, renderer identity and kernel logs) and `piglit-final-reference/` (complete llvmpipe reference). VM119 was left running with graphics health restored; Minecraft remained closed after its world was saved.
+
 ## Piglit guest baseline — 2026-10-03
 
 Added `make test-piglit`, an SSH/local runner, JSON/HTML evidence, and CI checks for outcome reporting. Seven reporting tests passed. A live interruption check confirmed that an interrupted SVGA run still attempts the llvmpipe reference, retains incomplete results, and exits unsuccessfully.
