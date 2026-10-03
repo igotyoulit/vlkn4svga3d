@@ -282,6 +282,45 @@ int main() {
     uint32_t untouchedPixel = *reinterpret_cast<const uint32_t*>(g_framebuffer.data());
     TEST_CHECK(untouchedPixel == 0x00, "Untouched framebuffer pixels outside blit area remained untouched");
 
+    /* 7b. Test Framebuffer Scanout Offset and GMR Aperture Isolation */
+    std::cout << "\n--- Subtest 6b: Framebuffer Scanout Offset and GMR Aperture Isolation ---" << std::endl;
+    const uint32_t SCANOUT_OFFSET = 1024 * 1024; /* 1 MB offset */
+    g_framebuffer.resize(FB_SIZE + SCANOUT_OFFSET);
+    st = svga3_vlkn_device_set_framebuffer(dev, g_framebuffer.data(), FB_BASE_GPA, g_framebuffer.size(), FB_WIDTH, FB_HEIGHT, FB_PITCH, FB_BPP);
+    TEST_CHECK(st == SVGA3_VLKN_SUCCESS, "Register full VRAM extent including scanout offset");
+    TEST_CHECK(svga3_vlkn_device_set_scanout_offset(dev, g_framebuffer.size()) == SVGA3_VLKN_ERROR_INVALID_PARAM, "Reject scanout at end of VRAM");
+    TEST_CHECK(svga3_vlkn_device_set_scanout_offset(dev, SCANOUT_OFFSET + 1) == SVGA3_VLKN_ERROR_INVALID_PARAM, "Reject incomplete scanout footprint");
+    TEST_CHECK(dev->guestMem->getFramebuffer().scanoutOffset == 0, "Rejected scanout does not mutate registration");
+    st = svga3_vlkn_device_set_scanout_offset(dev, SCANOUT_OFFSET);
+    TEST_CHECK(st == SVGA3_VLKN_SUCCESS, "Set scanout offset to 1MB");
+
+    /* Test that GMR SVGA_GMR_FRAMEBUFFER (4294967294) reads from hva + offset, NOT shifted by scanoutOffset */
+    uint32_t magicVal = 0x12345678;
+    *reinterpret_cast<uint32_t*>(g_framebuffer.data() + 256) = magicVal;
+    *reinterpret_cast<uint32_t*>(g_framebuffer.data() + SCANOUT_OFFSET + 256) = 0x99999999;
+
+    SVGAGuestPtr gmrFbPtr = {};
+    gmrFbPtr.gmrId = SVGA_GMR_FRAMEBUFFER;
+    gmrFbPtr.offset = 256;
+    uint32_t readBackVal = 0;
+    st = dev->guestMem->readGuest(gmrFbPtr, &readBackVal, sizeof(readBackVal));
+    TEST_CHECK(st == SVGA3_VLKN_SUCCESS && readBackVal == magicVal,
+               "GMR_FRAMEBUFFER reads from VRAM base independent of scanoutOffset");
+
+    /* Clear framebuffer to verify fresh present writes */
+    std::fill(g_framebuffer.begin(), g_framebuffer.end(), 0x00);
+    st = dev->surfaceMgr->present(SID_TEX, &presRect, 1, dev->guestMem.get());
+    TEST_CHECK(st == SVGA3_VLKN_SUCCESS, "Execute present() with active scanoutOffset");
+
+    uint32_t scanoutPixel = *reinterpret_cast<const uint32_t*>(g_framebuffer.data() + SCANOUT_OFFSET + (150 + 10) * FB_PITCH + (100 + 10) * FB_BPP);
+    uint32_t mirroredPixel = *reinterpret_cast<const uint32_t*>(g_framebuffer.data() + (150 + 10) * FB_PITCH + (100 + 10) * FB_BPP);
+    uint32_t expectedPixel = testPixels[10 * 64 + 10];
+    TEST_CHECK(scanoutPixel == expectedPixel, "Scanout region (hva + scanoutOffset) updated by present()");
+    TEST_CHECK(mirroredPixel == 0, "Present does not overwrite unowned VRAM at offset zero");
+
+    /* Reset scanout offset */
+    svga3_vlkn_device_set_scanout_offset(dev, 0);
+
     /* 8. Test FIFO Integration with GMR Commands */
     std::cout << "\n--- Subtest 7: FIFO Command Stream Execution with GMR Commands ---" << std::endl;
     /*
@@ -407,7 +446,7 @@ int main() {
     std::cout << "  [PASS] Device and all memory resources cleaned up successfully" << std::endl;
 
     std::cout << "\n======================================================================" << std::endl;
-    std::cout << "DELIVERABLE 3 ACCEPTANCE SUITE: ALL TESTS PASSED SUCCESSFULLY!" << std::endl;
+    std::cout << "DELIVERABLE 3 ACCEPTANCE SUITE: ALL TESTS PASSED" << std::endl;
     std::cout << "======================================================================" << std::endl;
 
     return 0;

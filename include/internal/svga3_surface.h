@@ -63,8 +63,11 @@ public:
 
     VkBuffer buffer() const { return m_buffer; }
     VkDeviceMemory bufferMemory() const { return m_bufferMemory; }
+    void* bufferMapped() const { return m_bufferMapped; }
     size_t bufferSize() const { return m_bufferSize; }
     Svga3VlknStatus ensureBufferSize(size_t requiredSize);
+    uint64_t lastBoundDrawSerial() const { return m_lastBoundDrawSerial; }
+    void markBoundForDraw(uint64_t serial) { m_lastBoundDrawSerial = serial; }
 
     uint32_t width() const { return m_width; }
     uint32_t height() const { return m_height; }
@@ -148,12 +151,17 @@ private:
     VkImage m_image;
     VkDeviceMemory m_memory;
     VkImageView m_imageView;
+    /* Earlier sampled views remain valid for queued draws and cached
+     * descriptors. Expansion is monotonic, so this is bounded by mip count. */
+    std::vector<VkImageView> m_previousSampledViews;
     uint32_t m_viewMipLevels;
     VkImageLayout m_currentLayout;
 
     VkBuffer m_buffer;
     VkDeviceMemory m_bufferMemory;
+    void *m_bufferMapped = nullptr;
     size_t m_bufferSize;
+    uint64_t m_lastBoundDrawSerial = 0;
 
     bool m_readbackValid;
     uint32_t m_readbackW;
@@ -239,6 +247,7 @@ public:
     Svga3VlknStatus setSurfaceActive(uint32_t sid, bool active);
 
     void setContextManager(VlknContextManager *ctxMgr) { m_contextMgr = ctxMgr; }
+
 
     size_t count() const;
 

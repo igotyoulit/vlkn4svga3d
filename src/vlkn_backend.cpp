@@ -38,7 +38,9 @@ VlknBackend::VlknBackend()
     , m_cmdBuffer(VK_NULL_HANDLE)
     , m_cmdBufferRecording(false)
     , m_cmdBufferPending(false)
+    , m_renderPassActive(false)
     , m_completedSubmissionSerial(0)
+    , m_recordingSerial(0)
     , m_descriptorPool(VK_NULL_HANDLE)
     , m_debugMessenger(VK_NULL_HANDLE)
     , m_validationErrors(0)
@@ -47,6 +49,7 @@ VlknBackend::VlknBackend()
     , m_stagingMemory(VK_NULL_HANDLE)
     , m_stagingMapped(nullptr)
     , m_stagingSize(0)
+    , m_stagingBump(0)
     , m_fallbackBuffer(VK_NULL_HANDLE)
     , m_fallbackMemory(VK_NULL_HANDLE)
     , m_fallbackSize(0)
@@ -101,6 +104,7 @@ Svga3VlknStatus VlknBackend::init(const Svga3VlknConfig *config) {
 
 void VlknBackend::shutdown() {
     waitIdle();
+    cleanupRetiredBuffers(true);
 
     for (auto &rp : m_renderPasses) {
         if (rp.renderPass) {
@@ -170,8 +174,9 @@ Svga3VlknStatus VlknBackend::waitIdle() {
             return SVGA3_VLKN_ERROR_DEVICE_LOST;
         }
         if (m_cmdBufferPending) {
-            ++m_completedSubmissionSerial;
+            m_completedSubmissionSerial = m_recordingSerial;
             m_cmdBufferPending = false;
+            cleanupRetiredBuffers(false);
             if (m_cmdBuffer && m_dispatch.vkResetCommandBuffer) {
                 res = m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
                 if (res != VK_SUCCESS) {
@@ -405,13 +410,13 @@ Svga3VlknStatus VlknBackend::initDevice(const Svga3VlknConfig *config) {
 
     /* Create Descriptor Pool for shader uniform buffers and texture samplers */
     VkDescriptorPoolSize poolSizes[] = {
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1024 },
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2048 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024 * 8 }
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4096 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 8192 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096 * 8 }
     };
     VkDescriptorPoolCreateInfo descPoolInfo = {};
     descPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    descPoolInfo.maxSets = 1024;
+    descPoolInfo.maxSets = 4096;
     descPoolInfo.poolSizeCount = 3;
     descPoolInfo.pPoolSizes = poolSizes;
     descPoolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -562,6 +567,24 @@ Svga3VlknStatus VlknBackend::initFallbackBuffer(size_t size) {
     return SVGA3_VLKN_SUCCESS;
 }
 
+VkDeviceSize VlknBackend::stagingAlloc(VkDeviceSize size) {
+    /* Caller holds m_stagingMutex. */
+    if (!m_stagingBuffer || !m_stagingMapped || size > m_stagingSize) {
+        return kStagingAllocFailed;
+    }
+    /* optimalBufferCopyOffsetAlignment is a power of two; 16 covers the
+     * largest texel block, so the offset is valid for buffer and image
+     * copies alike. */
+    VkDeviceSize align = m_props.limits.optimalBufferCopyOffsetAlignment;
+    if (align < 16) align = 16;
+    VkDeviceSize offset = (m_stagingBump + align - 1) & ~(align - 1);
+    if (offset > m_stagingSize || m_stagingSize - offset < size) {
+        return kStagingAllocFailed;
+    }
+    m_stagingBump = offset + size;
+    return offset;
+}
+
 Svga3VlknStatus VlknBackend::uploadToBuffer(VkBuffer dstBuffer, VkDeviceSize dstOffset, const void *srcData, VkDeviceSize size) {
     std::lock_guard<std::mutex> lock(m_stagingMutex);
     if (size > m_stagingSize) {
@@ -595,11 +618,19 @@ Svga3VlknStatus VlknBackend::uploadToBuffer(VkBuffer dstBuffer, VkDeviceSize dst
         return flushSt;
     }
 
-    memcpy(m_stagingMapped, srcData, (size_t)size);
+    /* Bump-allocate so a pending unflushed range is never clobbered. */
+    VkDeviceSize stagingOffset = stagingAlloc(size);
+    if (stagingOffset == kStagingAllocFailed) {
+        Svga3VlknStatus fst = flushCommandBuffer();
+        if (fst != SVGA3_VLKN_SUCCESS) return fst;
+        stagingOffset = stagingAlloc(size);
+        if (stagingOffset == kStagingAllocFailed) return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+    }
+    memcpy(stagingMappedAt(stagingOffset), srcData, (size_t)size);
 
     VkCommandBuffer cb = getActiveCommandBuffer();
     VkBufferCopy region = {};
-    region.srcOffset = 0;
+    region.srcOffset = stagingOffset;
     region.dstOffset = dstOffset;
     region.size = size;
     m_dispatch.vkCmdCopyBuffer(cb, m_stagingBuffer, dstBuffer, 1, &region);
@@ -643,17 +674,27 @@ Svga3VlknStatus VlknBackend::downloadFromBuffer(void *dstData, VkBuffer srcBuffe
         return SVGA3_VLKN_SUCCESS;
     }
 
+    /* Bump-allocate so a pending unflushed range is never clobbered. This
+     * is a reader: the flush below also drains any pending uploads first. */
+    VkDeviceSize stagingOffset = stagingAlloc(size);
+    if (stagingOffset == kStagingAllocFailed) {
+        Svga3VlknStatus fst = flushCommandBuffer();
+        if (fst != SVGA3_VLKN_SUCCESS) return fst;
+        stagingOffset = stagingAlloc(size);
+        if (stagingOffset == kStagingAllocFailed) return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+    }
+
     VkCommandBuffer cb = getActiveCommandBuffer();
     VkBufferCopy region = {};
     region.srcOffset = srcOffset;
-    region.dstOffset = 0;
+    region.dstOffset = stagingOffset;
     region.size = size;
 
     m_dispatch.vkCmdCopyBuffer(cb, srcBuffer, m_stagingBuffer, 1, &region);
     Svga3VlknStatus st = flushCommandBuffer();
     if (st != SVGA3_VLKN_SUCCESS) return st;
 
-    memcpy(dstData, m_stagingMapped, (size_t)size);
+    memcpy(dstData, stagingMappedAt(stagingOffset), (size_t)size);
     return SVGA3_VLKN_SUCCESS;
 }
 
@@ -664,8 +705,60 @@ VkCommandBuffer VlknBackend::getActiveCommandBuffer() {
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         m_dispatch.vkBeginCommandBuffer(m_cmdBuffer, &beginInfo);
         m_cmdBufferRecording = true;
+        ++m_recordingSerial;
     }
     return m_cmdBuffer;
+}
+
+void VlknBackend::retireBuffer(VkBuffer buffer, VkDeviceMemory memory, void *mapped, uint64_t serial, size_t budgetBytes) {
+    if (buffer == VK_NULL_HANDLE && memory == VK_NULL_HANDLE) return;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_retiredBuffers.push_back({buffer, memory, mapped, serial, budgetBytes});
+}
+
+void VlknBackend::cleanupRetiredBuffers(bool forceAll) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto it = m_retiredBuffers.begin(); it != m_retiredBuffers.end(); ) {
+        if (forceAll || it->serial <= m_completedSubmissionSerial) {
+            if (it->mapped && it->memory && m_dispatch.vkUnmapMemory) {
+                m_dispatch.vkUnmapMemory(m_device, it->memory);
+            }
+            if (it->buffer && m_dispatch.vkDestroyBuffer) {
+                m_dispatch.vkDestroyBuffer(m_device, it->buffer, nullptr);
+            }
+            if (it->memory && m_dispatch.vkFreeMemory) {
+                m_dispatch.vkFreeMemory(m_device, it->memory, nullptr);
+            }
+            m_budgets.releaseSurfaceBytes(it->budgetBytes);
+            it = m_retiredBuffers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void VlknBackend::cmdBeginRenderPass(VkCommandBuffer cb, const VkRenderPassBeginInfo *pBegin, VkSubpassContents contents) {
+    if (m_renderPassActive) {
+        log_msg("[libqemu_svga3d] WARNING: cmdBeginRenderPass called while render pass active; ending previous\n");
+        m_dispatch.vkCmdEndRenderPass(cb);
+        m_renderPassActive = false;
+    }
+    m_dispatch.vkCmdBeginRenderPass(cb, pBegin, contents);
+    m_renderPassActive = true;
+}
+
+void VlknBackend::cmdEndRenderPass(VkCommandBuffer cb) {
+    if (!m_renderPassActive) {
+        log_msg("[libqemu_svga3d] WARNING: cmdEndRenderPass called while NO render pass active; skipping to prevent crash\n");
+        return;
+    }
+    if (!m_cmdBufferRecording) {
+        log_msg("[libqemu_svga3d] WARNING: cmdEndRenderPass called while command buffer not recording; skipping\n");
+        m_renderPassActive = false;
+        return;
+    }
+    m_dispatch.vkCmdEndRenderPass(cb);
+    m_renderPassActive = false;
 }
 
 Svga3VlknStatus VlknBackend::flushCommandBuffer() {
@@ -674,9 +767,15 @@ Svga3VlknStatus VlknBackend::flushCommandBuffer() {
     if (m_cmdBufferPending) {
         Svga3VlknStatus idleStatus = waitIdle();
         if (idleStatus != SVGA3_VLKN_SUCCESS) return idleStatus;
+        /* Device is idle: no recorded staging range is still in flight. */
+        m_stagingBump = 0;
     }
     if (!m_cmdBufferRecording) return SVGA3_VLKN_SUCCESS;
 
+    /* Hook runs without the flush holding any backend lock, but transfer
+     * callers may hold m_stagingMutex (non-recursive) across this whole
+     * function — see the threading contract in vlkn_backend.h. The hook
+     * must not call transfer APIs. */
     if (m_preFlushHook) {
         auto hook = m_preFlushHook;
         m_preFlushHook = nullptr;
@@ -685,10 +784,16 @@ Svga3VlknStatus VlknBackend::flushCommandBuffer() {
         if (!m_cmdBufferRecording) return SVGA3_VLKN_SUCCESS;
     }
 
+    if (m_renderPassActive) {
+        m_dispatch.vkCmdEndRenderPass(m_cmdBuffer);
+        m_renderPassActive = false;
+    }
+
     VkResult res = m_dispatch.vkEndCommandBuffer(m_cmdBuffer);
     if (res != VK_SUCCESS) {
         log_msg("[libqemu_svga3d] vkEndCommandBuffer error: %d\n", res);
         m_cmdBufferRecording = false;
+        m_renderPassActive = false;
         VkResult resetRes = m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
         if (resetRes != VK_SUCCESS)
             log_msg("[libqemu_svga3d] vkResetCommandBuffer error after end failure: %d\n", resetRes);
@@ -717,8 +822,11 @@ Svga3VlknStatus VlknBackend::flushCommandBuffer() {
          * establishes completion; resetting it here would race the GPU. */
         return SVGA3_VLKN_ERROR_DEVICE_LOST;
     }
-    ++m_completedSubmissionSerial;
+    m_completedSubmissionSerial = m_recordingSerial;
     m_cmdBufferPending = false;
+    /* The wait above retired every recorded staging range. */
+    m_stagingBump = 0;
+    cleanupRetiredBuffers(false);
     res = m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
     if (res != VK_SUCCESS) {
         log_msg("[libqemu_svga3d] vkResetCommandBuffer error: %d\n", res);

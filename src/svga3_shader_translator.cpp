@@ -171,11 +171,13 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                                             std::vector<uint32_t> &outSpirv,
                                             std::string &outError,
                                             uint32_t *outInputMask,
-                                            uint32_t depthSamplerMask)
+                                            uint32_t depthSamplerMask,
+                                            bool *outHasBytecodeKill)
 {
     outSpirv.clear();
     outError.clear();
     if (outInputMask) *outInputMask = 0;
+    if (outHasBytecodeKill) *outHasBytecodeKill = false;
 
     /* Debug: dump D3D9 input alongside SPIR-V when SVGA3_VLKN_DUMP_SPIRV is set. */
     if (getenv("SVGA3_VLKN_DUMP_SPIRV")) {
@@ -657,6 +659,10 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     /* MISCTYPE sources: vPos -> BuiltIn FragCoord, vFace -> FrontFacing. */
     uint32_t psInFragCoord = 0;
     uint32_t psInFrontFacing = 0;
+    uint32_t specAlphaTestEnable = 0;
+    uint32_t specAlphaFunc = 0;
+    uint32_t specAlphaRef = 0;
+    uint32_t const_u[8] = { 0 };
 
     /* Samplers. depthSamplerMask bit N means stage N is a depth texture. */
     uint32_t samplerVars[8] = { 0 };
@@ -725,6 +731,10 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
         for (int i = 0; i < 8; ++i) {
             samplerVars[i] = b.allocId();
         }
+
+        specAlphaTestEnable = b.allocId();
+        specAlphaFunc = b.allocId();
+        specAlphaRef = b.allocId();
     }
 
     /* EntryPoint */
@@ -779,6 +789,10 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
             b.emitInst(b.annotations, SpvOpDecorate, { samplerVars[i], SpvDecorationDescriptorSet, 0 });
             b.emitInst(b.annotations, SpvOpDecorate, { samplerVars[i], SpvDecorationBinding, (uint32_t)(2 + i) });
         }
+
+        b.emitInst(b.annotations, SpvOpDecorate, { specAlphaTestEnable, SpvDecorationSpecId, 0 });
+        b.emitInst(b.annotations, SpvOpDecorate, { specAlphaFunc, SpvDecorationSpecId, 1 });
+        b.emitInst(b.annotations, SpvOpDecorate, { specAlphaRef, SpvDecorationSpecId, 2 });
     }
 
     /* UBO Block Decoration */
@@ -836,6 +850,17 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
     for (uint32_t i = 0; i < 4; ++i) {
         intConsts[i] = b.allocId();
         b.emitInst(b.typesConstantsGlobals, SpvOpConstant, { typeInt, intConsts[i], i });
+    }
+
+    if (!isVS) {
+        for (uint32_t i = 0; i < 8; ++i) {
+            const_u[i] = b.allocId();
+            b.emitInst(b.typesConstantsGlobals, SpvOpConstant, { typeUInt, const_u[i], i });
+        }
+        b.emitInst(b.typesConstantsGlobals, SpvOpSpecConstant, { typeUInt, specAlphaTestEnable, 0 });
+        b.emitInst(b.typesConstantsGlobals, SpvOpSpecConstant, { typeUInt, specAlphaFunc, 8 }); // default ALWAYS
+        f2u.f = 0.0f;
+        b.emitInst(b.typesConstantsGlobals, SpvOpSpecConstant, { typeFloat, specAlphaRef, f2u.u }); // default 0.0f
     }
 
     /* UBO Type: vec4 c[256] */
@@ -1654,6 +1679,7 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
                 break;
             }
             case D3DSIO_TEXKILL: {
+                if (outHasBytecodeKill) *outHasBytecodeKill = true;
                 ParsedDest dst;
                 parseDest(tokens[pc + 1], dst);
                 if (isVS || major < 2 ||
@@ -2234,6 +2260,70 @@ Svga3VlknStatus svga3_translate_shader_d3d9(SVGA3dShaderType shaderType,
         /* Store out_color */
         uint32_t colVal = b.allocId();
         b.emitInst(b.functionDefinitions, SpvOpLoad, { typeV4Float, colVal, outColorVar[0] });
+
+        /* Fixed-function alpha test emulation via specialization constants */
+        uint32_t alphaVal = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpCompositeExtract, { typeFloat, alphaVal, colVal, 3 });
+
+        uint32_t cmpLess = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpFOrdLessThan, { typeBool, cmpLess, alphaVal, specAlphaRef });
+        uint32_t cmpEqual = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpFOrdEqual, { typeBool, cmpEqual, alphaVal, specAlphaRef });
+        uint32_t cmpGreater = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpFOrdGreaterThan, { typeBool, cmpGreater, alphaVal, specAlphaRef });
+        uint32_t cmpLessEqual = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpFOrdLessThanEqual, { typeBool, cmpLessEqual, alphaVal, specAlphaRef });
+        uint32_t cmpGreaterEqual = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpFOrdGreaterThanEqual, { typeBool, cmpGreaterEqual, alphaVal, specAlphaRef });
+        uint32_t cmpNotEqual = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpFOrdNotEqual, { typeBool, cmpNotEqual, alphaVal, specAlphaRef });
+
+        uint32_t isFunc1 = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpIEqual, { typeBool, isFunc1, specAlphaFunc, const_u[1] });
+        uint32_t isFunc2 = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpIEqual, { typeBool, isFunc2, specAlphaFunc, const_u[2] });
+        uint32_t isFunc3 = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpIEqual, { typeBool, isFunc3, specAlphaFunc, const_u[3] });
+        uint32_t isFunc4 = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpIEqual, { typeBool, isFunc4, specAlphaFunc, const_u[4] });
+        uint32_t isFunc5 = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpIEqual, { typeBool, isFunc5, specAlphaFunc, const_u[5] });
+        uint32_t isFunc6 = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpIEqual, { typeBool, isFunc6, specAlphaFunc, const_u[6] });
+        uint32_t isFunc7 = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpIEqual, { typeBool, isFunc7, specAlphaFunc, const_u[7] });
+
+        uint32_t pass7 = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpSelect, { typeBool, pass7, isFunc7, cmpGreaterEqual, constTrue_b });
+        uint32_t pass6 = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpSelect, { typeBool, pass6, isFunc6, cmpNotEqual, pass7 });
+        uint32_t pass5 = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpSelect, { typeBool, pass5, isFunc5, cmpGreater, pass6 });
+        uint32_t pass4 = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpSelect, { typeBool, pass4, isFunc4, cmpLessEqual, pass5 });
+        uint32_t pass3 = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpSelect, { typeBool, pass3, isFunc3, cmpEqual, pass4 });
+        uint32_t pass2 = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpSelect, { typeBool, pass2, isFunc2, cmpLess, pass3 });
+        uint32_t passVal = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpSelect, { typeBool, passVal, isFunc1, constFalse_b, pass2 });
+
+        uint32_t testFail = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpLogicalNot, { typeBool, testFail, passVal });
+
+        uint32_t isAlphaTestEnabled = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpINotEqual, { typeBool, isAlphaTestEnabled, specAlphaTestEnable, const_u[0] });
+
+        uint32_t doKill = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpLogicalAnd, { typeBool, doKill, isAlphaTestEnabled, testFail });
+
+        uint32_t killLabel = b.allocId(), mergeLabel = b.allocId();
+        b.emitInst(b.functionDefinitions, SpvOpSelectionMerge, { mergeLabel, 0 });
+        b.emitInst(b.functionDefinitions, SpvOpBranchConditional, { doKill, killLabel, mergeLabel });
+        b.emitInst(b.functionDefinitions, SpvOpLabel, { killLabel });
+        b.emitInst(b.functionDefinitions, SpvOpKill, {});
+        b.emitInst(b.functionDefinitions, SpvOpLabel, { mergeLabel });
+
         b.emitInst(b.functionDefinitions, SpvOpStore, { psOutColor, colVal });
     }
 

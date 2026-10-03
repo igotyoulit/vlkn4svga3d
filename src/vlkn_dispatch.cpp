@@ -664,6 +664,20 @@ static void VKAPI_CALL mock_vkCmdDrawIndexed(VkCommandBuffer commandBuffer, uint
     if (cb) cb->drawCount++;
 }
 
+static void VKAPI_CALL mock_vkCmdClearColorImage(VkCommandBuffer commandBuffer, VkImage image,
+    VkImageLayout layout, const VkClearColorValue *color, uint32_t count,
+    const VkImageSubresourceRange *ranges) {
+    (void)commandBuffer; (void)layout; (void)count; (void)ranges;
+    MockImage_T *img = (MockImage_T*)(uintptr_t)image;
+    if (img && !img->memory) g_mockUnboundImageUses++;
+    // Context fallback images are one RGBA8 texel; retain their clear in the mock.
+    if (img && img->memory && color && img->memorySize >= img->memoryOffset + 4) {
+        uint8_t *pixel = (uint8_t*)img->memory + img->memoryOffset;
+        for (unsigned i = 0; i < 4; ++i)
+            pixel[i] = (uint8_t)(std::max(0.0f, std::min(1.0f, color->float32[i])) * 255.0f);
+    }
+}
+
 static void VKAPI_CALL mock_vkCmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t count, const VkClearAttachment* pAttachments, uint32_t rectCount, const VkClearRect* pRects) {
     (void)count; (void)pAttachments; (void)rectCount; (void)pRects;
     MockCommandBuffer_T *cb = (MockCommandBuffer_T*)commandBuffer;
@@ -1027,6 +1041,7 @@ static void populate_mock_table(VlknDispatchTable *t) {
     t->vkCmdBindIndexBuffer = mock_vkCmdBindIndexBuffer;
     t->vkCmdDraw = mock_vkCmdDraw;
     t->vkCmdDrawIndexed = mock_vkCmdDrawIndexed;
+    t->vkCmdClearColorImage = mock_vkCmdClearColorImage;
     t->vkCmdClearAttachments = mock_vkCmdClearAttachments;
     t->vkCmdPipelineBarrier = mock_vkCmdPipelineBarrier;
     t->vkCmdCopyBuffer = mock_vkCmdCopyBuffer;
@@ -1190,6 +1205,7 @@ bool vlkn_dispatch_init_device(VlknDispatchTable *table, VkInstance instance, Vk
     LOAD_DEV(vkCmdBindIndexBuffer);
     LOAD_DEV(vkCmdDraw);
     LOAD_DEV(vkCmdDrawIndexed);
+    LOAD_DEV(vkCmdClearColorImage);
     LOAD_DEV(vkCmdClearAttachments);
     LOAD_DEV(vkCmdPipelineBarrier);
     LOAD_DEV(vkCmdCopyBuffer);

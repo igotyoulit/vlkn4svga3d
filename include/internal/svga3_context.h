@@ -58,6 +58,7 @@ struct Svga3Shader {
     VkShaderModule module;
     uint32_t inputLocationMask;
     bool hasFragmentSideEffects = true;
+    bool hasBytecodeKill = false;
     /* Pixel shaders are recompiled per depth-sampler mask. Bit N means stage N
      * was a depth texture when that variant was built. */
     std::unordered_map<uint32_t, VkShaderModule> depthVariants;
@@ -85,6 +86,17 @@ struct PipelineKey {
     uint32_t alphaBlendEq;
     uint32_t stencilEnable;
     uint32_t stencilFunc;
+    uint32_t stencilFail;
+    uint32_t stencilZFail;
+    uint32_t stencilPass;
+    uint32_t stencilRef;
+    uint32_t stencilMask;
+    uint32_t stencilWriteMask;
+    uint32_t stencil2Sided;
+    uint32_t ccwStencilFunc;
+    uint32_t ccwStencilFail;
+    uint32_t ccwStencilZFail;
+    uint32_t ccwStencilPass;
     uint32_t colorWriteMask;
     uint32_t numVertexDecls;
     VkRenderPass renderPass;
@@ -93,11 +105,17 @@ struct PipelineKey {
     uint32_t boundPS;
     uint32_t ffTextureStage0;
     uint32_t depthSamplerMask;
+    uint32_t alphaTestEnable;
+    uint32_t alphaFunc;
+    uint32_t alphaRef;
+    uint32_t _pad;
 
     bool operator==(const PipelineKey &other) const {
         return memcmp(this, &other, sizeof(PipelineKey)) == 0;
     }
 };
+
+static_assert(sizeof(PipelineKey) % sizeof(uint64_t) == 0, "PipelineKey size must be multiple of 8");
 
 struct PipelineKeyHasher {
     size_t operator()(const PipelineKey &k) const {
@@ -106,6 +124,36 @@ struct PipelineKeyHasher {
         for (size_t i = 0; i < sizeof(PipelineKey) / sizeof(uint64_t); ++i) {
             h = (h ^ ptr[i]) * 0x100000001b3ULL;
         }
+        return h;
+    }
+};
+
+struct FramebufferKey {
+    uint32_t colorSid;
+    uint32_t depthSid;
+    VkRenderPass renderPass;
+    VkImageView colorView;
+    VkImageView depthView;
+    uint32_t width;
+    uint32_t height;
+
+    bool operator==(const FramebufferKey &o) const {
+        return colorSid == o.colorSid && depthSid == o.depthSid &&
+               renderPass == o.renderPass &&
+               colorView == o.colorView &&
+               depthView == o.depthView &&
+               width == o.width &&
+               height == o.height;
+    }
+};
+
+struct FramebufferKeyHasher {
+    size_t operator()(const FramebufferKey &k) const {
+        size_t h = 0xcbf29ce484222325ULL;
+        h = (h ^ reinterpret_cast<uintptr_t>(k.renderPass)) * 0x100000001b3ULL;
+        h = (h ^ reinterpret_cast<uintptr_t>(k.colorView)) * 0x100000001b3ULL;
+        h = (h ^ reinterpret_cast<uintptr_t>(k.depthView)) * 0x100000001b3ULL;
+        h = (h ^ (static_cast<size_t>(k.width) | (static_cast<size_t>(k.height) << 32))) * 0x100000001b3ULL;
         return h;
     }
 };
@@ -286,6 +334,8 @@ private:
     VkFramebuffer m_activeFramebuffer;
     VkRenderPass m_activeRenderPass;
     bool m_inRenderPass;
+    uint64_t m_renderPassRecordingSerial;
+    std::unordered_map<FramebufferKey, VkFramebuffer, FramebufferKeyHasher> m_framebufferCache;
 
     /* Pipeline Cache */
     std::unordered_map<PipelineKey, VkPipeline, PipelineKeyHasher> m_pipelineCache;

@@ -12,12 +12,16 @@
 #include "svga3_guest_mem.h"
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 
 struct Svga3VlknDevice {
     std::unique_ptr<svga3_vlkn::VlknBackend> backend;
     std::unique_ptr<svga3_vlkn::VlknSurfaceManager> surfaceMgr;
     std::unique_ptr<svga3_vlkn::VlknContextManager> contextMgr;
     std::unique_ptr<svga3_vlkn::GuestMemoryManager> guestMem;
+
+    std::unordered_set<uint32_t> dxContexts;
+    size_t dxContextLimit = 256;
 
     Svga3VlknStats stats;
     std::mutex mutex;
@@ -37,7 +41,7 @@ Svga3VlknStatus processFifoPacket(Svga3VlknDevice *dev,
                                   size_t *bytesRead);
 
 /* Present rendered client window surfaces to framebuffer */
-void svga3_vlkn_present_client_surfaces(Svga3VlknDevice *dev, const char *reason);
+Svga3VlknStatus svga3_vlkn_present_client_surfaces(Svga3VlknDevice *dev, const char *reason);
 
 } // namespace svga3_vlkn
 

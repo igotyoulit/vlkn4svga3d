@@ -1453,7 +1453,7 @@ static void TestFenceWithoutWindow() {
             backend.getActiveCommandBuffer();
         }
         fenceSubmits = fenceWaits = 0;
-        svga3_vlkn::svga3_vlkn_present_client_surfaces(dev, "fence-regression");
+        svga3_vlkn::svga3_vlkn_present_client_surfaces(dev, "fence");
         TEST_CHECK(fenceSubmits == 1 && fenceWaits == 1,
                    "Fence submits and waits even with no pending window");
         backend.flushCommandBuffer();
@@ -1461,6 +1461,108 @@ static void TestFenceWithoutWindow() {
     }
     dispatch.vkQueueSubmit = savedQueueSubmit;
     dispatch.vkQueueWaitIdle = savedQueueWaitIdle;
+    svga3_vlkn_device_destroy(dev);
+}
+
+static VkResult VKAPI_CALL failRenameSubmit(VkQueue, uint32_t, const VkSubmitInfo *, VkFence) {
+    return VK_ERROR_DEVICE_LOST;
+}
+
+static PFN_vkDestroyFramebuffer savedDestroyFramebuffer;
+static unsigned destroyedFramebufferCount;
+static void VKAPI_CALL countDestroyFramebuffer(VkDevice device, VkFramebuffer fb, const VkAllocationCallbacks *alloc) {
+    ++destroyedFramebufferCount;
+    savedDestroyFramebuffer(device, fb, alloc);
+}
+static void TestRenderPassContextOwnership() {
+    Svga3VlknConfig cfg{}; cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    SVGA3dSize size{64,64,1};
+    TEST_CHECK(svga3_vlkn_surface_define(dev,92,SVGA3D_SURFACE_HINT_RENDERTARGET,
+        SVGA3D_A8R8G8B8,&size,1) == SVGA3_VLKN_SUCCESS, "Define ownership target");
+    for (uint32_t id : {1u,2u}) {
+        svga3_vlkn_context_create(dev,id);
+        dev->contextMgr->getContext(id)->setRenderTarget(SVGA3D_RT_COLOR0,92,0,0);
+    }
+    auto *ctx1=dev->contextMgr->getContext(1);
+    auto *ctx2=dev->contextMgr->getContext(2);
+    ctx1->clear(SVGA3D_CLEAR_COLOR,0xff123456,1,0,nullptr,0);
+    dev->contextMgr->endAllRenderPassesExcept(1);
+    TEST_CHECK(dev->backend->isRenderPassActive(), "Inactive context cannot close active context's pass");
+    dev->contextMgr->endAllRenderPassesExcept(2);
+    ctx2->clear(SVGA3D_CLEAR_COLOR,0xff654321,1,0,nullptr,0);
+    TEST_CHECK(dev->backend->flushCommandBuffer()==SVGA3_VLKN_SUCCESS, "Complete second context's pass");
+    ctx1->clear(SVGA3D_CLEAR_COLOR,0xffabcdef,1,0,nullptr,0);
+    dev->contextMgr->endAllRenderPassesExcept(1);
+    TEST_CHECK(dev->backend->isRenderPassActive(), "Stale context cannot close a newer recording's pass");
+    svga3_vlkn_device_destroy(dev);
+}
+
+static void TestFramebufferCacheLifetime() {
+    Svga3VlknConfig cfg{}; cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    SVGA3dSize size{64,64,1};
+    for (uint32_t id : {90u,91u}) {
+        TEST_CHECK(svga3_vlkn_surface_define(dev,id,SVGA3D_SURFACE_HINT_RENDERTARGET,
+            SVGA3D_A8R8G8B8,&size,1) == SVGA3_VLKN_SUCCESS, "Define cached framebuffer target");
+    }
+    svga3_vlkn_context_create(dev,1);
+    auto *ctx=dev->contextMgr->getContext(1);
+    ctx->setRenderTarget(SVGA3D_RT_COLOR0,90,0,0);
+    SVGA3dRect viewport{3,4,16,20}; ctx->setViewport(&viewport);
+    SVGA3dZRange z{0.2f,0.8f}; ctx->setZRange(&z);
+    TEST_CHECK(ctx->clear(SVGA3D_CLEAR_COLOR,0xff112233,1,0,nullptr,0)==SVGA3_VLKN_SUCCESS,
+        "Create first cached framebuffer");
+    ctx->setRenderTarget(SVGA3D_RT_COLOR0,91,0,0);
+    TEST_CHECK(ctx->getViewport().x==3 && ctx->getViewport().width==16 &&
+        ctx->getViewport().minDepth==0.2f && ctx->getViewport().maxDepth==0.8f,
+        "Target changes preserve explicit viewport and depth range");
+    TEST_CHECK(ctx->clear(SVGA3D_CLEAR_COLOR,0xff445566,1,0,nullptr,0)==SVGA3_VLKN_SUCCESS,
+        "Create second cached framebuffer");
+    auto &dispatch=dev->backend->dispatch(); savedDestroyFramebuffer=dispatch.vkDestroyFramebuffer;
+    dispatch.vkDestroyFramebuffer=countDestroyFramebuffer; destroyedFramebufferCount=0;
+    TEST_CHECK(svga3_vlkn_surface_destroy(dev,90)==SVGA3_VLKN_SUCCESS, "Destroy inactive cached target");
+    TEST_CHECK(destroyedFramebufferCount==1, "Retire inactive destroyed target without discarding unrelated framebuffer");
+    dispatch.vkDestroyFramebuffer=savedDestroyFramebuffer;
+    svga3_vlkn_device_destroy(dev);
+}
+
+static void TestBufferRenameBudgetAndFailure() {
+    Svga3VlknConfig cfg{}; cfg.forceMockBackend = true;
+    auto *dev = svga3_vlkn_device_create(&cfg);
+    SVGA3dSize size{64, 1, 1};
+    TEST_CHECK(svga3_vlkn_surface_define(dev, 77, SVGA3D_SURFACE_HINT_VERTEXBUFFER,
+        SVGA3D_BUFFER, &size, 1) == SVGA3_VLKN_SUCCESS, "Define rename regression buffer");
+    auto *surf = dev->surfaceMgr->getSurface(77);
+    auto &backend = *dev->backend;
+    auto &budgets = backend.resourceBudgets();
+    uint32_t oldValue = 0x11223344, newValue = 0x55667788;
+    SVGA3dBox box{0,0,0,4,1,1};
+    TEST_CHECK(surf->dmaUpload(0, &box, &oldValue, 4) == SVGA3_VLKN_SUCCESS, "Initialize rename regression bytes");
+    uint64_t originalBudget = budgets.surfaceBytes();
+    void *oldMapping = surf->bufferMapped();
+    backend.getActiveCommandBuffer();
+    surf->markBoundForDraw(backend.recordingSerial());
+    TEST_CHECK(surf->dmaUpload(0, &box, &newValue, 4) == SVGA3_VLKN_SUCCESS, "Rename queued buffer on update");
+    TEST_CHECK(*static_cast<uint32_t*>(oldMapping) == oldValue, "Recorded allocation retains original bytes");
+    TEST_CHECK(budgets.surfaceBytes() == originalBudget + surf->bufferSize(), "Budget charges retired duplicate allocation");
+    TEST_CHECK(backend.flushCommandBuffer() == SVGA3_VLKN_SUCCESS, "Complete renamed allocation references");
+    TEST_CHECK(budgets.surfaceBytes() == originalBudget, "Retirement releases duplicate budget");
+    budgets.setMaxForTesting(originalBudget, budgets.maxShaderBytecodeBytes(), budgets.maxShaderModules());
+    backend.getActiveCommandBuffer(); surf->markBoundForDraw(backend.recordingSerial());
+    auto savedSubmit = backend.dispatch().vkQueueSubmit;
+    backend.dispatch().vkQueueSubmit = failRenameSubmit;
+    TEST_CHECK(surf->dmaUpload(0, &box, &oldValue, 4) == SVGA3_VLKN_ERROR_DEVICE_LOST,
+        "Budget fallback propagates failed submission");
+    TEST_CHECK(*static_cast<uint32_t*>(surf->bufferMapped()) == newValue,
+        "Failed submission cannot overwrite referenced buffer bytes");
+    TEST_CHECK(budgets.surfaceBytes() == originalBudget, "Failed rename leaves budget unchanged");
+    backend.dispatch().vkQueueSubmit = savedSubmit;
+    backend.getActiveCommandBuffer();
+    backend.dispatch().vkQueueSubmit = failRenameSubmit;
+    TEST_CHECK(svga3_vlkn::svga3_vlkn_present_client_surfaces(dev, "fence") == SVGA3_VLKN_ERROR_DEVICE_LOST,
+        "Normal guest fence propagates submission failure");
+    backend.dispatch().vkQueueSubmit = savedSubmit;
     svga3_vlkn_device_destroy(dev);
 }
 
@@ -1543,9 +1645,14 @@ static void TestSurfaceTransfersPropagateFlushFailures() {
 
     std::vector<uint32_t> pixels(64 * 64, 0x11223344u);
     SVGA3dBox box = { 0, 0, 0, 64, 64, 1 };
+    /* Uploads now bump-allocate staging and defer the flush: the upload
+     * records successfully and the injected submit failure surfaces at the
+     * next flush (reader or explicit), not at upload time. */
     TEST_CHECK(svga3_vlkn_surface_dma_upload(dev, 9201, 0, &box, pixels.data(),
-                                            64 * sizeof(uint32_t)) != SVGA3_VLKN_SUCCESS,
-               "dma_upload propagates flush/submit failure");
+                                            64 * sizeof(uint32_t)) == SVGA3_VLKN_SUCCESS,
+               "dma_upload records without flushing (deferred)");
+    TEST_CHECK(dev->backend->flushCommandBuffer() != SVGA3_VLKN_SUCCESS,
+               "deferred flush propagates flush/submit failure");
 
     SVGA3dCopyBox cbox;
     cbox.x = 0; cbox.y = 0; cbox.z = 0;
@@ -2461,6 +2568,9 @@ int main() {
     std::cout << ANSI_YELLOW << "==================================================================" << ANSI_RESET << std::endl;
 
     TestFenceWithoutWindow();
+    TestBufferRenameBudgetAndFailure();
+    TestFramebufferCacheLifetime();
+    TestRenderPassContextOwnership();
     TestFlushPropagatesWaitFailures();
     TestSurfaceTransfersPropagateFlushFailures();
     TestRenderPassAndGrowthFlushFailuresPropagate();
@@ -2527,7 +2637,7 @@ int main() {
 
     std::cout << ANSI_YELLOW << "\n==================================================================" << ANSI_RESET << std::endl;
     if (g_testsFailed == 0) {
-        std::cout << ANSI_GREEN << " ALL " << g_testsPassed << " TESTS PASSED SUCCESSFULLY! (100% PASS RATE)" << ANSI_RESET << std::endl;
+        std::cout << ANSI_GREEN << " ALL " << g_testsPassed << " TESTS PASSED" << ANSI_RESET << std::endl;
         std::cout << ANSI_YELLOW << "==================================================================" << ANSI_RESET << std::endl;
         return 0;
     } else {

@@ -1,60 +1,46 @@
-<img src="docs/logo.svg" width="1200" alt="VLKN4SVGA3D">
+<p align="center">
+  <img src="assets/logo.jpg" alt="vlkn4svga3d logo" width="720">
+</p>
 
 # vlkn4svga3d
 
-Experimental SVGA3D to Vulkan library and QEMU integration prototype. Internal names still use `svga3_vlkn`.
+Experimental SVGA3D-to-Vulkan rendering library and QEMU integration prototype. Internal APIs still use `svga3_vlkn`.
 
-## Status
+The renderer handles a subset of legacy D3D9-style commands and shaders. Shader, format and guest compatibility remain incomplete. DX context lifecycle bookkeeping is isolated from legacy contexts; DX rendering is unsupported and no DX capability is advertised.
 
-Work in progress. This is not a finished virtual GPU. This is not a drop-in VMware replacement.
-
-## Lab adapter
-
-The preload adapter targets one allowlisted QEMU build. It checks instruction bytes before patching. A build-id mismatch exits with code 78 and logs the observed build-id. The adapter only arms inside `qemu-system*` processes. Never set global `LD_PRELOAD`. The tested lab VM runs QEMU as `qemu119` with guest graphics `svga3d`. The framebuffer address comes from the device register.
-
-Environment variables:
-
-- `SVGA3_VLKN_VALIDATE=1` forces validation layers on. `=0` forces them off. Otherwise debug builds validate and release (`NDEBUG`) builds do not. Layers load only if `VK_LAYER_KHRONOS_validation` is installed.
-- `SVGA3_VLKN_GUEST_PROFILE=playbook-portrait` enables portrait mode overrides.
-- `SVGA3_VLKN_LEGACY_CLIENT_PRESENT=1` enables the old application-context centering heuristic.
+VM119 runs Debian with Mesa 22.3.6 and exposes OpenGL 2.1 through SVGA3D. The October 3 Piglit baseline found pixel failures and Intel GPU device loss; 30 of the 146 planned hardware cases never ran. The llvmpipe reference passed all 146. See [validation evidence](VALIDATION.md) for counts and limits.
 
 ## Build
 
-Requires a C++17 compiler, GNU Make, binutils, pthreads, and libdl. Vulkan headers are bundled. Real rendering also needs the Vulkan loader, a working driver, and validation layers. Mesa lavapipe works for tests.
-
-Debian/Ubuntu example:
+Requires a C++17 compiler, GNU Make, binutils, pthreads and libdl. Vulkan headers are bundled. Real rendering needs the Vulkan loader and a working driver. Tests that request validation also need the validation layer. Mesa lavapipe works for host tests.
 
 ```sh
-sudo apt install build-essential libvulkan1 mesa-vulkan-drivers vulkan-tools vulkan-validationlayers
-```
-
-```sh
-git clone https://github.com/sukar0972/vlkn4svga3d.git
-cd vlkn4svga3d
+sudo apt install build-essential libvulkan1 mesa-vulkan-drivers vulkan-tools vulkan-validationlayers spirv-tools
 make -j4 all
 ```
 
-Outputs: `lib/libsvga3_vlkn.a`, `lib/libqemu_svga3d.so`, and test binaries under `bin/`. Public headers are `include/svga3_vlkn.h` and `include/qemu_vmsvga.h`. Link consumers with `-ldl -pthread`.
+Core consumers link `lib/libsvga3_vlkn.a` with `-ldl -pthread`. The QEMU device harness additionally links `lib/libsvga3_qemu_adapter.a` before the core archive. Public interfaces are in `include/svga3_vlkn.h` and `include/qemu_vmsvga.h`; internal headers are not a stable API.
+
+## QEMU lab adapter
+
+Build the binary-patch adapter explicitly with `make preload-lab`. It is excluded from `make all`. It targets one allowlisted QEMU build and checks instruction bytes before patching. A build-ID mismatch exits with code 78 before patching and logs the observed ID. Use it only for the designated VM; never configure global `LD_PRELOAD`.
+
+`SVGA3_VLKN_VALIDATE=1` requests validation and `=0` disables it. Without an override, debug builds request validation and release builds (`NDEBUG`) do not. Initialization fails when requested validation cannot be activated. `SVGA3_VLKN_GUEST_PROFILE=playbook-portrait` enables portrait overrides; `SVGA3_VLKN_LEGACY_CLIENT_PRESENT=1` enables the old client-centering heuristic. Guest-RAM discovery still uses a lab mapping heuristic. Official QEMU integration remains follow-up work.
+
+Host integrations register RAM map/read/write and display-update callbacks through `svga3_vlkn_device_set_host_adapter`, replacing the former callback setters. The core copies the table; its opaque host state must remain valid until detached or device destruction. Callbacks run under core locks and must not reenter device APIs. Rendering, presentation copies and fence completion stay in the core.
 
 ## Tests
 
 ```sh
-make test            # mock and reference checks only
-make acceptance      # broader suite; needs a Vulkan ICD and validation layers
-make harness-loop    # build and test loop; needs HARNESS_ICD pointing at a real ICD
+make test
+make harness-loop HARNESS_ICD=/usr/share/vulkan/icd.d/lvp_icd.json
+make test-piglit PIGLIT_ARGS="--ssh svga3d@10.0.0.144 --renderer compare --output artifacts/piglit-compare"
 ```
 
-`make test` does not prove correct GPU rendering. `make acceptance` stops on the first failure and writes evidence under `artifacts/`. `test-qemu` and `test_qemu_integration` do not boot a guest.
+`make test` checks the mock backend and reference harness. `make harness-loop` exercises the host Vulkan path. Piglit runs inside the guest and compares SVGA pixels with llvmpipe. Neither `test-qemu` nor `test_qemu_integration` boots a guest.
 
-## Tests on Ubuntu
-
-Publication checks ran on Ubuntu with g++ 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04.1), software Vulkan, on 2026-09-25. Logs are under `validation/`. See `VALIDATION.md`.
-
-- `make -j4 all` passed. Compiler warnings remain.
-- `make test` passed, including 3407 mock-engine assertions. The Oracle runner in the same log passed 1508 tests.
-- `make acceptance` passed on llvmpipe (LLVM 20.1.2, 256 bits), Vulkan API 1.4.318, with validation layers on and zero validation errors in the real-Vulkan check.
-- The acceptance log covers: real Vulkan device sanity, D3D9 bytecode to SPIR-V shader translation, guest memory (GMR2), verified rendering (8 deterministic scenes), presentation, and an isolated QEMU device harness (PCI, FIFO wrap, cold-boot reset in-process). The QEMU harness does not boot a guest.
+The [testing guide](docs/testing.md) covers dependencies, individual targets, suite coverage, repeated harness runs and Piglit result handling. [VALIDATION.md](VALIDATION.md) records measured results and their limits.
 
 ## Licensing
 
-VirtualBox-derived files carry GPL-2.0 notices. The license text is in `COPYING`. VMware protocol headers keep their permissive notices. Bundled Khronos headers keep their own licenses. No blanket license has been chosen for original project code yet. See `VALIDATION.md` for publication-time checks.
+VirtualBox-derived files carry GPL-2.0 notices; the license text is in [COPYING](COPYING). VMware protocol headers and bundled Khronos headers retain their own notices. No blanket license has been chosen for original project code.

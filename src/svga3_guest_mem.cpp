@@ -118,7 +118,8 @@ Svga3VlknStatus GuestMemoryManager::setFramebuffer(void *hva,
                                                   uint32_t width,
                                                   uint32_t height,
                                                   uint32_t pitch,
-                                                  uint32_t bpp)
+                                                  uint32_t bpp,
+                                                  uint32_t scanoutOffset)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     /* Validate before accepting: the blit/present paths do raw pointer
@@ -139,7 +140,7 @@ Svga3VlknStatus GuestMemoryManager::setFramebuffer(void *hva,
         return SVGA3_VLKN_ERROR_INVALID_PARAM;
     }
     uint64_t fbBytes = static_cast<uint64_t>(pitch) * height;
-    if (fbBytes > size) {
+    if (scanoutOffset >= size || fbBytes > (size - scanoutOffset)) {
         return SVGA3_VLKN_ERROR_INVALID_PARAM;
     }
     m_fb.hva = reinterpret_cast<uint8_t*>(hva);
@@ -149,6 +150,16 @@ Svga3VlknStatus GuestMemoryManager::setFramebuffer(void *hva,
     m_fb.height = height;
     m_fb.pitch = pitch;
     m_fb.bpp = bytesPerPixel;
+    m_fb.scanoutOffset = scanoutOffset;
+    return SVGA3_VLKN_SUCCESS;
+}
+
+Svga3VlknStatus GuestMemoryManager::setScanoutOffset(uint32_t offset) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const uint64_t footprint = uint64_t(m_fb.pitch) * m_fb.height;
+    if (!m_fb.hva || offset >= m_fb.size || footprint > m_fb.size - offset)
+        return SVGA3_VLKN_ERROR_INVALID_PARAM;
+    m_fb.scanoutOffset = offset;
     return SVGA3_VLKN_SUCCESS;
 }
 
