@@ -125,6 +125,7 @@ Svga3VlknDevice *svga3_vlkn_device_create(const Svga3VlknConfig *config)
         cfg.stagingBufferSize = 64 * 1024 * 1024;
     }
 
+    dev->dxContextLimit = cfg.maxContexts ? cfg.maxContexts : 256;
     Svga3VlknStatus st = dev->backend->init(&cfg);
     if (st != SVGA3_VLKN_SUCCESS) {
         return nullptr;
@@ -173,6 +174,7 @@ Svga3VlknStatus svga3_vlkn_device_reset(Svga3VlknDevice *dev)
         Svga3VlknStatus waitStatus = dev->backend->waitIdle();
         if (waitStatus != SVGA3_VLKN_SUCCESS) return waitStatus;
     }
+    dev->dxContexts.clear();
     if (dev->contextMgr) {
         dev->contextMgr->clear();
     }
