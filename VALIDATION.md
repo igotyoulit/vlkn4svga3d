@@ -1,5 +1,28 @@
 # Validation
 
+## Piglit guest baseline — 2026-10-03
+
+Added `make test-piglit`, an SSH/local runner, JSON/HTML evidence, and CI checks for outcome reporting. Seven reporting tests passed. A live interruption check confirmed that an interrupted SVGA run still attempts the llvmpipe reference, retains incomplete results, and exits unsuccessfully.
+
+The VM setup was recovered from T3 thread `13096e80-1a96-4c91-81d2-6975166246af`: Proxmox `10.0.0.200`, VM119, Debian guest `svga3d@10.0.0.144`, Xorg `:0`. The loaded host library hash was `373096a13e9ff1b03ef54b753970374ab79902b77e1abe789dadd320714fe1a5`. The guest used Mesa 22.3.6 and Debian Piglit `0~git20220119-124bca3c9-1`.
+
+Both paths used the same 146-case selection and 60-second per-test timeout. Counts below are top-level cases, not upstream subtest totals:
+
+| Outcome | SVGA3D | Guest llvmpipe |
+| --- | ---: | ---: |
+| Pass | 53 | 146 |
+| Fail | 54 | 0 |
+| Skip | 3 | 0 |
+| Timeout before device loss | 2 | 0 |
+| Timeout/incomplete after device loss | 4 | 0 |
+| Not run after interruption | 30 | 0 |
+
+**The accelerated run did not complete.** Before device loss, 112 cases completed with the first four outcomes above. Pixel/API failures include blending, stencil/scissor, framebuffer, and mip-selection checks. Three skips reflect capability differences and are not correctness passes. Subsequent timeouts cannot be treated as independent rendering failures.
+
+Clean restarts reproduced Intel i915 GPU hangs while `copyteximage 2d`, `texsubimage`, and framebuffer format cases were executing. QEMU then reported `VK_ERROR_DEVICE_LOST`; a small glmark2 probe also stalled. Kernel and renderer logs are retained. No renderer fixes are claimed by this testing change. Minecraft was closed normally and its log confirmed that all dimensions finished saving before VM recovery.
+
+Evidence is in `artifacts/piglit-vm119-comparison-20261003/`, with interrupted exploratory runs in the other `artifacts/piglit-*` directories. The combined comparison records interrupted/unrun cases separately, and includes raw Piglit checkpoints, the exact test list, renderer identity, package versions, kernel logs, and an HTML report. These artifacts are excluded from Git.
+
 ## Renderer and scanout changes — 2026-10-03
 
 `make -j4 all`, all 12 harness suites, and `make -j4 test` passed on the final source changes. The harness used `/usr/share/vulkan/icd.d/lvp_icd.json` and SPIRV-Tools v2025.1. The no-ICD translator tests ran `spirv-val` successfully rather than skipping it. Rendering tests check Vulkan validation through resource and device teardown.

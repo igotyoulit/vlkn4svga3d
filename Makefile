@@ -68,7 +68,7 @@ QEMU_TEST_TARGET = $(BIN_DIR)/test_qemu_integration
 DX_TEST_TARGET = $(BIN_DIR)/test_dx_path
 LIB_QEMU_SVGA3D = $(LIB_DIR)/libqemu_svga3d.so
 
-.PHONY: all clean test test-oracle test-vlkn test-real-vulkan test-shader-translation test-shader test-guest-mem test-verified-rendering test-presentation test-qemu harness-loop acceptance dump
+.PHONY: all clean test test-oracle test-vlkn test-real-vulkan test-shader-translation test-shader test-guest-mem test-verified-rendering test-presentation test-qemu test-piglit harness-loop acceptance dump
 
 all: $(BIN_DIR)/test_preload_fifo $(BIN_DIR)/test_buffer_ordering $(DX_TEST_TARGET) $(ORACLE_TARGET) $(VLKN_LIB) $(LIB_QEMU_SVGA3D) $(VLKN_TEST_TARGET) $(REAL_VULKAN_TEST_TARGET) $(SHADER_TRANSLATION_TEST_TARGET) $(TRANSLATOR_NOVULKAN_TEST_TARGET) $(SHADER_TEST_TARGET) $(GUEST_MEM_TEST_TARGET) $(VERIFIED_RENDERING_TEST_TARGET) $(PRESENTATION_TEST_TARGET) $(QEMU_TEST_TARGET) $(MALFORMED_INPUT_TEST_TARGET)
 
@@ -179,6 +179,11 @@ test-presentation: $(PRESENTATION_TEST_TARGET)
 
 test-qemu: $(QEMU_TEST_TARGET)
 	./$(QEMU_TEST_TARGET)
+
+# External guest OpenGL tests; independent of the local Vulkan harness.
+# Example: make test-piglit PIGLIT_ARGS="--ssh user@guest"
+test-piglit:
+	python3 scripts/run_piglit.py $(PIGLIT_ARGS)
 
 # Tight feedback loop: build -> ICD-free translator suite -> lavapipe suites ->
 # per-iteration summary. Stops on NEW regressions vs the previous iteration.
