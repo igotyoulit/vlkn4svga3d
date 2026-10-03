@@ -49,6 +49,7 @@ VlknBackend::VlknBackend()
     , m_stagingMemory(VK_NULL_HANDLE)
     , m_stagingMapped(nullptr)
     , m_stagingSize(0)
+    , m_stagingBump(0)
     , m_fallbackBuffer(VK_NULL_HANDLE)
     , m_fallbackMemory(VK_NULL_HANDLE)
     , m_fallbackSize(0)
@@ -566,6 +567,24 @@ Svga3VlknStatus VlknBackend::initFallbackBuffer(size_t size) {
     return SVGA3_VLKN_SUCCESS;
 }
 
+VkDeviceSize VlknBackend::stagingAlloc(VkDeviceSize size) {
+    /* Caller holds m_stagingMutex. */
+    if (!m_stagingBuffer || !m_stagingMapped || size > m_stagingSize) {
+        return kStagingAllocFailed;
+    }
+    /* optimalBufferCopyOffsetAlignment is a power of two; 16 covers the
+     * largest texel block, so the offset is valid for buffer and image
+     * copies alike. */
+    VkDeviceSize align = m_props.limits.optimalBufferCopyOffsetAlignment;
+    if (align < 16) align = 16;
+    VkDeviceSize offset = (m_stagingBump + align - 1) & ~(align - 1);
+    if (offset > m_stagingSize || m_stagingSize - offset < size) {
+        return kStagingAllocFailed;
+    }
+    m_stagingBump = offset + size;
+    return offset;
+}
+
 Svga3VlknStatus VlknBackend::uploadToBuffer(VkBuffer dstBuffer, VkDeviceSize dstOffset, const void *srcData, VkDeviceSize size) {
     std::lock_guard<std::mutex> lock(m_stagingMutex);
     if (size > m_stagingSize) {
@@ -599,11 +618,19 @@ Svga3VlknStatus VlknBackend::uploadToBuffer(VkBuffer dstBuffer, VkDeviceSize dst
         return flushSt;
     }
 
-    memcpy(m_stagingMapped, srcData, (size_t)size);
+    /* Bump-allocate so a pending unflushed range is never clobbered. */
+    VkDeviceSize stagingOffset = stagingAlloc(size);
+    if (stagingOffset == kStagingAllocFailed) {
+        Svga3VlknStatus fst = flushCommandBuffer();
+        if (fst != SVGA3_VLKN_SUCCESS) return fst;
+        stagingOffset = stagingAlloc(size);
+        if (stagingOffset == kStagingAllocFailed) return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+    }
+    memcpy(stagingMappedAt(stagingOffset), srcData, (size_t)size);
 
     VkCommandBuffer cb = getActiveCommandBuffer();
     VkBufferCopy region = {};
-    region.srcOffset = 0;
+    region.srcOffset = stagingOffset;
     region.dstOffset = dstOffset;
     region.size = size;
     m_dispatch.vkCmdCopyBuffer(cb, m_stagingBuffer, dstBuffer, 1, &region);
@@ -647,17 +674,27 @@ Svga3VlknStatus VlknBackend::downloadFromBuffer(void *dstData, VkBuffer srcBuffe
         return SVGA3_VLKN_SUCCESS;
     }
 
+    /* Bump-allocate so a pending unflushed range is never clobbered. This
+     * is a reader: the flush below also drains any pending uploads first. */
+    VkDeviceSize stagingOffset = stagingAlloc(size);
+    if (stagingOffset == kStagingAllocFailed) {
+        Svga3VlknStatus fst = flushCommandBuffer();
+        if (fst != SVGA3_VLKN_SUCCESS) return fst;
+        stagingOffset = stagingAlloc(size);
+        if (stagingOffset == kStagingAllocFailed) return SVGA3_VLKN_ERROR_OUT_OF_MEMORY;
+    }
+
     VkCommandBuffer cb = getActiveCommandBuffer();
     VkBufferCopy region = {};
     region.srcOffset = srcOffset;
-    region.dstOffset = 0;
+    region.dstOffset = stagingOffset;
     region.size = size;
 
     m_dispatch.vkCmdCopyBuffer(cb, srcBuffer, m_stagingBuffer, 1, &region);
     Svga3VlknStatus st = flushCommandBuffer();
     if (st != SVGA3_VLKN_SUCCESS) return st;
 
-    memcpy(dstData, m_stagingMapped, (size_t)size);
+    memcpy(dstData, stagingMappedAt(stagingOffset), (size_t)size);
     return SVGA3_VLKN_SUCCESS;
 }
 
@@ -730,6 +767,8 @@ Svga3VlknStatus VlknBackend::flushCommandBuffer() {
     if (m_cmdBufferPending) {
         Svga3VlknStatus idleStatus = waitIdle();
         if (idleStatus != SVGA3_VLKN_SUCCESS) return idleStatus;
+        /* Device is idle: no recorded staging range is still in flight. */
+        m_stagingBump = 0;
     }
     if (!m_cmdBufferRecording) return SVGA3_VLKN_SUCCESS;
 
@@ -785,6 +824,8 @@ Svga3VlknStatus VlknBackend::flushCommandBuffer() {
     }
     m_completedSubmissionSerial = m_recordingSerial;
     m_cmdBufferPending = false;
+    /* The wait above retired every recorded staging range. */
+    m_stagingBump = 0;
     cleanupRetiredBuffers(false);
     res = m_dispatch.vkResetCommandBuffer(m_cmdBuffer, 0);
     if (res != VK_SUCCESS) {

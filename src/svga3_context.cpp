@@ -395,15 +395,25 @@ VlknContext::VlknContext(VlknBackend *backend, VlknSurfaceManager *surfaceMgr, u
 
         if (m_backend->stagingBuffer() && m_backend->stagingMapped()) {
             std::lock_guard<std::mutex> lock(m_backend->stagingMutex());
-            uint32_t white = 0xFFFFFFFF;
-            memcpy(m_backend->stagingMapped(), &white, sizeof(white));
-            VkBufferImageCopy region = {};
-            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            region.imageSubresource.layerCount = 1;
-            region.imageExtent = { 1, 1, 1 };
-            m_backend->dispatch().vkCmdCopyBufferToImage(
-                initCb, m_backend->stagingBuffer(), m_dummyImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region
-            );
+            VkDeviceSize stagingOffset = m_backend->stagingAlloc(sizeof(uint32_t));
+            if (stagingOffset == VlknBackend::kStagingAllocFailed) {
+                if (m_backend->flushCommandBuffer() == SVGA3_VLKN_SUCCESS)
+                    stagingOffset = m_backend->stagingAlloc(sizeof(uint32_t));
+            }
+            if (stagingOffset == VlknBackend::kStagingAllocFailed) {
+                log_msg("[libqemu_svga3d] context init: staging alloc failed for dummy pixel; leaving it uninitialized\\n");
+            } else {
+                uint32_t white = 0xFFFFFFFF;
+                memcpy(m_backend->stagingMappedAt(stagingOffset), &white, sizeof(white));
+                VkBufferImageCopy region = {};
+                region.bufferOffset = stagingOffset;
+                region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                region.imageSubresource.layerCount = 1;
+                region.imageExtent = { 1, 1, 1 };
+                m_backend->dispatch().vkCmdCopyBufferToImage(
+                    initCb, m_backend->stagingBuffer(), m_dummyImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region
+                );
+            }
         }
 
         dummyBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -435,14 +445,24 @@ VlknContext::VlknContext(VlknBackend *backend, VlknSurfaceManager *surfaceMgr, u
             0, 0, nullptr, 0, nullptr, 1, &dummyBarrier);
         if (m_backend->stagingBuffer() && m_backend->stagingMapped()) {
             std::lock_guard<std::mutex> lock(m_backend->stagingMutex());
-            uint32_t white = 0xFFFFFFFF;
-            memcpy(m_backend->stagingMapped(), &white, sizeof(white));
-            VkBufferImageCopy region = {};
-            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            region.imageSubresource.layerCount = 1;
-            region.imageExtent = { 1, 1, 1 };
-            m_backend->dispatch().vkCmdCopyBufferToImage(
-                initCb, m_backend->stagingBuffer(), m_whiteImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            VkDeviceSize stagingOffset = m_backend->stagingAlloc(sizeof(uint32_t));
+            if (stagingOffset == VlknBackend::kStagingAllocFailed) {
+                if (m_backend->flushCommandBuffer() == SVGA3_VLKN_SUCCESS)
+                    stagingOffset = m_backend->stagingAlloc(sizeof(uint32_t));
+            }
+            if (stagingOffset == VlknBackend::kStagingAllocFailed) {
+                log_msg("[libqemu_svga3d] context init: staging alloc failed for white pixel; leaving it uninitialized\\n");
+            } else {
+                uint32_t white = 0xFFFFFFFF;
+                memcpy(m_backend->stagingMappedAt(stagingOffset), &white, sizeof(white));
+                VkBufferImageCopy region = {};
+                region.bufferOffset = stagingOffset;
+                region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                region.imageSubresource.layerCount = 1;
+                region.imageExtent = { 1, 1, 1 };
+                m_backend->dispatch().vkCmdCopyBufferToImage(
+                    initCb, m_backend->stagingBuffer(), m_whiteImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            }
         }
         dummyBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         dummyBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
