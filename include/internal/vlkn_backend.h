@@ -26,10 +26,15 @@ namespace svga3_vlkn {
  * VlknBackend methods are NOT thread-safe as a whole. Callers must
  * externally serialize device-level operations. The internal mutexes protect
  * specific shared state only:
- *   - m_stagingMutex guards the staging buffer contents. uploadToBuffer /
- *     downloadFromBuffer hold it across flushCommandBuffer(), i.e. across
- *     the vkQueueWaitIdle wait. This serializes staging reuse at the cost of
- *     holding the lock during GPU waits.
+ *   - m_stagingMutex guards the staging buffer contents AND the bump
+ *     allocator offset. Upload paths bump-allocate staging ranges and record
+ *     their copies without flushing; the flush is deferred until a range
+ *     would be reused (bump overflow forces a flush first), a reader runs
+ *     (present / blit readback / guest readback / SVGA_CMD_FENCE), or an
+ *     explicit sync point is reached. Every readback still submits before
+ *     the host touches the data, so pixel order is unchanged. There is no
+ *     second queue and no fence-based overlap: one queue, one command
+ *     buffer, correctness over throughput.
  *   - m_mutex guards the render-pass cache.
  * Neither mutex protects the command-buffer recording state machine
  * (m_cmdBufferRecording / m_cmdBufferPending); concurrent
@@ -125,6 +130,20 @@ public:
     size_t stagingSize() const { return m_stagingSize; }
     std::mutex& stagingMutex() { return m_stagingMutex; }
 
+    /* Staging bump allocator. The caller must hold stagingMutex(). Returns
+     * the byte offset of a `size`-byte range, or kStagingAllocFailed when the
+     * range does not fit in the remaining space. On failure the caller must
+     * flushCommandBuffer() (which retires all pending ranges and resets the
+     * bump) and retry once; if it still fails the transfer is larger than the
+     * staging buffer and needs a temporary buffer. Returned offsets satisfy
+     * optimalBufferCopyOffsetAlignment, so they are valid for both
+     * vkCmdCopyBuffer and vkCmdCopyBufferToImage/vkCmdCopyImageToBuffer. */
+    static constexpr VkDeviceSize kStagingAllocFailed = ~VkDeviceSize(0);
+    VkDeviceSize stagingAlloc(VkDeviceSize size);
+    void* stagingMappedAt(VkDeviceSize offset) {
+        return static_cast<uint8_t*>(m_stagingMapped) + offset;
+    }
+
     /* Fallback Buffer Accessors (always-valid dummy buffer for missing vertex/index inputs) */
     VkBuffer fallbackBuffer() const { return m_fallbackBuffer; }
     size_t fallbackSize() const { return m_fallbackSize; }
@@ -183,6 +202,10 @@ private:
     void *m_stagingMapped;
     size_t m_stagingSize;
     std::mutex m_stagingMutex;
+    /* Bump offset into the staging buffer. Only touched while holding
+     * m_stagingMutex. Reset to 0 whenever flushCommandBuffer() establishes
+     * device idle, which retires all recorded staging ranges. */
+    VkDeviceSize m_stagingBump;
 
     /* Fallback buffer */
     VkBuffer m_fallbackBuffer;
