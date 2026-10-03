@@ -18,6 +18,7 @@
 #include "svga3_device.h"
 #include "vlkn_backend.h"
 #include "svga3_shader_translator.h"
+#include "fake_host_adapter.h"
 
 #include <iostream>
 #include <vector>
@@ -143,8 +144,9 @@ int main() {
                                                               FB_W, FB_H, FB_W * FB_BPP, FB_BPP);
     TEST_CHECK(status == SVGA3_VLKN_SUCCESS, "Registered emulated QEMU display framebuffer (BAR1)");
 
-    status = svga3_vlkn_device_set_display_callback(dev, nullptr, testDisplayUpdateCallback);
-    TEST_CHECK(status == SVGA3_VLKN_SUCCESS, "Registered QEMU display surface update callback");
+    Svga3HostAdapter adapter = fake_host_adapter(testDisplayUpdateCallback, nullptr);
+    status = svga3_vlkn_device_set_host_adapter(dev, &adapter);
+    TEST_CHECK(status == SVGA3_VLKN_SUCCESS, "Registered display surface update callback via host adapter");
 
     /* Step 3: Render a realistic 3D scene to an SVGA3D Render Target Surface */
     const uint32_t CID = 501;

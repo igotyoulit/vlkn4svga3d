@@ -16,6 +16,7 @@
 #include "qemu_vmsvga.h"
 #include "svga3_device.h"
 #include "svga3_guest_mem.h"
+#include "adapter/qemu_adapter.h"
 
 #include <iostream>
 #include <iomanip>
@@ -130,7 +131,7 @@ bool QemuVmsvgaDevice::init(bool enableValidation, bool forceMock)
     uint32_t bpp = m_regs[SVGA_REG_BITS_PER_PIXEL] ? (m_regs[SVGA_REG_BITS_PER_PIXEL] / 8) : 4;
 
     svga3_vlkn_device_set_framebuffer(m_vlknDev, m_fbMem.data(), m_fbGpa, m_fbSize, w, h, pitch, bpp);
-    svga3_vlkn_device_set_display_callback(m_vlknDev, this, displayUpdateCallback);
+    svga3_vlkn_device_set_host_adapter(m_vlknDev, qemu_adapter_for_device(this));
     return true;
 }
 
@@ -177,7 +178,7 @@ void QemuVmsvgaDevice::reset()
     if (m_vlknDev) {
         svga3_vlkn_device_reset(m_vlknDev);
         svga3_vlkn_device_set_framebuffer(m_vlknDev, m_fbMem.data(), m_fbGpa, m_fbSize, 1024, 768, 1024 * 4, 4);
-        svga3_vlkn_device_set_display_callback(m_vlknDev, this, displayUpdateCallback);
+        svga3_vlkn_device_set_host_adapter(m_vlknDev, qemu_adapter_for_device(this));
     }
 }
 

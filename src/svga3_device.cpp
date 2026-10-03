@@ -752,29 +752,15 @@ Svga3VlknStatus svga3_vlkn_context_wait_for_query(Svga3VlknDevice *dev,
 }
 
 /*
- * Guest Memory Management C API
+ * Host Adapter C API
  */
-Svga3VlknStatus svga3_vlkn_device_set_guest_memory_callbacks(
+Svga3VlknStatus svga3_vlkn_device_set_host_adapter(
     Svga3VlknDevice *dev,
-    void *opaque,
-    Svga3GpaToHvaFn gpaToHva,
-    Svga3DmaReadFn dmaRead,
-    Svga3DmaWriteFn dmaWrite)
+    const Svga3HostAdapter *adapter)
 {
     if (!dev || !dev->guestMem) return SVGA3_VLKN_ERROR_INVALID_PARAM;
     std::lock_guard<std::mutex> lock(dev->mutex);
-    dev->guestMem->setCallbacks(opaque, gpaToHva, dmaRead, dmaWrite);
-    return SVGA3_VLKN_SUCCESS;
-}
-
-Svga3VlknStatus svga3_vlkn_device_set_display_callback(
-    Svga3VlknDevice *dev,
-    void *opaque,
-    Svga3DisplayUpdateFn displayUpdate)
-{
-    if (!dev || !dev->guestMem) return SVGA3_VLKN_ERROR_INVALID_PARAM;
-    std::lock_guard<std::mutex> lock(dev->mutex);
-    dev->guestMem->setDisplayCallback(opaque, displayUpdate);
+    dev->guestMem->setAdapter(adapter);
     return SVGA3_VLKN_SUCCESS;
 }
 

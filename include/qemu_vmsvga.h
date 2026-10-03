@@ -70,6 +70,10 @@ struct PciConfigSpace {
  */
 class QemuVmsvgaDevice {
 public:
+    /* Adapter hook: record a display update rect. Public so the QEMU
+     * host adapter can forward core notifications. */
+    static void displayUpdateCallback(void *opaque, int32_t x, int32_t y, int32_t w, int32_t h);
+
     QemuVmsvgaDevice(uint64_t fbGpa = 0xE0000000ULL,
                      size_t fbSize = 16 * 1024 * 1024,
                      uint64_t fifoGpa = 0xF0000000ULL,
@@ -125,7 +129,6 @@ public:
 private:
     void initPciConfig();
     void initFifoRegs();
-    static void displayUpdateCallback(void *opaque, int32_t x, int32_t y, int32_t w, int32_t h);
 
     uint64_t m_fbGpa;
     size_t   m_fbSize;

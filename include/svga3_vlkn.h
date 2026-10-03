@@ -322,25 +322,31 @@ Svga3VlknStatus  svga3_vlkn_context_wait_for_query(Svga3VlknDevice *dev,
                                                     uint32_t *outResult);
 
 /*
- * Guest Memory Subsystem & QEMU Integration API (Deliverable 3 & 5)
+ * Host Adapter Interface
+ *
+ * The core rendering library (FIFO decode, surfaces, contexts, shader
+ * translation, Vulkan backend) talks to the host through this small
+ * interface. It covers guest RAM access, presentation, and fence
+ * synchronization. QEMU is the first adapter; adding another VM host
+ * means implementing this interface in a new adapter file, not editing
+ * the core. No QEMU types appear here or in any core header.
  */
-typedef void* (*Svga3GpaToHvaFn)(void *opaque, uint64_t gpa, size_t size, bool isWrite);
-typedef bool  (*Svga3DmaReadFn)(void *opaque, uint64_t gpa, void *dstHost, size_t size);
-typedef bool  (*Svga3DmaWriteFn)(void *opaque, uint64_t gpa, const void *srcHost, size_t size);
-typedef void  (*Svga3DisplayUpdateFn)(void *opaque, int32_t x, int32_t y, int32_t w, int32_t h);
+typedef struct Svga3HostAdapter {
+    void *opaque;
+    /* Guest RAM */
+    void* (*guestRamMap)(void *opaque, uint64_t gpa, size_t size, bool isWrite);
+    bool  (*guestRamRead)(void *opaque, uint64_t gpa, void *dst, size_t size);
+    bool  (*guestRamWrite)(void *opaque, uint64_t gpa, const void *src, size_t size);
+    /* Presentation */
+    Svga3VlknStatus (*present)(void *opaque, uint32_t sid);
+    void  (*displayUpdate)(void *opaque, int32_t x, int32_t y, int32_t w, int32_t h);
+    /* Fence synchronization */
+    Svga3VlknStatus (*fenceSync)(void *opaque, uint32_t fenceId);
+} Svga3HostAdapter;
 
-Svga3VlknStatus svga3_vlkn_device_set_guest_memory_callbacks(
+Svga3VlknStatus svga3_vlkn_device_set_host_adapter(
     Svga3VlknDevice *dev,
-    void *opaque,
-    Svga3GpaToHvaFn gpaToHva,
-    Svga3DmaReadFn dmaRead,
-    Svga3DmaWriteFn dmaWrite
-);
-
-Svga3VlknStatus svga3_vlkn_device_set_display_callback(
-    Svga3VlknDevice *dev,
-    void *opaque,
-    Svga3DisplayUpdateFn displayUpdate
+    const Svga3HostAdapter *adapter
 );
 
 Svga3VlknStatus svga3_vlkn_device_map_guest_ram(
