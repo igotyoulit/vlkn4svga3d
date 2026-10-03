@@ -50,7 +50,55 @@ static uint8_t* gpaToHva(uint64_t gpa) {
     return nullptr;
 }
 
+static int testAdapterFallback() {
+    svga3_vlkn::GuestMemoryManager mem;
+    struct Host { uint8_t bytes[32]{}; unsigned updates = 0; } first, second;
+    Svga3HostAdapter adapter{};
+    adapter.opaque = &first;
+    adapter.guestRamMap = [](void *opaque, uint64_t gpa, size_t size, bool) -> void* {
+        auto *host = static_cast<Host*>(opaque);
+        if (gpa < 0x1000 || gpa - 0x1000 > sizeof(host->bytes) ||
+            size > sizeof(host->bytes) - (gpa - 0x1000)) return nullptr;
+        return host->bytes + (gpa - 0x1000);
+    };
+    adapter.displayUpdate = [](void *opaque, int32_t, int32_t, int32_t, int32_t) {
+        ++static_cast<Host*>(opaque)->updates;
+    };
+    mem.setAdapter(&adapter);
+    adapter.opaque = &second; // Registration copies the table, not its address.
+    uint32_t value = 0x12345678, out = 0;
+    TEST_CHECK(mem.writePhysical(0x101c, &value, 4), "Adapter maps exact end range");
+    TEST_CHECK(mem.readPhysical(0x101c, &out, 4) && out == value, "Adapter RAM roundtrip");
+    TEST_CHECK(!mem.writePhysical(0x101d, &value, 4), "Adapter rejects overflowing range");
+    mem.notifyDisplayUpdate(0, 0, 4, 4);
+    TEST_CHECK(first.updates == 1 && second.updates == 0, "Adapter registration is independent");
+    uint8_t registered[32]{};
+    TEST_CHECK(mem.registerRamBlock(0x1000, registered, sizeof(registered)) == SVGA3_VLKN_SUCCESS,
+               "Register RAM over adapter range");
+    TEST_CHECK(mem.writePhysical(0x1000, &value, 4) && first.bytes[0] == 0,
+               "Registered RAM takes precedence over adapter");
+    mem.clear();
+    adapter.guestRamMap = nullptr;
+    adapter.guestRamRead = [](void *opaque, uint64_t gpa, void *dst, size_t size) {
+        if (gpa != 0x1000 || size > 32) return false;
+        memcpy(dst, static_cast<Host*>(opaque)->bytes, size); return true;
+    };
+    adapter.guestRamWrite = [](void *opaque, uint64_t gpa, const void *src, size_t size) {
+        if (gpa != 0x1000 || size > 32) return false;
+        memcpy(static_cast<Host*>(opaque)->bytes, src, size); return true;
+    };
+    mem.setAdapter(&adapter);
+    TEST_CHECK(mem.writePhysical(0x1000, &value, 4) && mem.readPhysical(0x1000, &out, 4) && out == value,
+               "Direct read/write callbacks work without a mapping callback");
+    mem.setAdapter(nullptr);
+    TEST_CHECK(!mem.readPhysical(0x1000, &out, 4), "Detached adapter cannot access RAM");
+    mem.notifyDisplayUpdate(0, 0, 4, 4);
+    TEST_CHECK(second.updates == 0, "Detached adapter cannot notify display");
+    return 0;
+}
+
 int main() {
+    if (testAdapterFallback()) return 1;
     std::cout << "======================================================================" << std::endl;
     std::cout << "SVGA3=VLKN Deliverable 3: Real Guest Memory Access & Region Translation" << std::endl;
     std::cout << "======================================================================" << std::endl;
