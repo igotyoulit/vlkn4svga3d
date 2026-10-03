@@ -96,6 +96,8 @@ $(BUILD_DIR)/svga3d-oracle.o: tools/svga3d-oracle.cpp tools/include/svga3d_table
 
 # SVGA3=VLKN Library
 $(VLKN_LIB): $(VLKN_OBJS) | $(LIB_DIR)
+	# Recreate: ar rcs alone retains QEMU members from pre-split builds.
+	rm -f $@
 	ar rcs $@ $(VLKN_OBJS)
 
 $(BUILD_DIR)/vlkn_dispatch.o: src/vlkn_dispatch.cpp include/internal/vlkn_dispatch.h | $(BUILD_DIR)
