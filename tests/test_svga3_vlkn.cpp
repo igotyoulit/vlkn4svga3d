@@ -1645,9 +1645,14 @@ static void TestSurfaceTransfersPropagateFlushFailures() {
 
     std::vector<uint32_t> pixels(64 * 64, 0x11223344u);
     SVGA3dBox box = { 0, 0, 0, 64, 64, 1 };
+    /* Uploads now bump-allocate staging and defer the flush: the upload
+     * records successfully and the injected submit failure surfaces at the
+     * next flush (reader or explicit), not at upload time. */
     TEST_CHECK(svga3_vlkn_surface_dma_upload(dev, 9201, 0, &box, pixels.data(),
-                                            64 * sizeof(uint32_t)) != SVGA3_VLKN_SUCCESS,
-               "dma_upload propagates flush/submit failure");
+                                            64 * sizeof(uint32_t)) == SVGA3_VLKN_SUCCESS,
+               "dma_upload records without flushing (deferred)");
+    TEST_CHECK(dev->backend->flushCommandBuffer() != SVGA3_VLKN_SUCCESS,
+               "deferred flush propagates flush/submit failure");
 
     SVGA3dCopyBox cbox;
     cbox.x = 0; cbox.y = 0; cbox.z = 0;
