@@ -94,6 +94,45 @@ Individual targets:
 
 **`test-qemu` does not boot an actual QEMU guest.** Passing it is not proof of working Linux, Windows, or QNX graphics. Test names and success banners inherited from development should not be read as completeness claims.
 
+## Piglit guest OpenGL tests
+
+[Piglit](https://piglit.freedesktop.org/) adds external OpenGL correctness tests through the guest's Mesa SVGA driver and the QEMU renderer. Install it **inside the Debian guest** with an existing Xorg session:
+
+```sh
+sudo apt install piglit mesa-utils
+```
+
+From this repository on the development machine, run:
+
+```sh
+make test-piglit PIGLIT_ARGS="--ssh user@guest"
+```
+
+The default compares the same focused selection from Piglit's `quick` profile using SVGA3D, then guest CPU rendering via llvmpipe. It covers legacy texture operations, blending, scissor/depth/stencil, framebuffer objects, and selected GLSL 1.10/1.20 execution tests. Tests run serially on display `:0`, with a 60-second per-test timeout and a 30-minute limit per renderer. The runner checks `glxinfo` renderer identity before each run, forces GLX, and clears software-rendering and version overrides. The software choice applies only to the test subprocesses.
+
+The current lab uses `svga3d@10.0.0.144`, display `:0`, in Proxmox VM119 on `10.0.0.200`. QEMU loads the host's `/usr/local/lib/libqemu_svga3d.so`. Piglit belongs in the guest: running it on the Proxmox host would bypass the guest SVGA path. Ensure the intended library is already loaded before testing; the runner does not deploy or restart QEMU. Keep the VM idle for consistent results.
+
+The initial VM runs reproduced Intel GPU hangs while `copyteximage 2d`, `texsubimage`, and framebuffer format tests were executing, followed by Vulkan device loss and stalled tests. The smoke runner schedules copyteximage/texsubimage cases last, preserving them in the test list so earlier cases can finish. `--last REGEX` overrides this ordering. This ordering changes no expected outcomes and does not suppress failing cases. If device loss occurs, stop the accelerated run, retain the logs, and recover before further accelerated testing. Unexecuted cases are not rendering failures or passes.
+
+Other runs:
+
+```sh
+# Only the guest SVGA path:
+make test-piglit PIGLIT_ARGS="--ssh user@guest --renderer svga"
+# Broader upstream profile, including unsupported API features (many expected skips):
+make test-piglit PIGLIT_ARGS="--ssh user@guest --suite quick --run-timeout 14400"
+# Investigate a particular feature; --include replaces the default selection:
+make test-piglit PIGLIT_ARGS="--ssh user@guest --include arb_depth_texture"
+# Run directly inside the guest after copying this repository:
+make test-piglit
+```
+
+Use `--piglit /path/to/piglit` for a built upstream checkout, `--display` for a different X session, and `--exclude` to make a deliberately narrowed run. Exact selection and commands are saved. Debian's package is a dated snapshot; compare runs using the same Piglit version and selection.
+
+Each run creates a new `artifacts/piglit-*` directory with renderer/system identity, package versions, command lines, logs, raw compressed JSON, `summary.json`, and an HTML report under `html/index.html`. The JSON summary counts top-level cases and subtests separately; upstream console totals may differ. SSH runs also retain a temporary guest result directory, printed at startup. Copying evidence back happens even if the runner fails. Inspect raw test output for expected/observed pixels and API errors.
+
+Exit status is nonzero for test failures, crashes, timeouts, warnings, incomplete/missing results, mismatched comparison test lists, or runs without any passing cases. A nonzero Piglit runner exit retains partial evidence and still attempts the software reference. The summary marks interrupted runs as incomplete and planned cases that never started as `notrun`. Skips remain separate from passes. `summary.json` distinguishes SVGA problems, skips, and unverified cases that pass on llvmpipe; skips can reflect differing advertised capabilities. Such differences identify investigation targets, not their cause. This is independent of `make acceptance` and `make harness-loop`; CI checks the result-reporting logic, while guest tests require the live VM. Piglit does not certify VM stability, desktop scanout, or full API conformance.
+
 ## Harness loop
 
 `make harness-loop` runs the tight build/test loop used for iterative translator and driver work:
