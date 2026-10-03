@@ -4,7 +4,8 @@
  * indirect JMP hooks at hardcoded RVAs). It must NEVER be deployed as a
  * global LD_PRELOAD: it only arms when the host process is qemu-system* AND
  * the process image's NT_GNU_BUILD_ID is on the explicit allowlist below.
- * Anything else _exit(78)s before touching a single byte.
+ * Unallowlisted QEMU processes _exit(78) before patching. Other processes
+ * do not arm this adapter.
  *
  * Each allowlist entry pairs ONE build-id with the RVA set further down.
  * Those RVAs are per-build; adding a build means re-verifying EVERY ADDR_*
