@@ -180,7 +180,7 @@ void QemuVmsvgaDevice::reset()
         svga3_vlkn_device_reset(m_vlknDev);
         svga3_vlkn_device_set_framebuffer(m_vlknDev, m_fbMem.data(), m_fbGpa, m_fbSize, 1024, 768, 1024 * 4, 4);
         const auto adapter = qemu_adapter_for_device(this);
-    svga3_vlkn_device_set_host_adapter(m_vlknDev, &adapter);
+        svga3_vlkn_device_set_host_adapter(m_vlknDev, &adapter);
     }
 }
 

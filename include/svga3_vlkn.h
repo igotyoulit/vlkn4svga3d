@@ -327,7 +327,8 @@ Svga3VlknStatus  svga3_vlkn_context_wait_for_query(Svga3VlknDevice *dev,
  * The core rendering library (FIFO decode, surfaces, contexts, shader
  * translation, Vulkan backend) talks to the host through this small
  * interface. It covers guest RAM access and display notifications.
- * Submission, presentation copies and fence synchronization remain in the core. QEMU is the first adapter; adding another VM host
+ * Submission, presentation copies and fence synchronization remain in the core.
+ * QEMU is the first adapter; adding another VM host
  * means implementing this interface in a new adapter file, not editing
  * the core. No QEMU types appear here or in any core header.
  */
