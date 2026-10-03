@@ -844,7 +844,7 @@ int main(int argc, char **argv)
 
     std::cout << "\n======================================================================\n";
     if (allPassed) {
-        std::cout << " DELIVERABLE 6 RESULT: ALL TESTS PASSED SUCCESSFULLY (100%)\n";
+        std::cout << " DELIVERABLE 6 RESULT: ALL TESTS PASSED\n";
         std::cout << "======================================================================\n";
         return 0;
     } else {

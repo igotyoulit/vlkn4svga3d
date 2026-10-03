@@ -446,7 +446,7 @@ int main() {
     std::cout << "  [PASS] Device and all memory resources cleaned up successfully" << std::endl;
 
     std::cout << "\n======================================================================" << std::endl;
-    std::cout << "DELIVERABLE 3 ACCEPTANCE SUITE: ALL TESTS PASSED SUCCESSFULLY!" << std::endl;
+    std::cout << "DELIVERABLE 3 ACCEPTANCE SUITE: ALL TESTS PASSED" << std::endl;
     std::cout << "======================================================================" << std::endl;
 
     return 0;

@@ -16,6 +16,33 @@
 
 namespace svga3_vlkn {
 
+/* Threading and command-buffer contract (issue #13).
+ *
+ * The backend owns a SINGLE global command buffer (m_cmdBuffer) and a single
+ * queue (m_queue). Every flush ends with vkQueueWaitIdle, so all recorded
+ * work — transfers and draws alike — is fully serialized: correctness over
+ * throughput. There is no separate transfer queue and no fence-based overlap.
+ *
+ * VlknBackend methods are NOT thread-safe as a whole. Callers must
+ * externally serialize device-level operations. The internal mutexes protect
+ * specific shared state only:
+ *   - m_stagingMutex guards the staging buffer contents. uploadToBuffer /
+ *     downloadFromBuffer hold it across flushCommandBuffer(), i.e. across
+ *     the vkQueueWaitIdle wait. This serializes staging reuse at the cost of
+ *     holding the lock during GPU waits.
+ *   - m_mutex guards the render-pass cache.
+ * Neither mutex protects the command-buffer recording state machine
+ * (m_cmdBufferRecording / m_cmdBufferPending); concurrent
+ * flushCommandBuffer() calls from two threads would corrupt it.
+ *
+ * Pre-flush hook: flushCommandBuffer() invokes m_preFlushHook exactly once
+ * per flush using a copy/null/restore pattern, so the hook cannot observe a
+ * stale registration. The hook runs with no backend lock held by the flush
+ * itself, BUT the caller may hold m_stagingMutex (see above), which is a
+ * non-recursive mutex. The hook must therefore not call transfer APIs
+ * (uploadToBuffer / downloadFromBuffer) — that would deadlock. The
+ * production hook (svga3_device.cpp) only ends render passes, which take the
+ * context manager's recursive mutex and record no transfers. */
 class VlknBackend {
 public:
     VlknBackend();

@@ -457,7 +457,10 @@ ULONG WINAPI MockDirect3DVolumeTexture9::Release(void) {
     ULONG count = --m_refCount; if (count == 0) delete this; return count;
 }
 HRESULT WINAPI MockDirect3DVolumeTexture9::GetDevice(IDirect3DDevice9 **ppDevice) {
-    if (!ppDevice) return D3DERR_INVALIDCALL; *ppDevice = (IDirect3DDevice9*)m_pDevice; if (m_pDevice) m_pDevice->AddRef(); return D3D_OK;
+    if (!ppDevice) return D3DERR_INVALIDCALL;
+    *ppDevice = (IDirect3DDevice9*)m_pDevice;
+    if (m_pDevice) m_pDevice->AddRef();
+    return D3D_OK;
 }
 HRESULT WINAPI MockDirect3DVolumeTexture9::SetPrivateData(const void *guid, const void *pData, DWORD SizeOfData, DWORD Flags) { (void)guid; (void)pData; (void)SizeOfData; (void)Flags; return D3D_OK; }
 HRESULT WINAPI MockDirect3DVolumeTexture9::GetPrivateData(const void *guid, void *pData, DWORD *pSizeOfData) { (void)guid; (void)pData; (void)pSizeOfData; return D3D_OK; }
@@ -529,7 +532,10 @@ ULONG WINAPI MockDirect3DVertexBuffer9::Release(void) {
     ULONG count = --m_refCount; if (count == 0) delete this; return count;
 }
 HRESULT WINAPI MockDirect3DVertexBuffer9::GetDevice(IDirect3DDevice9 **ppDevice) {
-    if (!ppDevice) return D3DERR_INVALIDCALL; *ppDevice = (IDirect3DDevice9*)m_pDevice; if (m_pDevice) m_pDevice->AddRef(); return D3D_OK;
+    if (!ppDevice) return D3DERR_INVALIDCALL;
+    *ppDevice = (IDirect3DDevice9*)m_pDevice;
+    if (m_pDevice) m_pDevice->AddRef();
+    return D3D_OK;
 }
 HRESULT WINAPI MockDirect3DVertexBuffer9::SetPrivateData(const void *guid, const void *pData, DWORD SizeOfData, DWORD Flags) { (void)guid; (void)pData; (void)SizeOfData; (void)Flags; return D3D_OK; }
 HRESULT WINAPI MockDirect3DVertexBuffer9::GetPrivateData(const void *guid, void *pData, DWORD *pSizeOfData) { (void)guid; (void)pData; (void)pSizeOfData; return D3D_OK; }
@@ -577,7 +583,10 @@ ULONG WINAPI MockDirect3DIndexBuffer9::Release(void) {
     ULONG count = --m_refCount; if (count == 0) delete this; return count;
 }
 HRESULT WINAPI MockDirect3DIndexBuffer9::GetDevice(IDirect3DDevice9 **ppDevice) {
-    if (!ppDevice) return D3DERR_INVALIDCALL; *ppDevice = (IDirect3DDevice9*)m_pDevice; if (m_pDevice) m_pDevice->AddRef(); return D3D_OK;
+    if (!ppDevice) return D3DERR_INVALIDCALL;
+    *ppDevice = (IDirect3DDevice9*)m_pDevice;
+    if (m_pDevice) m_pDevice->AddRef();
+    return D3D_OK;
 }
 HRESULT WINAPI MockDirect3DIndexBuffer9::SetPrivateData(const void *guid, const void *pData, DWORD SizeOfData, DWORD Flags) { (void)guid; (void)pData; (void)SizeOfData; (void)Flags; return D3D_OK; }
 HRESULT WINAPI MockDirect3DIndexBuffer9::GetPrivateData(const void *guid, void *pData, DWORD *pSizeOfData) { (void)guid; (void)pData; (void)pSizeOfData; return D3D_OK; }
@@ -625,7 +634,10 @@ ULONG WINAPI MockDirect3DVertexDeclaration9::Release(void) {
     ULONG count = --m_refCount; if (count == 0) delete this; return count;
 }
 HRESULT WINAPI MockDirect3DVertexDeclaration9::GetDevice(IDirect3DDevice9 **ppDevice) {
-    if (!ppDevice) return D3DERR_INVALIDCALL; *ppDevice = (IDirect3DDevice9*)m_pDevice; if (m_pDevice) m_pDevice->AddRef(); return D3D_OK;
+    if (!ppDevice) return D3DERR_INVALIDCALL;
+    *ppDevice = (IDirect3DDevice9*)m_pDevice;
+    if (m_pDevice) m_pDevice->AddRef();
+    return D3D_OK;
 }
 
 HRESULT WINAPI MockDirect3DVertexDeclaration9::GetDeclaration(D3DVERTEXELEMENT9 *pElement, UINT *pNumElements) {
@@ -659,7 +671,10 @@ ULONG WINAPI MockDirect3DVertexShader9::Release(void) {
     ULONG count = --m_refCount; if (count == 0) delete this; return count;
 }
 HRESULT WINAPI MockDirect3DVertexShader9::GetDevice(IDirect3DDevice9 **ppDevice) {
-    if (!ppDevice) return D3DERR_INVALIDCALL; *ppDevice = (IDirect3DDevice9*)m_pDevice; if (m_pDevice) m_pDevice->AddRef(); return D3D_OK;
+    if (!ppDevice) return D3DERR_INVALIDCALL;
+    *ppDevice = (IDirect3DDevice9*)m_pDevice;
+    if (m_pDevice) m_pDevice->AddRef();
+    return D3D_OK;
 }
 HRESULT WINAPI MockDirect3DVertexShader9::GetFunction(void *pData, UINT *pSizeOfData) {
     if (pSizeOfData) *pSizeOfData = (UINT)(m_function.size() * sizeof(DWORD));
@@ -689,7 +704,10 @@ ULONG WINAPI MockDirect3DPixelShader9::Release(void) {
     ULONG count = --m_refCount; if (count == 0) delete this; return count;
 }
 HRESULT WINAPI MockDirect3DPixelShader9::GetDevice(IDirect3DDevice9 **ppDevice) {
-    if (!ppDevice) return D3DERR_INVALIDCALL; *ppDevice = (IDirect3DDevice9*)m_pDevice; if (m_pDevice) m_pDevice->AddRef(); return D3D_OK;
+    if (!ppDevice) return D3DERR_INVALIDCALL;
+    *ppDevice = (IDirect3DDevice9*)m_pDevice;
+    if (m_pDevice) m_pDevice->AddRef();
+    return D3D_OK;
 }
 HRESULT WINAPI MockDirect3DPixelShader9::GetFunction(void *pData, UINT *pSizeOfData) {
     if (pSizeOfData) *pSizeOfData = (UINT)(m_function.size() * sizeof(DWORD));
@@ -712,7 +730,10 @@ ULONG WINAPI MockDirect3DQuery9::Release(void) {
     ULONG count = --m_refCount; if (count == 0) delete this; return count;
 }
 HRESULT WINAPI MockDirect3DQuery9::GetDevice(IDirect3DDevice9 **ppDevice) {
-    if (!ppDevice) return D3DERR_INVALIDCALL; *ppDevice = (IDirect3DDevice9*)m_pDevice; if (m_pDevice) m_pDevice->AddRef(); return D3D_OK;
+    if (!ppDevice) return D3DERR_INVALIDCALL;
+    *ppDevice = (IDirect3DDevice9*)m_pDevice;
+    if (m_pDevice) m_pDevice->AddRef();
+    return D3D_OK;
 }
 D3DQUERYTYPE WINAPI MockDirect3DQuery9::GetType(void) { return m_type; }
 DWORD WINAPI MockDirect3DQuery9::GetDataSize(void) {
@@ -805,7 +826,10 @@ HRESULT WINAPI MockDirect3DDevice9::TestCooperativeLevel(void) { return D3D_OK; 
 UINT    WINAPI MockDirect3DDevice9::GetAvailableTextureMem(void) { return 1024 * 1024 * 1024; /* 1GB */ }
 HRESULT WINAPI MockDirect3DDevice9::EvictManagedResources(void) { return D3D_OK; }
 HRESULT WINAPI MockDirect3DDevice9::GetDirect3D(IDirect3D9 **ppD3D9) {
-    if (!ppD3D9) return D3DERR_INVALIDCALL; *ppD3D9 = m_pD3D; if (m_pD3D) m_pD3D->AddRef(); return D3D_OK;
+    if (!ppD3D9) return D3DERR_INVALIDCALL;
+    *ppD3D9 = m_pD3D;
+    if (m_pD3D) m_pD3D->AddRef();
+    return D3D_OK;
 }
 HRESULT WINAPI MockDirect3DDevice9::GetDeviceCaps(D3DCAPS9 *pCaps) {
     if (!m_pD3D) return D3DERR_INVALIDCALL;
@@ -1538,6 +1562,7 @@ HRESULT WINAPI MockDirect3D9::EnumAdapterModesEx(UINT Adapter, const void *pFilt
 HRESULT WINAPI MockDirect3D9::GetAdapterDisplayModeEx(UINT Adapter, void *pMode, void *pRotation) { (void)Adapter; (void)pMode; (void)pRotation; return D3D_OK; }
 
 HRESULT WINAPI MockDirect3D9::CreateDeviceEx(UINT Adapter, D3DDEVTYPE DeviceType, HWND hFocusWindow, DWORD BehaviorFlags, D3DPRESENT_PARAMETERS *pPresentationParameters, void *pFullscreenDisplayMode, IDirect3DDevice9Ex **ppReturnedDeviceInterface) {
+    (void)Adapter; (void)DeviceType; (void)hFocusWindow; (void)BehaviorFlags; (void)pPresentationParameters;
     (void)pFullscreenDisplayMode;
     if (!ppReturnedDeviceInterface) return D3DERR_INVALIDCALL;
     MockDirect3DDevice9 *pDev = new MockDirect3DDevice9(this);
